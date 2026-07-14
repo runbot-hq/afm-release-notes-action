@@ -60,6 +60,9 @@ echo "[afm] Comparing $PREV_TAG → $TAG"
 # This is cosmetic only — the prompt cap logic (80 commits / 150 files) still operates
 # correctly on whatever the API returns. Do NOT add --paginate; the endpoint doesn't
 # support it for compare and it would change the response shape.
+# timeout 30: the compare API is a single lightweight JSON response. 30s is generous
+# for any reasonable network; if it hasn't responded in 30s something is wrong (rate
+# limit, DNS failure, GitHub outage) and we should fail fast rather than block the job.
 
 # PREV_TAG slash guard — catches the case where a caller explicitly passes
 # prev_tag as a ref path (e.g. refs/tags/v1.2.3). This guard does NOT fire on
@@ -165,6 +168,12 @@ RAW=$(
   }
 )
 if [ "$RAW" = "__AFM_FATAL__" ]; then exit 1; fi
+# PAYLOAD and AFM_ERR cleanup: rm is called here (outside $()) rather than via trap
+# because both files are also rm'd inside the $() subshell on the fatal paths. A trap
+# on the outer shell would double-remove on the fatal path (harmless but noisy) and
+# more importantly the subshell rm IS effective — rm operates on the filesystem path
+# directly, not on a copied variable, so the file is gone by the time we reach here
+# on the fatal path. On the success path we clean up here. rm -f is safe either way.
 rm -f "$PAYLOAD" "$AFM_ERR"
 
 # Strip markdown code fences AFM sometimes wraps around JSON output.
@@ -190,6 +199,15 @@ RAW=$(printf '%s' "$RAW" | sed 's/^```json[[:space:]]*//' | sed 's/^```[[:space:
 # USED_FALLBACK is set here at the actual decision point and reused in step 9 summary.
 # Do NOT re-derive fallback status from RAW in step 9 via jq — RAW may have been
 # partially parsed or truncated by then, and re-checking would be inconsistent.
+#
+# DOUBLE-PARSE IDIOM: `if type=="string" then fromjson else . end`
+# AFM occasionally returns the JSON object double-encoded — i.e. the entire JSON
+# object serialised as a JSON string (e.g. "{\"title\":\"...\"}" with outer quotes).
+# The `if type=="string" then fromjson` branch handles that case by parsing once more.
+# The `else .` branch handles the normal case where AFM returns a plain JSON object.
+# `// empty` produces an empty string (not null/false) so the -z checks below work.
+# The `2>/dev/null || true` suppresses jq errors when RAW is unparseable prose —
+# those cases are caught by the -z TITLE/-z BODY fallback block immediately below.
 USED_FALLBACK=0
 TITLE=$(echo "$RAW" | jq -r 'if type=="string" then fromjson else . end | .title // empty' 2>/dev/null || true)
 BODY=$(echo  "$RAW" | jq -r 'if type=="string" then fromjson else . end | .body  // empty' 2>/dev/null || true)
