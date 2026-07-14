@@ -6,8 +6,9 @@ author: runbot-hq
 
 inputs:
   tag:
-    description: The tag to generate release notes for
-    required: true
+    description: 'Tag to generate release notes for (e.g. v1.2.3) — leave blank to auto-resolve to latest git tag'
+    required: false
+    default: ''
   prev_tag:
     description: Previous tag to compare against (auto-resolved from git tags if omitted)
     required: false

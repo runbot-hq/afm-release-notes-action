@@ -14,7 +14,26 @@ if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
   git fetch --unshallow --tags --quiet
 fi
 
-# 2. Resolve prev_tag from git tags
+# 2. Resolve TAG — auto-fill latest if blank, then validate it exists in the repo.
+# workflow_dispatch default: '' means TAG may arrive empty when the user leaves the
+# field blank. Auto-resolving to the latest semver tag gives pre-fill UX without
+# requiring a static default in the YAML. If TAG is set but does not exist as a git
+# tag, we fail early with a clear message rather than letting gh api return a 404.
+if [ -z "${TAG:-}" ]; then
+  TAG=$(git tag --sort=-version:refname | head -n 1)
+  if [ -z "$TAG" ]; then
+    echo "::error::No tags found in repository — cannot auto-resolve TAG."
+    exit 1
+  fi
+  echo "[afm] TAG not provided — auto-resolved to latest: $TAG"
+fi
+
+if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+  echo "::error::TAG '$TAG' does not exist in this repository. Check the tag name and try again."
+  exit 1
+fi
+
+# 3. Resolve prev_tag from git tags
 # version:refname sort is semver-aware (vN.N.N). This is correct for run-bot's tag
 # convention. If non-semver tags are ever introduced (e.g. nightly-*, beta), add a
 # grep -E '^v[0-9]' filter before head -n 1 to exclude them from the sort.
@@ -29,7 +48,7 @@ fi
 
 echo "[afm] Comparing $PREV_TAG → $TAG"
 
-# 3. Fetch diff context (read-only, uses ambient GITHUB_TOKEN)
+# 4. Fetch diff context (read-only, uses ambient GITHUB_TOKEN)
 # GitHub's compare API returns at most 250 commits and 300 files per page (no pagination
 # on this endpoint via gh cli --jq). TOTAL_COMMITS / TOTAL_FILES in the step summary
 # reflect the API-capped count, not the true range size on very large releases.
@@ -59,7 +78,7 @@ TOTAL_FILES=$(echo "$CONTEXT"   | jq '.total_files')
 
 CONTEXT=$(echo "$CONTEXT" | jq '{commits: .commits[:80], files: .files[:150]}')
 
-# 4. Build prompt payload
+# 5. Build prompt payload
 PROMPT_EXTRA_SAFE="${PROMPT_EXTRA:0:300}"
 PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/afm_release_XXXXXX.json")
 
@@ -89,7 +108,7 @@ jq -n \
     created_at: (now | todate)
   }' > "$PAYLOAD"
 
-# 5. Call AFM sidecar — retry 2×60s with sleep between for cold-start model loading
+# 6. Call AFM sidecar — retry 2×60s with sleep between for cold-start model loading
 #
 # DESIGN: Why __AFM_FATAL__ sentinel instead of exit 1?
 # `exit 1` inside a $() command substitution only exits the subshell — bash does NOT
@@ -101,7 +120,7 @@ jq -n \
 # The string equality check `[ "$RAW" = "__AFM_FATAL__" ]` is intentional — any node
 # stdout prefix before a crash would mean RAW != sentinel, which falls through to the
 # empty-output check in step 6 and surfaces as a warning, not a silent pass.
-# NOTE: The exit 1 at line ~41 (gh api compare failure) is OUTSIDE $() and is correct.
+# NOTE: The exit 1 in step 4 (gh api compare failure) is OUTSIDE $() and is correct.
 AFM_ERR=$(mktemp "${TMPDIR:-/tmp}/afm_err_XXXXXX.txt")
 
 run_afm() {
@@ -128,7 +147,7 @@ RAW=$(
 if [ "$RAW" = "__AFM_FATAL__" ]; then exit 1; fi
 rm -f "$PAYLOAD" "$AFM_ERR"
 
-# 6. Parse — fallback to raw if AFM returns prose instead of JSON
+# 7. Parse — fallback to raw if AFM returns prose instead of JSON
 # USED_FALLBACK is set here at the actual decision point and reused in step 9 summary.
 # Do NOT re-derive fallback status from RAW in step 9 via jq — RAW may have been
 # partially parsed or truncated by then, and re-checking would be inconsistent.
@@ -148,7 +167,7 @@ if [ -z "$TITLE" ] || [ -z "$BODY" ]; then
   exit 1
 fi
 
-# 7. Cap body length — GitHub Actions output limit guard
+# 8. Cap body length — GitHub Actions output limit guard
 if [ "${#BODY}" -gt 65000 ]; then
   echo "::warning::Generated body exceeds 65000 chars — truncating"
   BODY="${BODY:0:65000}"
@@ -156,7 +175,7 @@ fi
 
 echo "[afm] Generated: $TITLE"
 
-# 8. Write outputs (random delimiter prevents body content collision)
+# 9. Write outputs (random delimiter prevents body content collision)
 # ALL THREE outputs (release_title, prev_tag, release_body) use the heredoc <<DELIM form.
 # Do NOT simplify release_title or prev_tag to bare `echo "key=value"` — AFM output could
 # theoretically contain a newline, which would silently corrupt $GITHUB_OUTPUT.
@@ -173,7 +192,7 @@ OUTPUT_DELIM="AFM_OUT_$(openssl rand -hex 8)"
   echo "${OUTPUT_DELIM}"
 } >> "$GITHUB_OUTPUT"
 
-# 9. Step Summary
+# 10. Step Summary
 FALLBACK_NOTE=""
 [ "$USED_FALLBACK" = "1" ] && FALLBACK_NOTE=" ⚠️ Fallback output (raw prose)"
 {
