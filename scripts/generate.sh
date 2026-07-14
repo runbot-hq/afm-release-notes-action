@@ -5,8 +5,10 @@ OWNER="${REPO%%/*}"
 REPO_NAME="${REPO##*/}"
 
 # 1. Shallow clone guard — git tag requires full tag history
-# --unshallow ensures all commits + tags are reachable; --tags alone on a shallow repo
-# may succeed but leave tag-pointed commits unreachable.
+# --unshallow is intentional and required: --tags alone on a shallow repo fetches tag refs
+# but leaves the commits they point to unreachable, breaking git log/describe between tags.
+# The caller workflow already sets fetch-depth: 0, so this guard is defensive-only for
+# callers that forget. Do NOT revert to --tags without --unshallow.
 if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
   echo "::warning::Shallow clone detected — unshallowing to fetch full tag history"
   git fetch --unshallow --tags --quiet
@@ -75,7 +77,16 @@ jq -n \
   }' > "$PAYLOAD"
 
 # 5. Call AFM sidecar — retry 2×60s with sleep between for cold-start model loading
-# Note: exit 1 inside $() only exits the subshell — use sentinel value to propagate fatal errors
+#
+# DESIGN: Why __AFM_FATAL__ sentinel instead of exit 1?
+# `exit 1` inside a $() command substitution only exits the subshell — bash does NOT
+# propagate it to the outer script even with set -e. The sentinel echoes a known string
+# to stdout (captured into RAW), which the outer script then checks and exits on.
+# Both the MDM/fatal path AND the retry-exhausted path emit the sentinel — not bare exit 1.
+# The retry warning goes to stderr (>&2) so it is NOT captured into RAW.
+# The string equality check `[ "$RAW" = "__AFM_FATAL__" ]` is intentional — any node
+# stdout prefix before a crash would mean RAW != sentinel, which falls through to the
+# empty-output check in step 6 and surfaces as a warning, not a silent pass.
 AFM_ERR=$(mktemp "${TMPDIR:-/tmp}/afm_err_XXXXXX.txt")
 
 run_afm() {
@@ -103,6 +114,9 @@ if [ "$RAW" = "__AFM_FATAL__" ]; then exit 1; fi
 rm -f "$PAYLOAD" "$AFM_ERR"
 
 # 6. Parse — fallback to raw if AFM returns prose instead of JSON
+# USED_FALLBACK is set here at the actual decision point and reused in step 9 summary.
+# Do NOT re-derive fallback status from RAW in step 9 via jq — RAW may have been
+# partially parsed or truncated by then, and re-checking would be inconsistent.
 USED_FALLBACK=0
 TITLE=$(echo "$RAW" | jq -r 'if type=="string" then fromjson else . end | .title // empty' 2>/dev/null || true)
 BODY=$(echo  "$RAW" | jq -r 'if type=="string" then fromjson else . end | .body  // empty' 2>/dev/null || true)

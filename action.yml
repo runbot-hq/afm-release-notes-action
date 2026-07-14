@@ -64,6 +64,14 @@ runs:
           exit 1
         }
 
+    # Cache strategy (three tiers):
+    #   1. Cache hit  — node_modules + dist/ restored, Build step skipped entirely.
+    #   2. Cache miss — npm ci + tsc run, node_modules + dist/ written to cache for next run.
+    #   3. Cold runner (no cache ever) — committed dist/index.js is the pre-built fallback;
+    #      npm ci + tsc still run and produce a fresh dist/ which then gets cached.
+    # Key hashes package-lock.json (deps), src/index.ts (source), and tsconfig.json (compiler
+    # config — e.g. target ES version change must bust the cache even if source is unchanged).
+    # Do NOT remove dist/ from the path or the Build step guard becomes meaningless on cache hit.
     - name: Cache afm-sidecar
       id: sidecar-cache
       uses: actions/cache@v4
@@ -105,6 +113,9 @@ runs:
       env:
         TAG: ${{ inputs.tag }}
         PREV_TAG: ${{ inputs.prev_tag }}
+        # PROMPT_EXTRA is safe: passed via env: (not interpolated into run: shell string),
+        # so shell injection is not possible. The script truncates to 300 chars and passes
+        # it through jq --arg which escapes it into JSON. No quoting guard needed here.
         PROMPT_EXTRA: ${{ inputs.prompt_extra }}
         AFM_DEBUG: ${{ inputs.debug == 'true' && '1' || '0' }}
         AFM_SIDECAR_DIST: ${{ github.action_path }}/afm-sidecar/dist/index.js
