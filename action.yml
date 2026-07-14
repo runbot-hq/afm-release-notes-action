@@ -52,7 +52,7 @@ runs:
       shell: bash
       run: |
         command -v timeout >/dev/null 2>&1 || {
-          echo "::error::timeout not found. Install coreutils (brew install coreutils) on this runner."
+          echo "::error::timeout not found. On macOS 12+ it is available as a system binary — check your PATH. If missing, install coreutils: brew install coreutils."
           exit 1
         }
 
@@ -68,10 +68,8 @@ runs:
       id: sidecar-cache
       uses: actions/cache@v4
       with:
-        path: |
-          ${{ github.action_path }}/afm-sidecar/node_modules
-          ${{ github.action_path }}/afm-sidecar/dist
-        key: afm-sidecar-${{ hashFiles('**/afm-sidecar/package-lock.json', '**/afm-sidecar/tsconfig.json') }}
+        path: ${{ github.action_path }}/afm-sidecar/node_modules
+        key: afm-sidecar-${{ hashFiles('**/afm-sidecar/package-lock.json') }}
 
     - name: Build afm-sidecar
       if: steps.sidecar-cache.outputs.cache-hit != 'true'
