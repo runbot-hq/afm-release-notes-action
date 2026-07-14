@@ -3,6 +3,11 @@ name: Advance @v1 floating tag
 on:
   push:
     tags:
+      # Matches all v1.x.y tags including pre-releases (e.g. v1.0.0-beta.1).
+      # This is intentional — @v1 tracks the latest v1 commit regardless of
+      # pre-release status, consistent with how actions/checkout@v4 etc. work.
+      # If @v1 should only advance on stable releases, add a step-level
+      # `if: ${{ !contains(github.ref_name, '-') }}` guard.
       - 'v1.*.*'
 
 permissions:

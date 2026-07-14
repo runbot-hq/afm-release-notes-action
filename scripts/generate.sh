@@ -181,7 +181,10 @@ rm -f "$PAYLOAD" "$AFM_ERR"
 # This is broader than "strip the leading fence" — it is "strip any fence-only line".
 # Do NOT collapse to a single -e expression; the three-pass order matters because a
 # ```json line must be matched by pass 1 before pass 2 would match its bare ``` residue.
-RAW=$(printf '%s' "$RAW" | sed 's/^```json[[:space:]]*//' | sed 's/^```[[:space:]]*//' | sed 's/[[:space:]]*```$//')
+# Pass 3 uses a full-line anchor (^...$) so it only strips lines that consist ENTIRELY
+# of optional whitespace + ``` + optional whitespace. This avoids stripping ``` that
+# appears at the end of a line with other content (e.g. prose like "Use ```").
+RAW=$(printf '%s' "$RAW" | sed 's/^```json[[:space:]]*//' | sed 's/^```[[:space:]]*//' | sed 's/^[[:space:]]*```[[:space:]]*$//')
 
 # 7. Parse — fallback to raw if AFM returns prose instead of JSON
 # USED_FALLBACK is set here at the actual decision point and reused in step 9 summary.
