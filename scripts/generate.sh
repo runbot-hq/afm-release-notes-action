@@ -62,7 +62,10 @@ echo "[afm] Comparing $PREV_TAG → $TAG"
 # support it for compare and it would change the response shape.
 
 # PREV_TAG slash guard — catches the case where a caller explicitly passes
-# prev_tag as a ref path. Auto-resolved values from git tag never contain slashes.
+# prev_tag as a ref path (e.g. refs/tags/v1.2.3). This guard does NOT fire on
+# auto-resolved values: `git tag` always emits bare tag names (no slashes), and
+# the first-commit SHA fallback (git rev-list --max-parents=0) also never contains
+# a slash. The guard is therefore only meaningful for explicit caller input.
 [[ "${PREV_TAG:-}" =~ / ]] && { echo '::error::prev_tag contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
 CONTEXT=$(timeout 30 gh api "repos/$OWNER/$REPO_NAME/compare/$PREV_TAG...$TAG" \
   --jq '{
@@ -83,6 +86,10 @@ TOTAL_FILES=$(echo "$CONTEXT"   | jq '.total_files')
 
 # Filter noisy commit messages (fixup!/squash!/WIP) before capping at 80 — they
 # pollute the prompt and degrade AFM output quality.
+# WIP REGEX: [Ww][Ii][Pp]([ :]|$) catches:
+#   "WIP: thing", "WIP thing", "WIP" (bare), "wip:", "wip" (bare)
+# The ([ :]|$) alternation is intentional — a bare WIP commit with no separator
+# would not be caught by [Ww][Ii][Pp][ :] alone.
 CONTEXT=$(echo "$CONTEXT" | jq '{
   commits: [.commits[] | select(test("^(fixup!|squash!|[Ww][Ii][Pp]([ :]|$))") | not)][:80],
   files: .files[:150]
@@ -164,6 +171,16 @@ rm -f "$PAYLOAD" "$AFM_ERR"
 # AFM occasionally ignores the "Output JSON only — no markdown fences" instruction
 # and wraps the response in ```json ... ``` or ``` ... ```. This strips leading/trailing
 # fences so jq can parse clean JSON without triggering the fallback path.
+#
+# WHY THREE SEPARATE sed PASSES (not one expression):
+# `printf '%s' "$RAW"` feeds the full multi-line string to sed. POSIX sed processes each
+# line independently — `^` anchors to the start of each line, `$` to the end of each
+# line. This means the first two passes strip any line that consists only of a fence
+# opener (not just the very first line of the blob). That is intentional: if AFM emits
+# a stray ```json line mid-body, it is stripped too. Same for the closing ``` pass.
+# This is broader than "strip the leading fence" — it is "strip any fence-only line".
+# Do NOT collapse to a single -e expression; the three-pass order matters because a
+# ```json line must be matched by pass 1 before pass 2 would match its bare ``` residue.
 RAW=$(printf '%s' "$RAW" | sed 's/^```json[[:space:]]*//' | sed 's/^```[[:space:]]*//' | sed 's/[[:space:]]*```$//')
 
 # 7. Parse — fallback to raw if AFM returns prose instead of JSON

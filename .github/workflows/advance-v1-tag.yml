@@ -12,6 +12,10 @@ jobs:
   advance-tag:
     runs-on: ubuntu-latest
     steps:
+      # NO actions/checkout NEEDED — this step only manipulates remote tag pointers.
+      # GITHUB_SHA is injected by the runner (no clone required). git config, git tag,
+      # and git push all operate against the remote via the GITHUB_TOKEN credential;
+      # they do not need a local working tree. Adding a checkout would be pure overhead.
       - name: Move v1 tag to this commit
         run: |
           git config user.name  "github-actions[bot]"
