@@ -193,7 +193,24 @@ rm -f "$PAYLOAD" "$AFM_ERR"
 # Pass 3 uses a full-line anchor (^...$) so it only strips lines that consist ENTIRELY
 # of optional whitespace + ``` + optional whitespace. This avoids stripping ``` that
 # appears at the end of a line with other content (e.g. prose like "Use ```").
-RAW=$(printf '%s' "$RAW" | sed 's/^```json[[:space:]]*//' | sed 's/^```[[:space:]]*//' | sed 's/^[[:space:]]*```[[:space:]]*$//')
+# WHY TWO SEPARATE sed PASSES (not one expression):
+# `printf '%s' "$RAW"` feeds the full multi-line string to sed. POSIX sed processes each
+# line independently — `^` anchors to the start of each line, `$` to the end of each
+# line. Both passes use full-line anchors (^[[:space:]]*...[[:space:]]*$) so they only
+# fire on lines that consist ENTIRELY of the fence pattern — never on lines in the body
+# that merely start with triple backticks (e.g. a code block opener like "```bash ...").
+#
+# Pass 1: strip any fence-only line that starts with ```json (language-tagged opener).
+#         Must run first — pass 2's bare-fence pattern would also match ```json lines,
+#         so pass 1 must consume them before pass 2 sees the string.
+# Pass 2: strip any remaining fence-only line (bare ``` opener, or closing fence).
+#         Catches: the residue after pass 1 if AFM emits ```json on its own line,
+#         standalone ``` openers with no language tag, and all closing ``` fences.
+#
+# All patterns are full-line anchored. Do NOT simplify to a prefix strip like
+# `s/^```[[:space:]]*//` — that would mangle "```bash" lines in body code blocks
+# by leaving "bash" as a dangling word on the line.
+RAW=$(printf '%s' "$RAW" | sed 's/^[[:space:]]*```json[[:space:]]*$//' | sed 's/^[[:space:]]*```[[:space:]]*$//')
 
 # 7. Parse — fallback to raw if AFM returns prose instead of JSON
 # USED_FALLBACK is set here at the actual decision point and reused in step 9 summary.

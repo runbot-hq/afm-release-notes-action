@@ -40,6 +40,11 @@ Generate AI release notes using Apple Intelligence (on-device AFM) on a self-hos
 
 ### With outputs
 
+> **Injection safety:** `release_title` and `release_body` are LLM-generated. Pass them
+> via `env:` rather than interpolating `${{ }}` directly into the shell script, and write
+> the body to a temp file for `--notes-file` to avoid shell word-splitting on quotes,
+> backticks, or `$()` sequences.
+
 ```yaml
 - uses: runbot-hq/afm-release-notes-action@v1
   id: notes
@@ -47,12 +52,17 @@ Generate AI release notes using Apple Intelligence (on-device AFM) on a self-hos
     tag: ${{ github.ref_name }}
 
 - name: Create release
-  run: |
-    gh release create "${{ github.ref_name }}" \
-      --title "${{ steps.notes.outputs.release_title }}" \
-      --notes "${{ steps.notes.outputs.release_body }}"
   env:
     GH_TOKEN: ${{ github.token }}
+    AFM_TITLE: ${{ steps.notes.outputs.release_title }}
+    AFM_BODY:  ${{ steps.notes.outputs.release_body }}
+  run: |
+    NOTES_FILE=$(mktemp)
+    trap "rm -f '$NOTES_FILE'" EXIT
+    printf '%s' "$AFM_BODY" > "$NOTES_FILE"
+    gh release create "${{ github.ref_name }}" \
+      --title "${AFM_TITLE:-${{ github.ref_name }}}" \
+      --notes-file "$NOTES_FILE"
 ```
 
 ### Using `prev_tag` with `gh release create`
@@ -61,13 +71,19 @@ Generate AI release notes using Apple Intelligence (on-device AFM) on a self-hos
 
 ```yaml
 - name: Create release
-  run: |
-    gh release create "${{ github.ref_name }}" \
-      --title "${{ steps.notes.outputs.release_title }}" \
-      --notes "${{ steps.notes.outputs.release_body }}" \
-      --notes-start-tag "${{ steps.notes.outputs.prev_tag }}"
   env:
     GH_TOKEN: ${{ github.token }}
+    AFM_TITLE: ${{ steps.notes.outputs.release_title }}
+    AFM_BODY:  ${{ steps.notes.outputs.release_body }}
+    PREV_TAG:  ${{ steps.notes.outputs.prev_tag }}
+  run: |
+    NOTES_FILE=$(mktemp)
+    trap "rm -f '$NOTES_FILE'" EXIT
+    printf '%s' "$AFM_BODY" > "$NOTES_FILE"
+    gh release create "${{ github.ref_name }}" \
+      --title "${AFM_TITLE:-${{ github.ref_name }}}" \
+      --notes-file "$NOTES_FILE" \
+      --notes-start-tag "$PREV_TAG"
 ```
 
 ### Full example with caller workflow
