@@ -5,9 +5,11 @@ OWNER="${REPO%%/*}"
 REPO_NAME="${REPO##*/}"
 
 # 1. Shallow clone guard — git tag requires full tag history
+# --unshallow ensures all commits + tags are reachable; --tags alone on a shallow repo
+# may succeed but leave tag-pointed commits unreachable.
 if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
-  echo "::warning::Shallow clone detected — fetching full tags"
-  git fetch --tags --quiet
+  echo "::warning::Shallow clone detected — unshallowing to fetch full tag history"
+  git fetch --unshallow --tags --quiet
 fi
 
 # 2. Resolve prev_tag from git tags
@@ -29,7 +31,10 @@ CONTEXT=$(timeout 30 gh api "repos/$OWNER/$REPO_NAME/compare/$PREV_TAG...$TAG" \
     files:   [.files[] | .status + " " + .filename],
     total_commits: (.commits | length),
     total_files:   (.files   | length)
-  }')
+  }') || {
+  echo "::error::gh api compare failed (rate limit, bad tags, or network). PREV_TAG=$PREV_TAG TAG=$TAG"
+  exit 1
+}
 
 TOTAL_COMMITS=$(echo "$CONTEXT" | jq '.total_commits')
 TOTAL_FILES=$(echo "$CONTEXT"   | jq '.total_files')
