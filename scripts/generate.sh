@@ -167,7 +167,7 @@ BODY=$(echo  "$RAW" | jq -r 'if type=="string" then fromjson else . end | .body 
 
 if [ -z "$TITLE" ] || [ -z "$BODY" ]; then
   USED_FALLBACK=1
-  echo "::warning::AFM did not return valid JSON — falling back to raw output"
+  echo "::warning::AFM did not return valid JSON — falling back to raw output. Check the Log outputs step and consider tuning the prompt."
   TITLE=$(echo "$RAW" | head -n 1 | cut -c1-100)
   BODY="$RAW"
 fi
