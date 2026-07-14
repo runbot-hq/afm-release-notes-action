@@ -34,6 +34,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           # ${{ github.repository }} and ${{ github.ref_name }} are trusted runner-controlled
           # values — interpolating them into the run: block is safe here.
           REF_OBJ=$(gh api "/repos/${{ github.repository }}/git/refs/tags/${{ github.ref_name }}" --jq '.object')

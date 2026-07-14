@@ -188,21 +188,30 @@ rm -f "$PAYLOAD" "$AFM_ERR"
 # WHY TWO SEPARATE sed PASSES (not one expression):
 # `printf '%s' "$RAW"` feeds the full multi-line string to sed. POSIX sed processes each
 # line independently — `^` anchors to the start of each line, `$` to the end of each
-# line. Both passes use full-line anchors (^[[:space:]]*...[[:space:]]*$) so they only
+# line. Both passes use /pattern/d (delete the line entirely, not replace with empty
+# string) so no blank-line residue is left where fences were. Using s/pattern// would
+# leave empty lines, which jq tolerates but would cause the prose fallback's `head -n 1`
+# to return an empty string if the fence was on line 1.
+#
+# Both passes use full-line anchors (^[[:space:]]*...[[:space:]]*$) so they only
 # fire on lines that consist ENTIRELY of the fence pattern — never on lines in the body
 # that merely start with triple backticks (e.g. a code block opener like "```bash ...").
 #
-# Pass 1: strip any fence-only line that starts with ```json (language-tagged opener).
+# Pass 1: delete any fence-only line that starts with ```json (language-tagged opener).
 #         Must run first — pass 2's bare-fence pattern would also match ```json lines,
 #         so pass 1 must consume them before pass 2 sees the string.
-# Pass 2: strip any remaining fence-only line (bare ``` opener, or closing fence).
+# Pass 2: delete any remaining fence-only line (bare ``` opener, or closing fence).
 #         Catches: the residue after pass 1 if AFM emits ```json on its own line,
 #         standalone ``` openers with no language tag, and all closing ``` fences.
 #
 # All patterns are full-line anchored. Do NOT simplify to a prefix strip like
 # `s/^```[[:space:]]*//` — that would mangle "```bash" lines in body code blocks
 # by leaving "bash" as a dangling word on the line.
-RAW=$(printf '%s' "$RAW" | sed 's/^[[:space:]]*```json[[:space:]]*$//' | sed 's/^[[:space:]]*```[[:space:]]*$//')
+# Note: /pattern/d deletes the matching line entirely (no blank line residue).
+# s/pattern// would leave an empty line where the fence was, which is harmless
+# for jq but would cause the prose fallback's `head -n 1` to return an empty
+# string if AFM wraps its output and the fence happens to be the first line.
+RAW=$(printf '%s' "$RAW" | sed '/^[[:space:]]*```json[[:space:]]*$/d' | sed '/^[[:space:]]*```[[:space:]]*$/d')
 
 # 7. Parse — fallback to raw if AFM returns prose instead of JSON
 # USED_FALLBACK is set here at the actual decision point and reused in step 9 summary.
