@@ -182,10 +182,11 @@ if [ -z "$TITLE" ] || [ -z "$BODY" ]; then
   exit 1
 fi
 
-# 8. Cap body length — GitHub Actions output limit guard
-if [ "${#BODY}" -gt 65000 ]; then
-  echo "::warning::Generated body exceeds 65000 chars — truncating"
-  BODY="${BODY:0:65000}"
+# 8. Cap body length — GitHub Releases supports ~125k chars; 120k gives a safe margin.
+# GitHub Actions output itself has no hard per-value limit that would be hit at this size.
+if [ "${#BODY}" -gt 120000 ]; then
+  echo "::warning::Generated body exceeds 120000 chars — truncating"
+  BODY="${BODY:0:120000}"
 fi
 
 echo "[afm] Generated: $TITLE"
