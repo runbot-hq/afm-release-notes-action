@@ -116,3 +116,4 @@ jobs:
 - **Random `$GITHUB_OUTPUT` delimiter** — prevents body content collision with heredoc delimiter.
 - **`sw_vers` + Node version in Step Summary** — forensic breadcrumb for AFM model version shifts across macOS updates.
 - **`@v1` floating tag** — moves on every patch. Breaking changes bump to `v2`.
+- **`dist/index.js` must be rebuilt manually** after any change to `afm-sidecar/src/index.ts`. Run `cd afm-sidecar && npm run build` and commit the updated `dist/index.js`. There is no pre-commit hook enforcing this — a stale `dist/` will silently run old code on cold runners that skip the cache.
