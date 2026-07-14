@@ -99,6 +99,10 @@ CONTEXT=$(echo "$CONTEXT" | jq '{
 }')
 
 # 5. Build prompt payload
+# PROMPT_EXTRA: sourced from env: in action.yml (inputs.prompt_extra). When a caller
+# omits prompt_extra, GitHub Actions sets the env var to '' (empty string) — NOT unset.
+# So ${#PROMPT_EXTRA} is 0 and set -u does not fire. The ${PROMPT_EXTRA:0:300} slice
+# below is also safe on an empty string. No guard needed.
 if [ "${#PROMPT_EXTRA}" -gt 300 ]; then
   echo "::warning::prompt_extra truncated to 300 chars (was ${#PROMPT_EXTRA})"
 fi
@@ -181,18 +185,6 @@ rm -f "$PAYLOAD" "$AFM_ERR"
 # and wraps the response in ```json ... ``` or ``` ... ```. This strips leading/trailing
 # fences so jq can parse clean JSON without triggering the fallback path.
 #
-# WHY THREE SEPARATE sed PASSES (not one expression):
-# `printf '%s' "$RAW"` feeds the full multi-line string to sed. POSIX sed processes each
-# line independently — `^` anchors to the start of each line, `$` to the end of each
-# line. This means the first two passes strip any line that consists only of a fence
-# opener (not just the very first line of the blob). That is intentional: if AFM emits
-# a stray ```json line mid-body, it is stripped too. Same for the closing ``` pass.
-# This is broader than "strip the leading fence" — it is "strip any fence-only line".
-# Do NOT collapse to a single -e expression; the three-pass order matters because a
-# ```json line must be matched by pass 1 before pass 2 would match its bare ``` residue.
-# Pass 3 uses a full-line anchor (^...$) so it only strips lines that consist ENTIRELY
-# of optional whitespace + ``` + optional whitespace. This avoids stripping ``` that
-# appears at the end of a line with other content (e.g. prose like "Use ```").
 # WHY TWO SEPARATE sed PASSES (not one expression):
 # `printf '%s' "$RAW"` feeds the full multi-line string to sed. POSIX sed processes each
 # line independently — `^` anchors to the start of each line, `$` to the end of each
