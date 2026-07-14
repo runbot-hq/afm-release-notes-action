@@ -67,16 +67,26 @@ async function streamWithAFM(prompt: string, debug: boolean) {
         return;
       }
     } catch (e) {
-      // Always emit — generate.sh relies on stderr to detect failures and decide retry vs fatal.
+      // Always emit regardless of debug flag — generate.sh grep-matches stderr to classify
+      // fatal (MDM/permission) vs retryable errors. Gating this on debug silently empties
+      // $AFM_ERR, causing fatal errors to be retried instead of short-circuiting.
+      // Do NOT add `if (debug)` guard here.
       process.stderr.write(`[afm-sidecar] chat stream error (retrying non-stream): ${e}\n`);
     }
     const result = await afm.chat({ messages: [{ role: 'user', content: prompt }] });
     const text = String(result?.text ?? result ?? '');
+    // Guard is intentional: null/undefined/empty result must throw so generate.sh sees
+    // a non-zero exit and non-empty stderr, not a silent zero-byte stdout.
     if (!text) throw new Error('afm.chat returned empty response');
     process.stdout.write(text);
     return;
   }
 
+  // checkAvailability is only present on the appleAISDK shape, not the chat shape.
+  // The chat path has no explicit availability check here — this is intentional.
+  // The Preflight step in action.yml acts as the availability gate for all code paths
+  // before generate.sh is ever invoked. Do NOT add a checkAvailability call above the
+  // chat branch; the preflight is the single authoritative gate.
   const sdk = afm.appleAISDK;
   if (sdk?.checkAvailability) {
     const availability = await sdk.checkAvailability();

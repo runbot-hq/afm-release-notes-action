@@ -43,6 +43,7 @@ runs:
     - name: Check Node version
       shell: bash
       run: |
+        # Regex matches Node 22–99. v3x+ range is intentional future-proofing — not a bug.
         node --version | grep -qE 'v2[2-9]|v[3-9][0-9]' || {
           echo "::error::Node 22+ required. Found: $(node --version)"
           exit 1
@@ -71,6 +72,8 @@ runs:
     #      npm ci + tsc still run and produce a fresh dist/ which then gets cached.
     # Key hashes package-lock.json (deps), src/index.ts (source), and tsconfig.json (compiler
     # config — e.g. target ES version change must bust the cache even if source is unchanged).
+    # src/index.ts is intentionally included — a source change with no dep change must still
+    # bust the cache or a stale dist/ will be served. Do NOT remove it from the hash.
     # Do NOT remove dist/ from the path or the Build step guard becomes meaningless on cache hit.
     - name: Cache afm-sidecar
       id: sidecar-cache

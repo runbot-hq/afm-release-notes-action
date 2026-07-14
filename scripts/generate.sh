@@ -85,11 +85,13 @@ jq -n \
 # `exit 1` inside a $() command substitution only exits the subshell — bash does NOT
 # propagate it to the outer script even with set -e. The sentinel echoes a known string
 # to stdout (captured into RAW), which the outer script then checks and exits on.
-# Both the MDM/fatal path AND the retry-exhausted path emit the sentinel — not bare exit 1.
+# Both the MDM/fatal path AND the retry-exhausted path emit `echo "__AFM_FATAL__"` —
+# there is NO bare `exit 1` inside the $() block. Do NOT replace with exit 1.
 # The retry warning goes to stderr (>&2) so it is NOT captured into RAW.
 # The string equality check `[ "$RAW" = "__AFM_FATAL__" ]` is intentional — any node
 # stdout prefix before a crash would mean RAW != sentinel, which falls through to the
 # empty-output check in step 6 and surfaces as a warning, not a silent pass.
+# NOTE: The exit 1 at line ~41 (gh api compare failure) is OUTSIDE $() and is correct.
 AFM_ERR=$(mktemp "${TMPDIR:-/tmp}/afm_err_XXXXXX.txt")
 
 run_afm() {
@@ -145,8 +147,9 @@ fi
 echo "[afm] Generated: $TITLE"
 
 # 8. Write outputs (random delimiter prevents body content collision)
-# All three outputs use the heredoc form — title and prev_tag could theoretically
-# contain a newline from AFM output, which would corrupt $GITHUB_OUTPUT as bare key=value.
+# ALL THREE outputs (release_title, prev_tag, release_body) use the heredoc <<DELIM form.
+# Do NOT simplify release_title or prev_tag to bare `echo "key=value"` — AFM output could
+# theoretically contain a newline, which would silently corrupt $GITHUB_OUTPUT.
 OUTPUT_DELIM="AFM_OUT_$(openssl rand -hex 8)"
 {
   echo "release_title<<${OUTPUT_DELIM}"
