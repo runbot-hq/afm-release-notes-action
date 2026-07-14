@@ -95,11 +95,16 @@ runs:
 
     - name: Preflight — verify Apple Intelligence responds
       shell: bash
+      # AFM_SIDECAR_DIST is passed via env: (not interpolated into the run: string) so
+      # paths with spaces are safe. Do NOT inline ${{ github.action_path }} directly into
+      # the run: block — it is not quoted by the YAML expansion and will word-split.
+      env:
+        AFM_SIDECAR_DIST: ${{ github.action_path }}/afm-sidecar/dist/index.js
       run: |
         PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/afm_preflight_XXXXXX.json")
         echo '{"raw_prompt":"Reply with the single word: ready","intent":"test","request_id":"preflight","created_at":""}' > "$PAYLOAD"
         ERR=$(mktemp "${TMPDIR:-/tmp}/afm_preflight_err_XXXXXX.txt")
-        RESULT=$(timeout 30 node ${{ github.action_path }}/afm-sidecar/dist/index.js --payload "$PAYLOAD" 2>"$ERR" || true)
+        RESULT=$(timeout 30 node "$AFM_SIDECAR_DIST" --payload "$PAYLOAD" 2>"$ERR" || true)
         rm -f "$PAYLOAD"
         if [ -z "$RESULT" ]; then
           echo "::error::Preflight failed on runner '${RUNNER_NAME}' — no response from Apple Intelligence."
