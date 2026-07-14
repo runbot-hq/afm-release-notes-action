@@ -80,6 +80,9 @@ TOTAL_FILES=$(echo "$CONTEXT"   | jq '.total_files')
 CONTEXT=$(echo "$CONTEXT" | jq '{commits: .commits[:80], files: .files[:150]}')
 
 # 5. Build prompt payload
+if [ "${#PROMPT_EXTRA}" -gt 300 ]; then
+  echo "::warning::prompt_extra truncated to 300 chars (was ${#PROMPT_EXTRA})"
+fi
 PROMPT_EXTRA_SAFE="${PROMPT_EXTRA:0:300}"
 PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/afm_release_XXXXXX.json")
 
