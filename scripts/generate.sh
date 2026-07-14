@@ -128,10 +128,16 @@ fi
 echo "[afm] Generated: $TITLE"
 
 # 8. Write outputs (random delimiter prevents body content collision)
-OUTPUT_DELIM="AFM_BODY_$(openssl rand -hex 8)"
+# All three outputs use the heredoc form — title and prev_tag could theoretically
+# contain a newline from AFM output, which would corrupt $GITHUB_OUTPUT as bare key=value.
+OUTPUT_DELIM="AFM_OUT_$(openssl rand -hex 8)"
 {
-  echo "release_title=$TITLE"
-  echo "prev_tag=$PREV_TAG"
+  echo "release_title<<${OUTPUT_DELIM}"
+  echo "$TITLE"
+  echo "${OUTPUT_DELIM}"
+  echo "prev_tag<<${OUTPUT_DELIM}"
+  echo "$PREV_TAG"
+  echo "${OUTPUT_DELIM}"
   echo "release_body<<${OUTPUT_DELIM}"
   echo "$BODY"
   echo "${OUTPUT_DELIM}"

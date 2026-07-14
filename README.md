@@ -64,7 +64,8 @@ on:
     types: [published]
 
 permissions:
-  contents: read
+  contents: read  # read-only — action only generates notes, does not write releases
+                  # If you pass outputs to `gh release edit`, upgrade to contents: write
 
 jobs:
   generate-notes:
