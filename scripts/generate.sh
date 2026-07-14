@@ -77,7 +77,12 @@ TOTAL_FILES=$(echo "$CONTEXT"   | jq '.total_files')
 [ "$TOTAL_COMMITS" -gt 80  ] && echo "::warning::$TOTAL_COMMITS commits — prompt capped at 80"
 [ "$TOTAL_FILES"   -gt 150 ] && echo "::warning::$TOTAL_FILES files — prompt capped at 150"
 
-CONTEXT=$(echo "$CONTEXT" | jq '{commits: .commits[:80], files: .files[:150]}')
+# Filter noisy commit messages (fixup!/squash!/WIP) before capping at 80 — they
+# pollute the prompt and degrade AFM output quality.
+CONTEXT=$(echo "$CONTEXT" | jq '{
+  commits: [.commits[] | select(test("^(fixup!|squash!|[Ww][Ii][Pp][ :])") | not)][:80],
+  files: .files[:150]
+}')
 
 # 5. Build prompt payload
 if [ "${#PROMPT_EXTRA}" -gt 300 ]; then
