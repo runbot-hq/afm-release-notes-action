@@ -67,10 +67,13 @@ async function streamWithAFM(prompt: string, debug: boolean) {
         return;
       }
     } catch (e) {
-      if (debug) process.stderr.write(`[afm-sidecar] chat stream error (retrying non-stream): ${e}\n`);
+      // Always emit — generate.sh relies on stderr to detect failures and decide retry vs fatal.
+      process.stderr.write(`[afm-sidecar] chat stream error (retrying non-stream): ${e}\n`);
     }
     const result = await afm.chat({ messages: [{ role: 'user', content: prompt }] });
-    process.stdout.write(String(result?.text ?? result ?? ''));
+    const text = String(result?.text ?? result ?? '');
+    if (!text) throw new Error('afm.chat returned empty response');
+    process.stdout.write(text);
     return;
   }
 

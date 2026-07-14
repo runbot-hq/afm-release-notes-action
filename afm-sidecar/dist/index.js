@@ -38,6 +38,8 @@ async function main() {
     if (debug)
         process.stderr.write(`[afm-sidecar] prompt chars=${prompt.length} intent=${payload.intent}\n`);
     await streamWithAFM(prompt, debug);
+    // Explicit exit needed — the native Apple Intelligence module keeps the Node event loop
+    // alive indefinitely after completion. Without this, the process hangs until timeout.
     process.exit(0);
 }
 async function streamWithAFM(prompt, debug) {
@@ -54,11 +56,14 @@ async function streamWithAFM(prompt, debug) {
             }
         }
         catch (e) {
-            if (debug)
-                process.stderr.write(`[afm-sidecar] chat stream error (retrying non-stream): ${e}\n`);
+            // Always emit — generate.sh relies on stderr to detect failures and decide retry vs fatal.
+            process.stderr.write(`[afm-sidecar] chat stream error (retrying non-stream): ${e}\n`);
         }
         const result = await afm.chat({ messages: [{ role: 'user', content: prompt }] });
-        process.stdout.write(String(result?.text ?? result ?? ''));
+        const text = String(result?.text ?? result ?? '');
+        if (!text)
+            throw new Error('afm.chat returned empty response');
+        process.stdout.write(text);
         return;
     }
     const sdk = afm.appleAISDK;
