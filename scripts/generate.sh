@@ -23,7 +23,7 @@ fi
 echo "[afm] Comparing $PREV_TAG → $TAG"
 
 # 3. Fetch diff context (read-only, uses ambient GITHUB_TOKEN)
-CONTEXT=$(gh api "repos/$OWNER/$REPO_NAME/compare/$PREV_TAG...$TAG" \
+CONTEXT=$(timeout 30 gh api "repos/$OWNER/$REPO_NAME/compare/$PREV_TAG...$TAG" \
   --jq '{
     commits: [.commits[].commit.message[:120]],
     files:   [.files[] | .status + " " + .filename],
@@ -70,6 +70,7 @@ jq -n \
   }' > "$PAYLOAD"
 
 # 5. Call AFM sidecar — retry 2×60s with sleep between for cold-start model loading
+# Note: exit 1 inside $() only exits the subshell — use sentinel value to propagate fatal errors
 AFM_ERR=$(mktemp "${TMPDIR:-/tmp}/afm_err_XXXXXX.txt")
 
 run_afm() {
@@ -81,24 +82,28 @@ RAW=$(
     if grep -qiE "(mdm|not authorized|permission denied|not available)" "$AFM_ERR"; then
       echo "::error::AFM fatal error (not retrying): $(cat $AFM_ERR)"
       rm -f "$PAYLOAD" "$AFM_ERR"
-      exit 1
+      echo "__AFM_FATAL__"
+    else
+      echo "[afm] Attempt 1 failed — retrying in 5s..." >&2
+      sleep 5
+      timeout 60 node "$AFM_SIDECAR_DIST" --payload "$PAYLOAD" 2>>"$AFM_ERR" || {
+        echo "::error::AFM failed after 2 attempts. Stderr: $(cat $AFM_ERR)"
+        rm -f "$PAYLOAD" "$AFM_ERR"
+        echo "__AFM_FATAL__"
+      }
     fi
-    echo "[afm] Attempt 1 failed — retrying in 5s..."
-    sleep 5
-    timeout 60 node "$AFM_SIDECAR_DIST" --payload "$PAYLOAD" 2>>"$AFM_ERR" || {
-      echo "::error::AFM failed after 2 attempts. Stderr: $(cat $AFM_ERR)"
-      rm -f "$PAYLOAD" "$AFM_ERR"
-      exit 1
-    }
   }
 )
+if [ "$RAW" = "__AFM_FATAL__" ]; then exit 1; fi
 rm -f "$PAYLOAD" "$AFM_ERR"
 
 # 6. Parse — fallback to raw if AFM returns prose instead of JSON
+USED_FALLBACK=0
 TITLE=$(echo "$RAW" | jq -r 'if type=="string" then fromjson else . end | .title // empty' 2>/dev/null || true)
 BODY=$(echo  "$RAW" | jq -r 'if type=="string" then fromjson else . end | .body  // empty' 2>/dev/null || true)
 
 if [ -z "$TITLE" ] || [ -z "$BODY" ]; then
+  USED_FALLBACK=1
   echo "::warning::AFM did not return valid JSON — falling back to raw output"
   TITLE=$(echo "$RAW" | head -n 1 | cut -c1-100)
   BODY="$RAW"
@@ -129,7 +134,7 @@ OUTPUT_DELIM="AFM_BODY_$(openssl rand -hex 8)"
 
 # 9. Step Summary
 FALLBACK_NOTE=""
-[ -z "$(echo "$RAW" | jq -r '.title // empty' 2>/dev/null)" ] && FALLBACK_NOTE=" ⚠️ Fallback output (raw prose)"
+[ "$USED_FALLBACK" = "1" ] && FALLBACK_NOTE=" ⚠️ Fallback output (raw prose)"
 {
   echo "## 📝 Release Notes: $TAG${FALLBACK_NOTE}"
   echo ""

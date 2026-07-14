@@ -50,6 +50,8 @@ async function main() {
   if (debug) process.stderr.write(`[afm-sidecar] prompt chars=${prompt.length} intent=${payload.intent}\n`);
 
   await streamWithAFM(prompt, debug);
+  // Explicit exit needed — the native Apple Intelligence module keeps the Node event loop
+  // alive indefinitely after completion. Without this, the process hangs until timeout.
   process.exit(0);
 }
 
