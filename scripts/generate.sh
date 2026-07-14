@@ -30,6 +30,16 @@ fi
 echo "[afm] Comparing $PREV_TAG → $TAG"
 
 # 3. Fetch diff context (read-only, uses ambient GITHUB_TOKEN)
+# GitHub's compare API returns at most 250 commits and 300 files per page (no pagination
+# on this endpoint via gh cli --jq). TOTAL_COMMITS / TOTAL_FILES in the step summary
+# reflect the API-capped count, not the true range size on very large releases.
+# This is cosmetic only — the prompt cap logic (80 commits / 150 files) still operates
+# correctly on whatever the API returns. Do NOT add --paginate; the endpoint doesn't
+# support it for compare and it would change the response shape.
+#
+# TAG and PREV_TAG must not contain '/' — GitHub's ref_name for a semver tag never does,
+# and the version:refname sort + your vN.N.N convention makes this safe. If non-standard
+# tags are ever introduced, add: [[ "$TAG" =~ / ]] && { echo '::error::TAG contains slash'; exit 1; }
 CONTEXT=$(timeout 30 gh api "repos/$OWNER/$REPO_NAME/compare/$PREV_TAG...$TAG" \
   --jq '{
     commits: [.commits[].commit.message[:120]],
