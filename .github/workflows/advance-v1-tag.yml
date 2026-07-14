@@ -49,9 +49,21 @@ jobs:
             COMMIT_SHA="$OBJ_SHA"
           fi
 
-          gh api \
+          # PATCH requires the v1 ref to already exist; it returns 422 on a fresh
+          # repo where v1 has never been created. Try PATCH first (the normal case),
+          # and fall back to POST (ref creation) only if PATCH fails.
+          if ! gh api \
             --method PATCH \
             -H "Accept: application/vnd.github+json" \
             "/repos/${{ github.repository }}/git/refs/tags/v1" \
             -f sha="$COMMIT_SHA" \
-            -F force=true
+            -F force=true 2>/tmp/v1_patch_err.log; then
+            echo "::notice::PATCH failed (v1 ref likely does not exist yet) — creating via POST"
+            cat /tmp/v1_patch_err.log
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/v1" \
+              -f sha="$COMMIT_SHA"
+          fi

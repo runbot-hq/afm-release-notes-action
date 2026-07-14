@@ -140,11 +140,11 @@ jobs:
 ## Known Constraints
 
 - **Apple Intelligence is per-user** — may be blocked by MDM. Preflight validates a real non-empty response and includes the runner name in the error.
-- **AFM retried 2×60s with 5s sleep** — handles cold-start model loading; fatal errors (MDM block, permission denied) skip the retry.
+- **AFM retried 2×60s with 15s sleep** — handles cold-start model loading; fatal errors (MDM block, permission denied) skip the retry.
 - **`@meridius-labs/apple-on-device-ai` pinned to `1.6.2`** — upgrade explicitly via PR.
 - **`dist/` committed** — fallback for cold runners that skip the cache.
 - **`prompt_extra` capped at 300 chars** — prevents context bloat.
-- **`release_body` capped at 65,000 chars** — GitHub Actions output limit guard.
+- **`release_body` capped at 120,000 chars** — GitHub Releases supports ~125k chars; the cap leaves headroom for the API envelope.
 - **Random `$GITHUB_OUTPUT` delimiter** — prevents body content collision with heredoc delimiter.
 - **`sw_vers` + Node version in Step Summary** — forensic breadcrumb for AFM model version shifts across macOS updates.
 - **`@v1` floating tag** — moves on every patch. Breaking changes bump to `v2`.
