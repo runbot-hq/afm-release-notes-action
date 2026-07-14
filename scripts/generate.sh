@@ -147,6 +147,12 @@ RAW=$(
 if [ "$RAW" = "__AFM_FATAL__" ]; then exit 1; fi
 rm -f "$PAYLOAD" "$AFM_ERR"
 
+# Strip markdown code fences AFM sometimes wraps around JSON output.
+# AFM occasionally ignores the "Output JSON only — no markdown fences" instruction
+# and wraps the response in ```json ... ``` or ``` ... ```. This strips leading/trailing
+# fences so jq can parse clean JSON without triggering the fallback path.
+RAW=$(printf '%s' "$RAW" | sed 's/^```json[[:space:]]*//' | sed 's/^```[[:space:]]*//' | sed 's/[[:space:]]*```$//')
+
 # 7. Parse — fallback to raw if AFM returns prose instead of JSON
 # USED_FALLBACK is set here at the actual decision point and reused in step 9 summary.
 # Do NOT re-derive fallback status from RAW in step 9 via jq — RAW may have been
