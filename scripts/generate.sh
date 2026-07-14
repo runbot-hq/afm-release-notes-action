@@ -135,8 +135,8 @@ RAW=$(
       rm -f "$PAYLOAD" "$AFM_ERR"
       echo "__AFM_FATAL__"
     else
-      echo "[afm] Attempt 1 failed — retrying in 5s..." >&2
-      sleep 5
+      echo "[afm] Attempt 1 failed — retrying in 15s (cold-start model load)..." >&2
+      sleep 15
       timeout 60 node "$AFM_SIDECAR_DIST" --payload "$PAYLOAD" 2>>"$AFM_ERR" || {
         echo "::error::AFM failed after 2 attempts. Stderr: $(cat $AFM_ERR)"
         rm -f "$PAYLOAD" "$AFM_ERR"
