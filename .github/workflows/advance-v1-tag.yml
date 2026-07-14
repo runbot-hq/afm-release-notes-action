@@ -12,15 +12,17 @@ jobs:
   advance-tag:
     runs-on: ubuntu-latest
     steps:
-      # NO actions/checkout NEEDED — this step only manipulates remote tag pointers.
-      # GITHUB_SHA is injected by the runner (no clone required). git config, git tag,
-      # and git push all operate against the remote via the GITHUB_TOKEN credential;
-      # they do not need a local working tree. Adding a checkout would be pure overhead.
+      # gh api PATCH is used instead of git tag -f + git push because git tag requires
+      # a local .git repo — there is no actions/checkout here, so the workspace is empty.
+      # The API call moves the v1 ref atomically in one round-trip with no clone needed.
+      # GITHUB_SHA is the SHA of the triggering tag push, injected by the runner.
       - name: Move v1 tag to this commit
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -f v1 "$GITHUB_SHA"
-          git push origin v1 --force
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/git/refs/tags/v1" \
+            -f sha="$GITHUB_SHA" \
+            -F force=true
