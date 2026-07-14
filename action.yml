@@ -47,14 +47,25 @@ runs:
         # The runner bundles node24 in externals/. Prepend it to GITHUB_PATH so all
         # subsequent steps use it regardless of what the system PATH resolves to.
         # This makes the action self-contained and immune to system node version drift.
-        # RUNNER_DIR is the runner's install root (e.g. .../actions-runner/my-runner/run-bot-2).
-        # externals/ lives directly inside it alongside bin/, lib/ etc.
+        # Prepend bundled node24 so the action is immune to system node version drift.
         BUNDLED_NODE="$(dirname "$(dirname "$RUNNER_TOOL_CACHE")")/externals/node24/bin"
         if [ -d "$BUNDLED_NODE" ]; then
           echo "$BUNDLED_NODE" >> "$GITHUB_PATH"
           echo "[afm] Using bundled node: $BUNDLED_NODE"
         else
           echo "[afm] Bundled node24 not found at $BUNDLED_NODE — falling back to system node"
+        fi
+        # Prepend Homebrew bin so gh and other tools are available
+        # regardless of what PATH the LaunchAgent runner process inherited at login.
+        if [ -d "/opt/homebrew/bin" ]; then
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          echo "[afm] Added /opt/homebrew/bin to PATH"
+        fi
+        # coreutils installs as gprefixed on macOS (gtimeout etc). Add gnubin so
+        # timeout works without a prefix, matching Linux runner behaviour.
+        if [ -d "/opt/homebrew/opt/coreutils/libexec/gnubin" ]; then
+          echo "/opt/homebrew/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "[afm] Added coreutils gnubin to PATH"
         fi
 
     - name: Check Node version
