@@ -28,6 +28,11 @@ if [ -z "${TAG:-}" ]; then
   echo "[afm] TAG not provided — auto-resolved to latest: $TAG"
 fi
 
+# Tag slash guard — must run before git rev-parse so a caller passing
+# refs/tags/v1.0.0 gets the clear ::error:: annotation, not a confusing
+# "does not exist" message from rev-parse.
+[[ "$TAG" =~ / ]] && { echo '::error::TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
+
 if ! git rev-parse "$TAG" >/dev/null 2>&1; then
   echo "::error::TAG '$TAG' does not exist in this repository. Check the tag name and try again."
   exit 1
@@ -55,10 +60,16 @@ echo "[afm] Comparing $PREV_TAG → $TAG"
 # This is cosmetic only — the prompt cap logic (80 commits / 150 files) still operates
 # correctly on whatever the API returns. Do NOT add --paginate; the endpoint doesn't
 # support it for compare and it would change the response shape.
-#
-# TAG and PREV_TAG must not contain '/' — GitHub's ref_name for a semver tag never does,
-# and the version:refname sort + your vN.N.N convention makes this safe. If non-standard
-# tags are ever introduced, add: [[ "$TAG" =~ / ]] && { echo '::error::TAG contains slash'; exit 1; }
+# timeout 30: the compare API is a single lightweight JSON response. 30s is generous
+# for any reasonable network; if it hasn't responded in 30s something is wrong (rate
+# limit, DNS failure, GitHub outage) and we should fail fast rather than block the job.
+
+# PREV_TAG slash guard — catches the case where a caller explicitly passes
+# prev_tag as a ref path (e.g. refs/tags/v1.2.3). This guard does NOT fire on
+# auto-resolved values: `git tag` always emits bare tag names (no slashes), and
+# the first-commit SHA fallback (git rev-list --max-parents=0) also never contains
+# a slash. The guard is therefore only meaningful for explicit caller input.
+[[ "${PREV_TAG:-}" =~ / ]] && { echo '::error::prev_tag contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
 CONTEXT=$(timeout 30 gh api "repos/$OWNER/$REPO_NAME/compare/$PREV_TAG...$TAG" \
   --jq '{
     commits: [.commits[].commit.message[:120]],
@@ -76,9 +87,25 @@ TOTAL_FILES=$(echo "$CONTEXT"   | jq '.total_files')
 [ "$TOTAL_COMMITS" -gt 80  ] && echo "::warning::$TOTAL_COMMITS commits — prompt capped at 80"
 [ "$TOTAL_FILES"   -gt 150 ] && echo "::warning::$TOTAL_FILES files — prompt capped at 150"
 
-CONTEXT=$(echo "$CONTEXT" | jq '{commits: .commits[:80], files: .files[:150]}')
+# Filter noisy commit messages (fixup!/squash!/WIP) before capping at 80 — they
+# pollute the prompt and degrade AFM output quality.
+# WIP REGEX: [Ww][Ii][Pp]([ :]|$) catches:
+#   "WIP: thing", "WIP thing", "WIP" (bare), "wip:", "wip" (bare)
+# The ([ :]|$) alternation is intentional — a bare WIP commit with no separator
+# would not be caught by [Ww][Ii][Pp][ :] alone.
+CONTEXT=$(echo "$CONTEXT" | jq '{
+  commits: [.commits[] | select(test("^(fixup!|squash!|[Ww][Ii][Pp]([ :]|$))") | not)][:80],
+  files: .files[:150]
+}')
 
 # 5. Build prompt payload
+# PROMPT_EXTRA: sourced from env: in action.yml (inputs.prompt_extra). When a caller
+# omits prompt_extra, GitHub Actions sets the env var to '' (empty string) — NOT unset.
+# So ${#PROMPT_EXTRA} is 0 and set -u does not fire. The ${PROMPT_EXTRA:0:300} slice
+# below is also safe on an empty string. No guard needed.
+if [ "${#PROMPT_EXTRA}" -gt 300 ]; then
+  echo "::warning::prompt_extra truncated to 300 chars (was ${#PROMPT_EXTRA})"
+fi
 PROMPT_EXTRA_SAFE="${PROMPT_EXTRA:0:300}"
 PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/afm_release_XXXXXX.json")
 
@@ -134,8 +161,8 @@ RAW=$(
       rm -f "$PAYLOAD" "$AFM_ERR"
       echo "__AFM_FATAL__"
     else
-      echo "[afm] Attempt 1 failed — retrying in 5s..." >&2
-      sleep 5
+      echo "[afm] Attempt 1 failed — retrying in 15s (cold-start model load)..." >&2
+      sleep 15
       timeout 60 node "$AFM_SIDECAR_DIST" --payload "$PAYLOAD" 2>>"$AFM_ERR" || {
         echo "::error::AFM failed after 2 attempts. Stderr: $(cat $AFM_ERR)"
         rm -f "$PAYLOAD" "$AFM_ERR"
@@ -145,19 +172,67 @@ RAW=$(
   }
 )
 if [ "$RAW" = "__AFM_FATAL__" ]; then exit 1; fi
+# PAYLOAD and AFM_ERR cleanup: rm is called here (outside $()) rather than via trap
+# because both files are also rm'd inside the $() subshell on the fatal paths. A trap
+# on the outer shell would double-remove on the fatal path (harmless but noisy) and
+# more importantly the subshell rm IS effective — rm operates on the filesystem path
+# directly, not on a copied variable, so the file is gone by the time we reach here
+# on the fatal path. On the success path we clean up here. rm -f is safe either way.
 rm -f "$PAYLOAD" "$AFM_ERR"
+
+# Strip markdown code fences AFM sometimes wraps around JSON output.
+# AFM occasionally ignores the "Output JSON only — no markdown fences" instruction
+# and wraps the response in ```json ... ``` or ``` ... ```. This strips leading/trailing
+# fences so jq can parse clean JSON without triggering the fallback path.
+#
+# WHY TWO SEPARATE sed PASSES (not one expression):
+# `printf '%s' "$RAW"` feeds the full multi-line string to sed. POSIX sed processes each
+# line independently — `^` anchors to the start of each line, `$` to the end of each
+# line. Both passes use /pattern/d (delete the line entirely, not replace with empty
+# string) so no blank-line residue is left where fences were. Using s/pattern// would
+# leave empty lines, which jq tolerates but would cause the prose fallback's `head -n 1`
+# to return an empty string if the fence was on line 1.
+#
+# Both passes use full-line anchors (^[[:space:]]*...[[:space:]]*$) so they only
+# fire on lines that consist ENTIRELY of the fence pattern — never on lines in the body
+# that merely start with triple backticks (e.g. a code block opener like "```bash ...").
+#
+# Pass 1: delete any fence-only line that starts with ```json (language-tagged opener).
+#         Must run first — pass 2's bare-fence pattern would also match ```json lines,
+#         so pass 1 must consume them before pass 2 sees the string.
+# Pass 2: delete any remaining fence-only line (bare ``` opener, or closing fence).
+#         Catches: the residue after pass 1 if AFM emits ```json on its own line,
+#         standalone ``` openers with no language tag, and all closing ``` fences.
+#
+# All patterns are full-line anchored. Do NOT simplify to a prefix strip like
+# `s/^```[[:space:]]*//` — that would mangle "```bash" lines in body code blocks
+# by leaving "bash" as a dangling word on the line.
+# Note: /pattern/d deletes the matching line entirely (no blank line residue).
+# s/pattern// would leave an empty line where the fence was, which is harmless
+# for jq but would cause the prose fallback's `head -n 1` to return an empty
+# string if AFM wraps its output and the fence happens to be the first line.
+RAW=$(printf '%s' "$RAW" | sed '/^[[:space:]]*```json[[:space:]]*$/d' | sed '/^[[:space:]]*```[[:space:]]*$/d')
 
 # 7. Parse — fallback to raw if AFM returns prose instead of JSON
 # USED_FALLBACK is set here at the actual decision point and reused in step 9 summary.
 # Do NOT re-derive fallback status from RAW in step 9 via jq — RAW may have been
 # partially parsed or truncated by then, and re-checking would be inconsistent.
+#
+# DOUBLE-PARSE IDIOM: `if type=="string" then fromjson else . end`
+# AFM occasionally returns the JSON object double-encoded — i.e. the entire JSON
+# object serialised as a JSON string (e.g. "{\"title\":\"...\"}" with outer quotes).
+# The `if type=="string" then fromjson` branch handles that case by parsing once more.
+# The `else .` branch handles the normal case where AFM returns a plain JSON object.
+# `// empty` produces an empty string (not null/false) so the -z checks below work.
+# The `2>/dev/null || true` suppresses jq errors when RAW is unparseable prose —
+# those cases are caught by the -z TITLE/-z BODY fallback block immediately below.
 USED_FALLBACK=0
 TITLE=$(echo "$RAW" | jq -r 'if type=="string" then fromjson else . end | .title // empty' 2>/dev/null || true)
 BODY=$(echo  "$RAW" | jq -r 'if type=="string" then fromjson else . end | .body  // empty' 2>/dev/null || true)
 
 if [ -z "$TITLE" ] || [ -z "$BODY" ]; then
   USED_FALLBACK=1
-  echo "::warning::AFM did not return valid JSON — falling back to raw output"
+  echo "::warning::AFM did not return valid JSON — falling back to raw output. Check the Log outputs step and consider tuning the prompt."
   TITLE=$(echo "$RAW" | head -n 1 | cut -c1-100)
   BODY="$RAW"
 fi
@@ -167,10 +242,11 @@ if [ -z "$TITLE" ] || [ -z "$BODY" ]; then
   exit 1
 fi
 
-# 8. Cap body length — GitHub Actions output limit guard
-if [ "${#BODY}" -gt 65000 ]; then
-  echo "::warning::Generated body exceeds 65000 chars — truncating"
-  BODY="${BODY:0:65000}"
+# 8. Cap body length — GitHub Releases supports ~125k chars; 120k gives a safe margin.
+# GitHub Actions output itself has no hard per-value limit that would be hit at this size.
+if [ "${#BODY}" -gt 120000 ]; then
+  echo "::warning::Generated body exceeds 120000 chars — truncating"
+  BODY="${BODY:0:120000}"
 fi
 
 echo "[afm] Generated: $TITLE"

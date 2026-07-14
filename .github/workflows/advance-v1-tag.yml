@@ -1,0 +1,69 @@
+name: Advance @v1 floating tag
+
+on:
+  push:
+    tags:
+      # Matches all v1.x.y tags including pre-releases (e.g. v1.0.0-beta.1).
+      # This is intentional — @v1 tracks the latest v1 commit regardless of
+      # pre-release status, consistent with how actions/checkout@v4 etc. work.
+      # If @v1 should only advance on stable releases, add a step-level
+      # `if: ${{ !contains(github.ref_name, '-') }}` guard.
+      - 'v1.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  advance-tag:
+    runs-on: ubuntu-latest
+    steps:
+      # gh api PATCH is used instead of git tag -f + git push because git tag requires
+      # a local .git repo — there is no actions/checkout here, so the workspace is empty.
+      # The API call moves the v1 ref atomically in one round-trip with no clone needed.
+      #
+      # ANNOTATED TAG PEEL: publish.yml creates annotated tags (git tag -a). On a push
+      # event for an annotated tag, GITHUB_SHA is the SHA of the tag *object*, not the
+      # underlying commit. Passing a tag object SHA to the PATCH ref endpoint sets v1
+      # to a dangling tag object rather than a commit, which breaks `uses: @v1` resolution.
+      # We must peel to the commit SHA first via the API:
+      #   GET /repos/:repo/git/refs/tags/:tag  → .object.type == "tag" → .object.sha
+      #   GET /repos/:repo/git/tags/:sha       → .object.sha  (the commit)
+      # The jq below handles both lightweight tags (object.type == "commit", no peel
+      # needed) and annotated tags (object.type == "tag", one extra GET to dereference).
+      - name: Move v1 tag to this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # ${{ github.repository }} and ${{ github.ref_name }} are trusted runner-controlled
+          # values — interpolating them into the run: block is safe here.
+          REF_OBJ=$(gh api "/repos/${{ github.repository }}/git/refs/tags/${{ github.ref_name }}" --jq '.object')
+          OBJ_TYPE=$(echo "$REF_OBJ" | jq -r '.type')
+          OBJ_SHA=$(echo "$REF_OBJ"  | jq -r '.sha')
+
+          if [ "$OBJ_TYPE" = "tag" ]; then
+            # Annotated tag: dereference the tag object to get the commit SHA
+            COMMIT_SHA=$(gh api "/repos/${{ github.repository }}/git/tags/$OBJ_SHA" --jq '.object.sha')
+          else
+            # Lightweight tag: object SHA is already the commit SHA
+            COMMIT_SHA="$OBJ_SHA"
+          fi
+
+          # PATCH requires the v1 ref to already exist; it returns 422 on a fresh
+          # repo where v1 has never been created. Try PATCH first (the normal case),
+          # and fall back to POST (ref creation) only if PATCH fails.
+          if ! gh api \
+            --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/git/refs/tags/v1" \
+            -f sha="$COMMIT_SHA" \
+            -F force=true 2>/tmp/v1_patch_err.log; then
+            echo "::notice::PATCH failed (v1 ref likely does not exist yet) — creating via POST"
+            cat /tmp/v1_patch_err.log
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/v1" \
+              -f sha="$COMMIT_SHA"
+          fi
