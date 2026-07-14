@@ -15,6 +15,9 @@ if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
 fi
 
 # 2. Resolve prev_tag from git tags
+# version:refname sort is semver-aware (vN.N.N). This is correct for run-bot's tag
+# convention. If non-semver tags are ever introduced (e.g. nightly-*, beta), add a
+# grep -E '^v[0-9]' filter before head -n 1 to exclude them from the sort.
 if [ -z "${PREV_TAG:-}" ]; then
   PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -n 1)
 fi
