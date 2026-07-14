@@ -55,6 +55,21 @@ Generate AI release notes using Apple Intelligence (on-device AFM) on a self-hos
     GH_TOKEN: ${{ github.token }}
 ```
 
+### Using `prev_tag` with `gh release create`
+
+`prev_tag` is useful when you want GitHub's auto-generated comparison URL to span exactly the same range the action used:
+
+```yaml
+- name: Create release
+  run: |
+    gh release create "${{ github.ref_name }}" \
+      --title "${{ steps.notes.outputs.release_title }}" \
+      --notes "${{ steps.notes.outputs.release_body }}" \
+      --notes-start-tag "${{ steps.notes.outputs.prev_tag }}"
+  env:
+    GH_TOKEN: ${{ github.token }}
+```
+
 ### Full example with caller workflow
 
 ```yaml
