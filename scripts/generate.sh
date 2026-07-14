@@ -28,6 +28,11 @@ if [ -z "${TAG:-}" ]; then
   echo "[afm] TAG not provided — auto-resolved to latest: $TAG"
 fi
 
+# Tag slash guard — must run before git rev-parse so a caller passing
+# refs/tags/v1.0.0 gets the clear ::error:: annotation, not a confusing
+# "does not exist" message from rev-parse.
+[[ "$TAG" =~ / ]] && { echo '::error::TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
+
 if ! git rev-parse "$TAG" >/dev/null 2>&1; then
   echo "::error::TAG '$TAG' does not exist in this repository. Check the tag name and try again."
   exit 1
@@ -56,9 +61,8 @@ echo "[afm] Comparing $PREV_TAG → $TAG"
 # correctly on whatever the API returns. Do NOT add --paginate; the endpoint doesn't
 # support it for compare and it would change the response shape.
 
-# Tag slash guard — a caller passing refs/tags/v1.0.0 instead of v1.0.0 would silently
-# produce a broken gh api URL. Fail fast with a clear message instead.
-[[ "$TAG" =~ / ]] && { echo '::error::TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
+# PREV_TAG slash guard — catches the case where a caller explicitly passes
+# prev_tag as a ref path. Auto-resolved values from git tag never contain slashes.
 [[ "${PREV_TAG:-}" =~ / ]] && { echo '::error::prev_tag contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
 CONTEXT=$(timeout 30 gh api "repos/$OWNER/$REPO_NAME/compare/$PREV_TAG...$TAG" \
   --jq '{
@@ -80,7 +84,7 @@ TOTAL_FILES=$(echo "$CONTEXT"   | jq '.total_files')
 # Filter noisy commit messages (fixup!/squash!/WIP) before capping at 80 — they
 # pollute the prompt and degrade AFM output quality.
 CONTEXT=$(echo "$CONTEXT" | jq '{
-  commits: [.commits[] | select(test("^(fixup!|squash!|[Ww][Ii][Pp][ :])") | not)][:80],
+  commits: [.commits[] | select(test("^(fixup!|squash!|[Ww][Ii][Pp]([ :]|$))") | not)][:80],
   files: .files[:150]
 }')
 
