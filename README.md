@@ -32,7 +32,7 @@ Generate AI release notes using Apple Intelligence (on-device AFM) on a self-hos
 ### Minimal
 
 ```yaml
-- uses: runbot-hq/afm-release-notes-action@v1
+- uses: runbot-hq/afm-release-notes-action@main
   id: notes
   with:
     tag: ${{ github.ref_name }}
@@ -46,7 +46,7 @@ Generate AI release notes using Apple Intelligence (on-device AFM) on a self-hos
 > backticks, or `$()` sequences.
 
 ```yaml
-- uses: runbot-hq/afm-release-notes-action@v1
+- uses: runbot-hq/afm-release-notes-action@main
   id: notes
   with:
     tag: ${{ github.ref_name }}
@@ -106,7 +106,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: runbot-hq/afm-release-notes-action@v1
+      - uses: runbot-hq/afm-release-notes-action@main
         id: notes
         with:
           tag: ${{ github.ref_name }}
