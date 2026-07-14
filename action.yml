@@ -41,6 +41,22 @@ runs:
         echo "::error::afm-release-notes-action requires a macOS runner. Label it [self-hosted, macOS, apple-intelligence]."
         exit 1
 
+    - name: Prefer bundled Node 24
+      shell: bash
+      run: |
+        # The runner bundles node24 in externals/. Prepend it to GITHUB_PATH so all
+        # subsequent steps use it regardless of what the system PATH resolves to.
+        # This makes the action self-contained and immune to system node version drift.
+        # RUNNER_DIR is the runner's install root (e.g. .../actions-runner/my-runner/run-bot-2).
+        # externals/ lives directly inside it alongside bin/, lib/ etc.
+        BUNDLED_NODE="$(dirname "$(dirname "$RUNNER_TOOL_CACHE")")/externals/node24/bin"
+        if [ -d "$BUNDLED_NODE" ]; then
+          echo "$BUNDLED_NODE" >> "$GITHUB_PATH"
+          echo "[afm] Using bundled node: $BUNDLED_NODE"
+        else
+          echo "[afm] Bundled node24 not found at $BUNDLED_NODE — falling back to system node"
+        fi
+
     - name: Check Node version
       shell: bash
       run: |
