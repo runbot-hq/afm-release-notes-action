@@ -55,10 +55,11 @@ echo "[afm] Comparing $PREV_TAG → $TAG"
 # This is cosmetic only — the prompt cap logic (80 commits / 150 files) still operates
 # correctly on whatever the API returns. Do NOT add --paginate; the endpoint doesn't
 # support it for compare and it would change the response shape.
-#
-# TAG and PREV_TAG must not contain '/' — GitHub's ref_name for a semver tag never does,
-# and the version:refname sort + your vN.N.N convention makes this safe. If non-standard
-# tags are ever introduced, add: [[ "$TAG" =~ / ]] && { echo '::error::TAG contains slash'; exit 1; }
+
+# Tag slash guard — a caller passing refs/tags/v1.0.0 instead of v1.0.0 would silently
+# produce a broken gh api URL. Fail fast with a clear message instead.
+[[ "$TAG" =~ / ]] && { echo '::error::TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
+[[ "${PREV_TAG:-}" =~ / ]] && { echo '::error::prev_tag contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
 CONTEXT=$(timeout 30 gh api "repos/$OWNER/$REPO_NAME/compare/$PREV_TAG...$TAG" \
   --jq '{
     commits: [.commits[].commit.message[:120]],
