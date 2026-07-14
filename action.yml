@@ -1,0 +1,112 @@
+name: AFM Release Notes
+description: >
+  Generate AI release notes using Apple Intelligence (on-device) on a self-hosted macOS runner.
+  Returns release_title, release_body, and prev_tag as outputs. Does not create or modify any release.
+author: runbot-hq
+
+inputs:
+  tag:
+    description: The tag to generate release notes for
+    required: true
+  prev_tag:
+    description: Previous tag to compare against (auto-resolved from git tags if omitted)
+    required: false
+  prompt_extra:
+    description: Optional extra instruction appended to the prompt (max 300 chars)
+    required: false
+  debug:
+    description: Set to true to enable AFM_DEBUG=1 verbose sidecar logging
+    required: false
+    default: 'false'
+
+outputs:
+  release_title:
+    description: AI-generated release title
+    value: ${{ steps.generate.outputs.release_title }}
+  release_body:
+    description: AI-generated release notes body (Markdown)
+    value: ${{ steps.generate.outputs.release_body }}
+  prev_tag:
+    description: The previous tag used for comparison
+    value: ${{ steps.generate.outputs.prev_tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check runner OS
+      if: runner.os != 'macOS'
+      shell: bash
+      run: |
+        echo "::error::afm-release-notes-action requires a macOS runner. Label it [self-hosted, macOS, apple-intelligence]."
+        exit 1
+
+    - name: Check Node version
+      shell: bash
+      run: |
+        node --version | grep -qE 'v2[2-9]|v[3-9][0-9]' || {
+          echo "::error::Node 22+ required. Found: $(node --version)"
+          exit 1
+        }
+
+    - name: Check timeout availability
+      shell: bash
+      run: |
+        command -v timeout >/dev/null 2>&1 || {
+          echo "::error::timeout not found. Install coreutils (brew install coreutils) on this runner."
+          exit 1
+        }
+
+    - name: Validate repo format
+      shell: bash
+      run: |
+        [[ "${{ github.repository }}" == */* ]] || {
+          echo "::error::Unexpected github.repository format: ${{ github.repository }}"
+          exit 1
+        }
+
+    - name: Cache afm-sidecar
+      id: sidecar-cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ github.action_path }}/afm-sidecar/node_modules
+          ${{ github.action_path }}/afm-sidecar/dist
+        key: afm-sidecar-${{ hashFiles('**/afm-sidecar/package-lock.json', '**/afm-sidecar/tsconfig.json') }}
+
+    - name: Build afm-sidecar
+      if: steps.sidecar-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        cd ${{ github.action_path }}/afm-sidecar
+        npm ci
+        npm run build
+
+    - name: Preflight — verify Apple Intelligence responds
+      shell: bash
+      run: |
+        PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/afm_preflight_XXXXXX.json")
+        echo '{"raw_prompt":"Reply with the single word: ready","intent":"test","request_id":"preflight","created_at":""}' > "$PAYLOAD"
+        ERR=$(mktemp "${TMPDIR:-/tmp}/afm_preflight_err_XXXXXX.txt")
+        RESULT=$(timeout 30 node ${{ github.action_path }}/afm-sidecar/dist/index.js --payload "$PAYLOAD" 2>"$ERR" || true)
+        rm -f "$PAYLOAD"
+        if [ -z "$RESULT" ]; then
+          echo "::error::Preflight failed on runner '${RUNNER_NAME}' — no response from Apple Intelligence."
+          echo "::error::Stderr: $(cat $ERR)"
+          echo "::error::Ensure macOS 15+ with Apple Intelligence enabled per-user in System Settings. Check MDM restrictions."
+          rm -f "$ERR"; exit 1
+        fi
+        rm -f "$ERR"
+        echo "[afm] Preflight OK: $RESULT"
+
+    - name: Generate release notes
+      id: generate
+      shell: bash
+      run: ${{ github.action_path }}/scripts/generate.sh
+      env:
+        TAG: ${{ inputs.tag }}
+        PREV_TAG: ${{ inputs.prev_tag }}
+        PROMPT_EXTRA: ${{ inputs.prompt_extra }}
+        AFM_DEBUG: ${{ inputs.debug == 'true' && '1' || '0' }}
+        AFM_SIDECAR_DIST: ${{ github.action_path }}/afm-sidecar/dist/index.js
+        GITHUB_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
