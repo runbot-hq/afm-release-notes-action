@@ -1,0 +1,61 @@
+name: Build and commit artifacts
+
+# Builds afm-cli (Swift binary) and dist/index.js (ncc bundle) on every push
+# to main, then commits them back to the branch if they changed.
+#
+# Why macos-26:
+#   - FoundationModels framework ships with the macOS 26 SDK (Xcode 26)
+#   - The binary compiles on the GitHub-hosted runner even though Apple
+#     Intelligence inference requires a physical Apple Silicon device
+#   - The resulting arm64 Mach-O is the artifact committed to the repo
+#
+# The runner cannot run afm-cli — it only builds it.
+# Runtime execution happens on the caller's self-hosted macOS runner.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'afm-cli/Sources/**'
+      - 'afm-cli/Package.swift'
+      - 'package.json'
+      - 'tsconfig.json'
+
+jobs:
+  build:
+    runs-on: macos-26
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history needed so the commit-back push is not rejected
+          fetch-depth: 0
+
+      - name: Build afm-cli Swift binary
+        run: |
+          swift build -c release --package-path afm-cli
+          cp afm-cli/.build/release/afm-cli ./afm-cli-bin
+          # Replace in place (binary may already exist)
+          mv afm-cli-bin afm-cli
+          chmod +x afm-cli
+
+      - name: Build dist/index.js
+        run: |
+          npm install
+          npm run build
+
+      - name: Commit artifacts if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add afm-cli dist/index.js
+          # Only commit if there is actually a diff — no-op on clean tree
+          if git diff --cached --quiet; then
+            echo "Artifacts unchanged — nothing to commit."
+          else
+            git commit -m "chore: rebuild artifacts [skip ci]"
+            git push
+          fi
