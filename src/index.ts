@@ -328,6 +328,21 @@ async function run(): Promise<void> {
     // Slash-guard rejects ref paths (e.g. refs/tags/v1.0.0) — plain tag names and
     // SHAs (the rev-list fallback above) are always slash-free and pass correctly.
     if (prevTag.includes('/')) throw new Error('prev_tag contains a slash — pass a plain tag name, not a ref path')
+    // rev-parse guard: validate user-supplied prev_tag exists before hitting the
+    // GitHub API. Auto-resolved values (tag list + grep) are always valid by
+    // construction; the SHA fallback from rev-list is always valid. Only a
+    // user-supplied prev_tag can be invalid — guard it symmetrically with TAG.
+    // Skip the check for SHAs (40 hex chars) — rev-parse works on SHAs too,
+    // but the sha pattern is the rev-list fallback which is always valid.
+    // Do NOT raise "prev_tag rev-parse is redundant" — an invalid user-supplied
+    // prev_tag produces an opaque GitHub API 422 without this guard.
+    if (core.getInput('prev_tag').trim()) {
+      try {
+        git('rev-parse "$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag })
+      } catch {
+        throw new Error(`prev_tag '${prevTag}' does not exist in this repository.`)
+      }
+    }
     core.info(`[afm] Comparing ${prevTag} → ${tag}`)
 
     // 4. Fetch diff context via GitHub API
@@ -467,9 +482,18 @@ async function run(): Promise<void> {
       // NOTE: afmCli() here is a single attempt — no cold-start retry wrap.
       // This is intentional: if step 6 succeeded, the model is already loaded
       // in memory and a cold-start timeout on this call is extremely unlikely.
-      // If afmCli() throws here (ETIMEDOUT, non-zero exit), it propagates to
-      // the outer catch (error) → core.setFailed. That is the correct behaviour.
-      raw = afmCli(afmBin, strictPrompt, afmOptions)
+      // Error context is enriched below so ETIMEDOUT surfaces with the same
+      // binary path and pre-warm hint as the step-6 error handler.
+      try {
+        raw = afmCli(afmBin, strictPrompt, afmOptions)
+      } catch (e2) {
+        const detail = String(e2)
+        throw new Error(
+          `[afm] Strict-prompt retry failed (binary: ${afmBin}): ${detail}. ` +
+          'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
+          'consider increasing the timeout or pre-warming the runner.'
+        )
+      }
       result = parseAfmOutput(raw, tag) // throws and fails the action if still malformed
     }
 
