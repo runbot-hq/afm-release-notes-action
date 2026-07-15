@@ -27,33 +27,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # fetch-depth: 0 fetches full history so the commit-back push is not
-          # rejected due to diverged history. A shallow clone (depth: 1) would
-          # cause `git push` to fail if the remote has commits the local doesn't.
-          # Do NOT raise "fetch-depth: 0 is slow" — the repo is small and the
-          # full clone is required for a clean push back to the branch.
           fetch-depth: 0
 
       - name: Build afm-cli Swift binary
         run: |
           swift build -c release --package-path afm-cli
-          # Do NOT use `cp ... ./afm-cli` or `mv ... afm-cli` — `afm-cli/` is an
-          # existing directory in this repo. Both cp and mv follow POSIX semantics:
-          # if the destination is an existing directory the source lands *inside* it
-          # (afm-cli/afm-cli), not at the repo root. install(1) is unambiguous —
-          # it always treats the destination as the exact target path.
+          # Output as afm-cli-bin (NOT afm-cli) — avoids POSIX collision with the
+          # afm-cli/ Swift package source directory. mv/cp move a file *into* a
+          # same-named directory; install(1) with a distinct target name is unambiguous.
+          # src/index.ts looks for afm-cli-bin via path.join(actionPath, 'afm-cli-bin').
+          # Do NOT rename back to afm-cli — the directory collision will recur.
           install -m 755 afm-cli/.build/release/afm-cli ./afm-cli-bin
-          # afm-cli-bin is a plain file (not a directory), so mv is now safe.
-          mv -f afm-cli-bin afm-cli
 
       - name: Build dist/index.js
         run: |
-          # npm install (not npm ci) — package-lock.json is intentionally not
-          # committed to this repo (documented in package.json). This is a known
-          # tradeoff: ^ version ranges resolve fresh on each build run.
-          # Do NOT raise "npm install is non-reproducible" — the tradeoff is
-          # intentional. To pin versions, commit package-lock.json and switch to
-          # `npm ci`. Until then, npm install is the correct command here.
           npm install
           npm run build
 
@@ -61,14 +48,11 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add afm-cli dist/index.js
-          # Only commit if there is actually a diff — no-op on clean tree
+          git add afm-cli-bin dist/index.js
           if git diff --cached --quiet; then
             echo "Artifacts unchanged — nothing to commit."
           else
             git commit -m "chore: rebuild artifacts"
-            # Rebase before push — handles concurrent runs where two source
-            # commits land close together and both jobs try to push to the branch.
             git pull --rebase origin "$GITHUB_REF_NAME"
             git push origin "HEAD:$GITHUB_REF_NAME"
           fi
