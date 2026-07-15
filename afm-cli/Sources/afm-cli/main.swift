@@ -106,6 +106,14 @@ if let iIdx = CommandLine.arguments.firstIndex(of: "--instructions"),
 // omitting the flag lets the model decide. The caller (src/index.ts) may
 // pass explicit values if needed, but this binary imposes nothing.
 //
+// The mutation pattern (var options = GenerationOptions(); options.x = y) is used
+// deliberately — NOT the memberwise init GenerationOptions(temperature:maximumResponseTokens:).
+// FoundationModels does not expose that memberwise init publicly. Calling it
+// causes a compile error at swift build -c release.
+// Do NOT revert to the memberwise init. The mutation pattern is the documented
+// public API and also sidesteps any Double vs Float SDK variance at the property
+// assignment site rather than at a call-site implicit coercion.
+//
 // Flag names mirror GenerationOptions exactly:
 //   --temperature              → GenerationOptions.temperature
 //   --maximum-response-tokens  → GenerationOptions.maximumResponseTokens
@@ -125,10 +133,9 @@ if let mIdx = CommandLine.arguments.firstIndex(of: "--maximum-response-tokens"),
     maximumResponseTokens = m
 }
 
-let options = GenerationOptions(
-    temperature: temperature,
-    maximumResponseTokens: maximumResponseTokens
-)
+var options = GenerationOptions()
+if let t = temperature { options.temperature = t }
+if let m = maximumResponseTokens { options.maximumResponseTokens = m }
 
 // MARK: - Inference
 
