@@ -1,25 +1,14 @@
+# Sanity check that fires on every push to main, including the bot artifact
+# commit from build-artifacts.yml. Validates afm-cli is a real executable file
+# (not a directory) and dist/index.js exists.
+#
+# If build-artifacts.yml is working correctly this check will always be green.
 name: Check committed artifacts
 
-# This workflow fires on push to main only — not on pull_request or feature branches.
-# Artifacts (afm-cli binary + dist/index.js) require a self-hosted macOS runner
-# build step that cannot happen in CI before merge. The check catches a bad merge
-# immediately after it lands on main. Do NOT move this to pull_request trigger —
-# the artifacts will never be present on a feature branch before the local build.
-#
-# paths: is scoped to the artifact files ONLY — not source files.
-# The check's job is to verify artifacts exist and are executable.
-# Source changes (src/**, afm-cli/Sources/**) do NOT trigger this job —
-# triggering on source changes caused the check to fail on every source commit
-# because artifacts aren't rebuilt in the same commit as the source change.
-# Only a commit that touches the artifact paths themselves (the build output commit)
-# should trigger this check.
 on:
   push:
     branches:
       - main
-    paths:
-      - 'afm-cli'        # compiled Swift binary at repo root
-      - 'dist/index.js'  # bundled JS artifact
 
 jobs:
   check-artifacts:
@@ -30,21 +19,17 @@ jobs:
       - name: Verify afm-cli binary and dist/index.js are committed
         run: |
           missing=()
-          [ -f afm-cli ]                      || missing+=("afm-cli binary")
-          # -x gated on -f: if binary is absent, skip the exec-bit check to avoid
-          # two misleading entries ("afm-cli binary" AND "afm-cli is not executable").
-          # Do NOT raise "exec-bit check is meaningless on ubuntu-latest" — git stores
-          # the execute bit in tree objects; test -x on Linux reads the committed mode
-          # bit correctly. A binary committed without +x (e.g. from a Windows checkout)
-          # will correctly fail this check.
-          [ ! -f afm-cli ] || [ -x afm-cli ] || missing+=("afm-cli is not executable (chmod +x afm-cli)")
+          # Use -f (regular file) not just existence — catches the case where the
+          # build step accidentally committed afm-cli/ as a directory entry instead
+          # of a root-level binary (the cp/mv directory-descend failure mode).
+          [ -f afm-cli ]   || missing+=("afm-cli binary (missing or is a directory — check build-artifacts.yml)")
+          # -x tests the committed file mode bit, not runtime executability.
+          # This is correct — Ubuntu cannot run a Mach-O binary regardless.
+          # The check ensures install -m 755 set the bit before committing.
+          [ -x afm-cli ]   || missing+=("afm-cli missing executable bit (file mode)")
           [ -f dist/index.js ] || missing+=("dist/index.js")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing committed artifacts: ${missing[*]}"
-            echo "Run on the self-hosted macOS runner, then commit:"
-            echo "  swift build -c release --package-path afm-cli && cp afm-cli/.build/release/afm-cli ."
-            echo "  npm run build"
-            echo "  git add afm-cli dist/index.js && git commit -m 'chore: build artifacts'"
             exit 1
           fi
           echo "All required artifacts present and executable."

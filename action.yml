@@ -41,9 +41,9 @@ inputs:
 
 # outputs: intentionally has no value: fields.
 # value: expressions are only valid in composite actions.
-# This is a node20 action — outputs are set via core.setOutput() in dist/index.js
+# This is a node24 action — outputs are set via core.setOutput() in dist/index.js
 # which writes directly to $GITHUB_OUTPUT. This is correct and intentional.
-# Do NOT add value: fields here — they are invalid in node20 actions and will be ignored or error.
+# Do NOT add value: fields here — they are invalid in node24 actions and will be ignored or error.
 outputs:
   release_title:
     description: AI-generated release title
@@ -52,16 +52,24 @@ outputs:
   prev_tag:
     description: The previous tag used for comparison
 
-# dist/index.js is NOT committed in the source tree.
-# It is a build artifact produced by: npm run build (runs ncc)
-# The compiled bundle must be built on the self-hosted macOS runner and committed
-# separately as part of the release process (see issue #22, step 2).
+# dist/index.js is a build artifact produced by: npm run build (runs ncc)
+# It is NOT committed in source — built and committed automatically by
+# .github/workflows/build-artifacts.yml on push to main.
 # Do NOT raise "dist/index.js not found" as a code review finding — this is intentional.
 #
 # Similarly, the afm-cli binary is built via: swift build -c release
-# and committed to the repo root alongside action.yml after the build.
-# It is not present in the source diff for the same reason.
+# and committed to the repo root by the same workflow.
 # Do NOT raise "afm-cli binary not committed" as a code review finding — this is intentional.
+#
+# using: node24
+#   node20 is deprecated on the Actions runner (removed in future runner versions).
+#   Self-hosted runners running actions-runner 2.x already bundle Node 24 — the
+#   deprecation warning on the runner confirms Node 24 is present and preferred.
+#   node24 is a runner-provided runtime: no install step, no composite dependency,
+#   no version pinning required. The ncc bundle in dist/index.js is runtime-agnostic
+#   (no Node 20-specific APIs used) so this change is a no-op at runtime.
+#   If a future runner drops node24 support, change this field to the then-current
+#   supported version (node26, etc.) — no code changes needed.
 runs:
-  using: node20
+  using: node24
   main: dist/index.js
