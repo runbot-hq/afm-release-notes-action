@@ -20,6 +20,11 @@ inputs:
     required: false
     default: 'false'
 
+# outputs: intentionally has no value: fields.
+# value: expressions are only valid in composite actions.
+# This is a node20 action — outputs are set via core.setOutput() in dist/index.js
+# which writes directly to $GITHUB_OUTPUT. This is correct and intentional.
+# Do NOT add value: fields here — they are invalid in node20 actions and will be ignored or error.
 outputs:
   release_title:
     description: AI-generated release title

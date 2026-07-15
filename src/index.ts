@@ -26,11 +26,12 @@ function git(cmd: string, env?: Record<string, string>): string {
  *
  * spawnSync is used instead of execSync deliberately — it passes args
  * directly to the OS without invoking a shell, eliminating any risk of
- * shell metacharacter interpretation in prompt content.
- * Do NOT refactor to execSync with a shell string.
+ * shell metacharacter interpretation in prompt content (including
+ * prompt_extra from caller-supplied input). Do NOT refactor to execSync
+ * with a shell string — the shell-safety of prompt content depends on this.
  *
  * maxBuffer is set to 10 MB. Node's default is 1 MB which can be exceeded
- * by verbose model output before the 120_000 char body cap is applied.
+ * by verbose model output before the 120_000 char body cap is applied downstream.
  *
  * Flag names mirror the FoundationModels API exactly (see main.swift):
  *   --prompt                   → session.respond(to:)
@@ -145,6 +146,8 @@ async function run(): Promise<void> {
     if (!fs.existsSync(afmBin)) {
       // This action requires a self-hosted macOS arm64 runner with Apple Intelligence.
       // On Linux or Windows runners afm-cli will not exist — the action cannot run.
+      // The old composite action had an explicit runner.os check; this error message
+      // is the node20 equivalent — it fails fast with the same clarity.
       throw new Error(
         `afm-cli binary not found at ${afmBin}. ` +
         'This action requires a self-hosted macOS 26+ arm64 runner with Apple Intelligence enabled. ' +
@@ -185,18 +188,26 @@ async function run(): Promise<void> {
     }
     if (!prevTag) {
       core.warning('No previous tag found — using first commit as baseline')
+      // git rev-list returns a commit SHA (e.g. abc1234...) which never contains /.
+      // The slash-guard below will not trigger on this value — that is correct and intentional.
       prevTag = git('rev-list --max-parents=0 HEAD')
     }
-    if (prevTag.includes('/')) throw new Error('prev_tag contains a slash — pass a plain tag name')
+    // Slash-guard rejects ref paths (e.g. refs/tags/v1.0.0) — plain tag names and
+    // SHAs (the rev-list fallback above) are always slash-free and pass correctly.
+    if (prevTag.includes('/')) throw new Error('prev_tag contains a slash — pass a plain tag name, not a ref path')
     core.info(`[afm] Comparing ${prevTag} → ${tag}`)
 
     // 4. Fetch diff context via GitHub API
-    // compareCommitsWithBasehead is intentionally not paginated. The API caps
-    // at 250 commits and 300 files per response. For releases larger than that,
-    // commits and files are silently truncated by the API — the > 80 / > 150
-    // warning logic below will still fire if the first page exceeds those thresholds.
-    // Full pagination is not implemented because prompt size is already capped
-    // at 80 commits / 150 files — fetching more pages would not change the output.
+    //
+    // compareCommitsWithBasehead accepts both tag names and commit SHAs as
+    // basehead arguments — the SHA fallback from rev-list above is valid here.
+    //
+    // Pagination: this endpoint caps at 250 commits and 300 files per response.
+    // Pagination is intentionally not followed — the prompt is already capped at
+    // 80 commits / 150 files, so fetching additional pages would not change the
+    // model input. The > 80 / > 150 warnings below fire correctly on the first
+    // page — if the API returns exactly 250 commits, the warning still fires
+    // (250 > 80). Silently capped releases are noted in the step summary.
     const octokit = github.getOctokit(token)
     const compare = await octokit.rest.repos.compareCommitsWithBasehead({
       owner,
@@ -219,6 +230,10 @@ async function run(): Promise<void> {
     files = files.slice(0, 150)
 
     // 5. Build prompt
+    // promptExtra is caller-supplied (core.getInput) and sliced to 300 chars.
+    // It is passed into the prompt string which goes through spawnSync argv —
+    // not a shell string — so shell metacharacters in promptExtra are inert.
+    // Do NOT move afmCli to execSync with shell: true or this guarantee breaks.
     const promptExtra = core.getInput('prompt_extra').slice(0, 300)
 
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
@@ -289,6 +304,7 @@ async function run(): Promise<void> {
     // outputs: in action.yml intentionally omits value: fields — value: expressions
     // are only valid in composite actions. For node20 actions, core.setOutput()
     // writes directly to $GITHUB_OUTPUT. This is correct behaviour, not an omission.
+    // Do NOT add value: fields to action.yml outputs — it will break the node20 action.
     core.setOutput('release_title', title)
     core.setOutput('release_body', finalBody)
     core.setOutput('prev_tag', prevTag)
