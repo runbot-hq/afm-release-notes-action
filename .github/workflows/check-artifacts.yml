@@ -23,9 +23,12 @@ jobs:
       - name: Verify afm-cli binary and dist/index.js are committed
         run: |
           missing=()
-          [ -f afm-cli ]                       || missing+=("afm-cli binary")
-          [ ! -f afm-cli ] || [ -x afm-cli ]   || missing+=("afm-cli is not executable")
-          [ -f dist/index.js ]                 || missing+=("dist/index.js")
+          # Use -f (regular file) not just existence — catches the case where the
+          # build step accidentally committed afm-cli/ as a directory entry instead
+          # of a root-level binary (the cp/mv directory-descend failure mode).
+          [ -f afm-cli ]   || missing+=("afm-cli binary (missing or is a directory — check build-artifacts.yml)")
+          [ -x afm-cli ]   || missing+=("afm-cli is not executable")
+          [ -f dist/index.js ] || missing+=("dist/index.js")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing committed artifacts: ${missing[*]}"
             exit 1

@@ -37,11 +37,14 @@ jobs:
       - name: Build afm-cli Swift binary
         run: |
           swift build -c release --package-path afm-cli
-          # Do NOT use `mv afm-cli-bin afm-cli` — `afm-cli/` is also a directory
-          # in this repo; mv would move the file into that directory instead of
-          # replacing the root-level binary. Copy directly to the target path.
-          cp afm-cli/.build/release/afm-cli ./afm-cli
-          chmod +x afm-cli
+          # Do NOT use `cp ... ./afm-cli` or `mv ... afm-cli` — `afm-cli/` is an
+          # existing directory in this repo. Both cp and mv follow POSIX semantics:
+          # if the destination is an existing directory the source lands *inside* it
+          # (afm-cli/afm-cli), not at the repo root. install(1) is unambiguous —
+          # it always treats the destination as the exact target path.
+          install -m 755 afm-cli/.build/release/afm-cli ./afm-cli-bin
+          # afm-cli-bin is a plain file (not a directory), so mv is now safe.
+          mv -f afm-cli-bin afm-cli
 
       - name: Build dist/index.js
         run: |
