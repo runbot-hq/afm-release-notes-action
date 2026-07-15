@@ -66,20 +66,16 @@ runs:
         fi
 
         # 4. Synthesise a `timeout` shim so all downstream steps have it regardless
-        # of whether coreutils is installed. macOS ships /usr/bin/timeout on 12+ but
-        # self-hosted LaunchAgent runners inherit a minimal PATH that can omit /usr/bin.
-        # The shim delegates to the first real binary found; as a last resort it runs
-        # the command without a time limit and emits a warning so the job still proceeds.
+        # of whether coreutils is installed. Written with printf (not heredoc) to avoid
+        # YAML parse errors — heredoc delimiters inside run: | confuse the YAML parser.
         SHIM_DIR=$(mktemp -d "${TMPDIR:-/tmp}/afm_bin_XXXXXX")
-        cat > "$SHIM_DIR/timeout" << 'SHIM'
-#!/usr/bin/env bash
-for _t in /usr/bin/timeout /opt/homebrew/opt/coreutils/libexec/gnubin/timeout "$(command -v gtimeout 2>/dev/null)"; do
-  [ -x "$_t" ] && exec "$_t" "$@"
-done
-echo "[afm] WARNING: no real timeout binary found — running without time limit" >&2
-shift
-exec "$@"
-SHIM
+        printf '%s\n' '#!/usr/bin/env bash' \
+          'for _t in /usr/bin/timeout /opt/homebrew/opt/coreutils/libexec/gnubin/timeout "$(command -v gtimeout 2>/dev/null)"; do' \
+          '  [ -x "$_t" ] && exec "$_t" "$@"' \
+          'done' \
+          'echo "[afm] WARNING: no real timeout binary found — running without time limit" >&2' \
+          'shift' \
+          'exec "$@"' > "$SHIM_DIR/timeout"
         chmod +x "$SHIM_DIR/timeout"
         echo "$SHIM_DIR" >> "$GITHUB_PATH"
         echo "[afm] Installed timeout shim at $SHIM_DIR/timeout"
