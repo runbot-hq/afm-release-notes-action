@@ -45,7 +45,7 @@ jobs:
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing committed artifacts: ${missing[*]}"
             echo "Run on the self-hosted macOS runner, then commit:"
-            echo "  swift build -c release && cp .build/release/afm-cli ."
+            echo "  swift build -c release --package-path afm-cli && cp afm-cli/.build/release/afm-cli ."
             echo "  npm run build"
             echo "  git add afm-cli dist/index.js && git commit -m 'chore: build artifacts'"
             exit 1
