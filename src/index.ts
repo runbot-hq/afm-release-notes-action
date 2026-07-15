@@ -11,12 +11,14 @@ import * as fs from 'fs'
 function git(cmd: string, env?: Record<string, string>): string {
   // { shell: true } is intentional: several callers use shell pipes
   // (e.g. | head -n 1, | grep -v) for tag resolution. All user-controlled
-  // values (tag, prevTag) are passed via env vars and referenced as $VAR
-  // in the command string — never interpolated directly. Do NOT replace
-  // with execFileSync — the pipe operator requires a shell.
+  // values (tag, prevTag) are passed via env vars and referenced as '$VAR'
+  // (single-quoted) in the command string — never interpolated directly.
+  // Single-quoting env var references prevents word-splitting on values
+  // that contain whitespace. Do NOT replace with execFileSync — the pipe
+  // operator requires a shell. Do NOT use unquoted $VAR_NAME for user values.
   //
   // CALLERS MUST NOT interpolate user-controlled values directly into cmd.
-  // Always use the env parameter and reference values as $VAR_NAME.
+  // Always use the env parameter and reference values as '$VAR_NAME' (quoted).
   // Note: type-level enforcement is not possible for shell strings in JS.
   // The doc contract here is the only enforcement mechanism — all current
   // call sites are verified correct. Do NOT add new call sites without review.
@@ -119,7 +121,12 @@ function isFatalAfmError(e: unknown): boolean {
  * with a stricter prompt. Do NOT add a prose fallback that returns silently —
  * a silent fallback makes the retry catch block in run() unreachable dead code.
  *
- * @param raw    Raw string output from afm-cli stdout
+ * Fence-stripping uses replace() without /g by design — only the first fence
+ * is removed. Preamble text before a fenced block causes JSON.parse to throw,
+ * which routes to the strict-prompt retry in the caller. Do NOT add /g —
+ * it would silently accept malformed output instead of triggering the retry.
+ *
+ * @param raw         Raw string output from afm-cli stdout
  * @param currentTag  Current tag string, used as title fallback for format C.
  *                    Passed explicitly to keep this function pure and testable
  *                    without mocking the GitHub Actions runtime.
@@ -155,12 +162,6 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
 
   // Format D: unrecognised — throw so caller retries with stricter prompt.
   // Do NOT convert this to a return — the retry block in run() depends on this throw.
-  //
-  // Fence-stripping above uses replace() without /g — only the first fence
-  // occurrence is removed. Preamble text before a fenced block will cause
-  // JSON.parse to throw here, which triggers the strict-prompt retry. That is
-  // the correct and intended behaviour. Do NOT add /g — it would mask the
-  // failure instead of routing it to the retry handler.
   throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`)
 }
 
@@ -239,7 +240,10 @@ async function run(): Promise<void> {
 
     // 2. Resolve TAG
     // tag is validated (slash-guard + rev-parse) before any shell or prompt use.
-    // All shell calls reference tag via $SAFE_TAG env var — never direct interpolation.
+    // All shell calls reference tag via '$SAFE_TAG' (single-quoted env var) —
+    // never direct interpolation. Single-quoting prevents word-splitting on
+    // tag values that contain whitespace (technically valid in git tag names).
+    // The slash-guard rejects '/' but not whitespace — quoting is the correct fix.
     //
     // Prompt injection via tag: tag is interpolated into the prompt string below,
     // but this is not an injection vector — git rev-parse validates the tag exists
@@ -254,7 +258,7 @@ async function run(): Promise<void> {
     }
     if (tag.includes('/')) throw new Error('TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path')
     try {
-      git('rev-parse $SAFE_TAG', { SAFE_TAG: tag })
+      git("rev-parse '$SAFE_TAG'", { SAFE_TAG: tag })
     } catch {
       throw new Error(`TAG '${tag}' does not exist in this repository.`)
     }
@@ -262,7 +266,7 @@ async function run(): Promise<void> {
     // 3. Resolve PREV_TAG
     let prevTag = core.getInput('prev_tag').trim()
     if (!prevTag) {
-      prevTag = git('tag --sort=-version:refname | grep -v "^$SAFE_TAG$" | head -n 1', { SAFE_TAG: tag })
+      prevTag = git("tag --sort=-version:refname | grep -v '^$SAFE_TAG$' | head -n 1", { SAFE_TAG: tag })
     }
     if (!prevTag) {
       core.warning('No previous tag found — using first commit as baseline')
@@ -287,7 +291,10 @@ async function run(): Promise<void> {
     // page — if the API returns exactly 250 commits, the warning still fires
     // (250 > 80). Silently capped releases are noted in the step summary.
     //
-    // Requires: contents: read permission on GITHUB_TOKEN (see action.yml permissions block).
+    // Requires: contents: read permission on GITHUB_TOKEN.
+    // The permissions: block in action.yml documents this requirement but is
+    // advisory only — GitHub does not enforce action-level permissions at runtime.
+    // The caller workflow must grant contents: read at the job or workflow level.
     const octokit = github.getOctokit(token)
     const compare = await octokit.rest.repos.compareCommitsWithBasehead({
       owner,
