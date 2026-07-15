@@ -37,9 +37,10 @@ jobs:
       - name: Build afm-cli Swift binary
         run: |
           swift build -c release --package-path afm-cli
-          cp afm-cli/.build/release/afm-cli ./afm-cli-bin
-          # Replace in place (binary may already exist)
-          mv afm-cli-bin afm-cli
+          # Do NOT use `mv afm-cli-bin afm-cli` — `afm-cli/` is also a directory
+          # in this repo; mv would move the file into that directory instead of
+          # replacing the root-level binary. Copy directly to the target path.
+          cp afm-cli/.build/release/afm-cli ./afm-cli
           chmod +x afm-cli
 
       - name: Build dist/index.js
