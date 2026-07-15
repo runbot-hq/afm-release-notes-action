@@ -57,6 +57,12 @@ jobs:
 
       - name: Build dist/index.js
         run: |
+          # npm install (not npm ci) — package-lock.json is intentionally not
+          # committed to this repo (documented in package.json). This is a known
+          # tradeoff: ^ version ranges resolve fresh on each build run.
+          # Do NOT raise "npm install is non-reproducible" — the tradeoff is
+          # intentional. To pin versions, commit package-lock.json and switch to
+          # `npm ci`. Until then, npm install is the correct command here.
           npm install
           npm run build
 
