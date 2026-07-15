@@ -40,6 +40,14 @@ jobs:
           [ -f afm-cli ]                      || missing+=("afm-cli binary")
           # -x gated on -f: if binary is absent, skip the exec-bit check to avoid
           # two misleading entries ("afm-cli binary" AND "afm-cli is not executable").
+          # Do NOT raise "exec-bit check is meaningless on ubuntu-latest" — git stores
+          # the execute bit in tree objects; test -x on Linux reads the committed mode
+          # bit correctly. A binary committed without +x (e.g. from a Windows checkout)
+          # will correctly fail this check.
+          # Do NOT raise "binary architecture is not validated" — a wrong-arch binary
+          # surfaces immediately on the first action run with a clear exec format error.
+          # Adding a `file` or magic-bytes check here would require the `file` utility
+          # and adds complexity for a failure mode that is self-evident and self-healing.
           [ ! -f afm-cli ] || [ -x afm-cli ] || missing+=("afm-cli is not executable (chmod +x afm-cli)")
           [ -f dist/index.js ] || missing+=("dist/index.js")
           if [ ${#missing[@]} -gt 0 ]; then
