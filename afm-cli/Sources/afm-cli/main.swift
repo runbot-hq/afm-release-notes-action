@@ -12,7 +12,7 @@ guard #available(macOS 26.0, *) else {
 
 guard let idx = CommandLine.arguments.firstIndex(of: "--prompt"),
       CommandLine.arguments.indices.contains(idx + 1) else {
-    fputs("Usage: afm-cli --prompt <text>\n", stderr)
+    fputs("Usage: afm-cli --prompt <text> [--instructions <text>] [--temperature <double>] [--maximum-response-tokens <int>]\n", stderr)
     exit(1)
 }
 
@@ -29,28 +29,25 @@ switch SystemLanguageModel.default.availability {
 case .available:
     break
 case .unavailable(let reason):
-    fputs("Error: Apple Intelligence unavailable — \(reason)\n", stderr)
+    fputs("Error: Apple Intelligence unavailable \u{2014} \(reason)\n", stderr)
     exit(1)
 @unknown default:
     fputs("Error: unknown model availability state\n", stderr)
     exit(1)
 }
 
-// MARK: - Optional system prompt via --system-prompt flag
-
-var systemPrompt: String? = nil
-if let sysIdx = CommandLine.arguments.firstIndex(of: "--system-prompt"),
-   CommandLine.arguments.indices.contains(sysIdx + 1) {
-    systemPrompt = CommandLine.arguments[sysIdx + 1]
-}
-
 // MARK: - Session setup
+//
+// --instructions maps directly to Transcript.Instructions
+// which is Apple's term for what other frameworks call a system prompt.
 
 let session: LanguageModelSession
 
-if let sys = systemPrompt {
+if let iIdx = CommandLine.arguments.firstIndex(of: "--instructions"),
+   CommandLine.arguments.indices.contains(iIdx + 1) {
+    let instructionText = CommandLine.arguments[iIdx + 1]
     let instructions = Transcript.Instructions(
-        segments: [.text(.init(content: sys))],
+        segments: [.text(.init(content: instructionText))],
         toolDefinitions: []
     )
     session = LanguageModelSession(
@@ -60,10 +57,14 @@ if let sys = systemPrompt {
     session = LanguageModelSession()
 }
 
-// MARK: - Generation options
+// MARK: - GenerationOptions
+//
+// All parameter names mirror GenerationOptions API exactly:
+//   --temperature              → GenerationOptions.temperature
+//   --maximum-response-tokens  → GenerationOptions.maximumResponseTokens
 
 var temperature: Double = 0.7
-var maxTokens: Int = 2048
+var maximumResponseTokens: Int? = nil
 
 if let tIdx = CommandLine.arguments.firstIndex(of: "--temperature"),
    CommandLine.arguments.indices.contains(tIdx + 1),
@@ -71,15 +72,15 @@ if let tIdx = CommandLine.arguments.firstIndex(of: "--temperature"),
     temperature = t
 }
 
-if let mIdx = CommandLine.arguments.firstIndex(of: "--max-tokens"),
+if let mIdx = CommandLine.arguments.firstIndex(of: "--maximum-response-tokens"),
    CommandLine.arguments.indices.contains(mIdx + 1),
    let m = Int(CommandLine.arguments[mIdx + 1]) {
-    maxTokens = m
+    maximumResponseTokens = m
 }
 
 let options = GenerationOptions(
     temperature: temperature,
-    maximumResponseTokens: maxTokens
+    maximumResponseTokens: maximumResponseTokens
 )
 
 // MARK: - Inference
@@ -89,7 +90,7 @@ do {
     print(response.content)
     exit(0)
 } catch {
-    fputs("Error: inference failed — \(error)\n", stderr)
+    fputs("Error: inference failed \u{2014} \(error)\n", stderr)
     exit(1)
 }
 
