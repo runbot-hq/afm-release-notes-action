@@ -15,10 +15,6 @@ if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
 fi
 
 # 2. Resolve TAG — auto-fill latest if blank, then validate it exists in the repo.
-# workflow_dispatch default: '' means TAG may arrive empty when the user leaves the
-# field blank. Auto-resolving to the latest semver tag gives pre-fill UX without
-# requiring a static default in the YAML. If TAG is set but does not exist as a git
-# tag, we fail early with a clear message rather than letting gh api return a 404.
 if [ -z "${TAG:-}" ]; then
   TAG=$(git tag --sort=-version:refname | head -n 1)
   if [ -z "$TAG" ]; then
@@ -28,9 +24,6 @@ if [ -z "${TAG:-}" ]; then
   echo "[afm] TAG not provided — auto-resolved to latest: $TAG"
 fi
 
-# Tag slash guard — must run before git rev-parse so a caller passing
-# refs/tags/v1.0.0 gets the clear ::error:: annotation, not a confusing
-# "does not exist" message from rev-parse.
 [[ "$TAG" =~ / ]] && { echo '::error::TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
 
 if ! git rev-parse "$TAG" >/dev/null 2>&1; then
@@ -39,9 +32,6 @@ if ! git rev-parse "$TAG" >/dev/null 2>&1; then
 fi
 
 # 3. Resolve prev_tag from git tags
-# version:refname sort is semver-aware (vN.N.N). This is correct for run-bot's tag
-# convention. If non-semver tags are ever introduced (e.g. nightly-*, beta), add a
-# grep -E '^v[0-9]' filter before head -n 1 to exclude them from the sort.
 if [ -z "${PREV_TAG:-}" ]; then
   PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -n 1)
 fi
@@ -53,22 +43,7 @@ fi
 
 echo "[afm] Comparing $PREV_TAG → $TAG"
 
-# 4. Fetch diff context (read-only, uses ambient GITHUB_TOKEN)
-# GitHub's compare API returns at most 250 commits and 300 files per page (no pagination
-# on this endpoint via gh cli --jq). TOTAL_COMMITS / TOTAL_FILES in the step summary
-# reflect the API-capped count, not the true range size on very large releases.
-# This is cosmetic only — the prompt cap logic (80 commits / 150 files) still operates
-# correctly on whatever the API returns. Do NOT add --paginate; the endpoint doesn't
-# support it for compare and it would change the response shape.
-# timeout 30: the compare API is a single lightweight JSON response. 30s is generous
-# for any reasonable network; if it hasn't responded in 30s something is wrong (rate
-# limit, DNS failure, GitHub outage) and we should fail fast rather than block the job.
-
-# PREV_TAG slash guard — catches the case where a caller explicitly passes
-# prev_tag as a ref path (e.g. refs/tags/v1.2.3). This guard does NOT fire on
-# auto-resolved values: `git tag` always emits bare tag names (no slashes), and
-# the first-commit SHA fallback (git rev-list --max-parents=0) also never contains
-# a slash. The guard is therefore only meaningful for explicit caller input.
+# 4. Fetch diff context
 [[ "${PREV_TAG:-}" =~ / ]] && { echo '::error::prev_tag contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path'; exit 1; }
 CONTEXT=$(timeout 30 gh api "repos/$OWNER/$REPO_NAME/compare/$PREV_TAG...$TAG" \
   --jq '{
@@ -87,22 +62,12 @@ TOTAL_FILES=$(echo "$CONTEXT"   | jq '.total_files')
 [ "$TOTAL_COMMITS" -gt 80  ] && echo "::warning::$TOTAL_COMMITS commits — prompt capped at 80"
 [ "$TOTAL_FILES"   -gt 150 ] && echo "::warning::$TOTAL_FILES files — prompt capped at 150"
 
-# Filter noisy commit messages (fixup!/squash!/WIP) before capping at 80 — they
-# pollute the prompt and degrade AFM output quality.
-# WIP REGEX: [Ww][Ii][Pp]([ :]|$) catches:
-#   "WIP: thing", "WIP thing", "WIP" (bare), "wip:", "wip" (bare)
-# The ([ :]|$) alternation is intentional — a bare WIP commit with no separator
-# would not be caught by [Ww][Ii][Pp][ :] alone.
 CONTEXT=$(echo "$CONTEXT" | jq '{
   commits: [.commits[] | select(test("^(fixup!|squash!|[Ww][Ii][Pp]([ :]|$))") | not)][:80],
   files: .files[:150]
 }')
 
 # 5. Build prompt payload
-# PROMPT_EXTRA: sourced from env: in action.yml (inputs.prompt_extra). When a caller
-# omits prompt_extra, GitHub Actions sets the env var to '' (empty string) — NOT unset.
-# So ${#PROMPT_EXTRA} is 0 and set -u does not fire. The ${PROMPT_EXTRA:0:300} slice
-# below is also safe on an empty string. No guard needed.
 if [ "${#PROMPT_EXTRA}" -gt 300 ]; then
   echo "::warning::prompt_extra truncated to 300 chars (was ${#PROMPT_EXTRA})"
 fi
@@ -136,18 +101,6 @@ jq -n \
   }' > "$PAYLOAD"
 
 # 6. Call AFM sidecar — retry 2×60s with sleep between for cold-start model loading
-#
-# DESIGN: Why __AFM_FATAL__ sentinel instead of exit 1?
-# `exit 1` inside a $() command substitution only exits the subshell — bash does NOT
-# propagate it to the outer script even with set -e. The sentinel echoes a known string
-# to stdout (captured into RAW), which the outer script then checks and exits on.
-# Both the MDM/fatal path AND the retry-exhausted path emit `echo "__AFM_FATAL__"` —
-# there is NO bare `exit 1` inside the $() block. Do NOT replace with exit 1.
-# The retry warning goes to stderr (>&2) so it is NOT captured into RAW.
-# The string equality check `[ "$RAW" = "__AFM_FATAL__" ]` is intentional — any node
-# stdout prefix before a crash would mean RAW != sentinel, which falls through to the
-# empty-output check in step 6 and surfaces as a warning, not a silent pass.
-# NOTE: The exit 1 in step 4 (gh api compare failure) is OUTSIDE $() and is correct.
 AFM_ERR=$(mktemp "${TMPDIR:-/tmp}/afm_err_XXXXXX.txt")
 
 run_afm() {
@@ -172,69 +125,51 @@ RAW=$(
   }
 )
 if [ "$RAW" = "__AFM_FATAL__" ]; then exit 1; fi
-# PAYLOAD and AFM_ERR cleanup: rm is called here (outside $()) rather than via trap
-# because both files are also rm'd inside the $() subshell on the fatal paths. A trap
-# on the outer shell would double-remove on the fatal path (harmless but noisy) and
-# more importantly the subshell rm IS effective — rm operates on the filesystem path
-# directly, not on a copied variable, so the file is gone by the time we reach here
-# on the fatal path. On the success path we clean up here. rm -f is safe either way.
 rm -f "$PAYLOAD" "$AFM_ERR"
 
 # Strip markdown code fences AFM sometimes wraps around JSON output.
-# AFM occasionally ignores the "Output JSON only — no markdown fences" instruction
-# and wraps the response in ```json ... ``` or ``` ... ```. This strips leading/trailing
-# fences so jq can parse clean JSON without triggering the fallback path.
-#
-# WHY TWO SEPARATE sed PASSES (not one expression):
-# `printf '%s' "$RAW"` feeds the full multi-line string to sed. POSIX sed processes each
-# line independently — `^` anchors to the start of each line, `$` to the end of each
-# line. Both passes use /pattern/d (delete the line entirely, not replace with empty
-# string) so no blank-line residue is left where fences were. Using s/pattern// would
-# leave empty lines, which jq tolerates but would cause the prose fallback's `head -n 1`
-# to return an empty string if the fence was on line 1.
-#
-# Both passes use full-line anchors (^[[:space:]]*...[[:space:]]*$) so they only
-# fire on lines that consist ENTIRELY of the fence pattern — never on lines in the body
-# that merely start with triple backticks (e.g. a code block opener like "```bash ...").
-#
-# Pass 1: delete any fence-only line that starts with ```json (language-tagged opener).
-#         Must run first — pass 2's bare-fence pattern would also match ```json lines,
-#         so pass 1 must consume them before pass 2 sees the string.
-# Pass 2: delete any remaining fence-only line (bare ``` opener, or closing fence).
-#         Catches: the residue after pass 1 if AFM emits ```json on its own line,
-#         standalone ``` openers with no language tag, and all closing ``` fences.
-#
-# All patterns are full-line anchored. Do NOT simplify to a prefix strip like
-# `s/^```[[:space:]]*//` — that would mangle "```bash" lines in body code blocks
-# by leaving "bash" as a dangling word on the line.
-# Note: /pattern/d deletes the matching line entirely (no blank line residue).
-# s/pattern// would leave an empty line where the fence was, which is harmless
-# for jq but would cause the prose fallback's `head -n 1` to return an empty
-# string if AFM wraps its output and the fence happens to be the first line.
 RAW=$(printf '%s' "$RAW" | sed '/^[[:space:]]*```json[[:space:]]*$/d' | sed '/^[[:space:]]*```[[:space:]]*$/d')
 
-# 7. Parse — fallback to raw if AFM returns prose instead of JSON
-# USED_FALLBACK is set here at the actual decision point and reused in step 9 summary.
-# Do NOT re-derive fallback status from RAW in step 9 via jq — RAW may have been
-# partially parsed or truncated by then, and re-checking would be inconsistent.
+# 7. Parse AFM output — three formats handled in priority order:
 #
-# DOUBLE-PARSE IDIOM: `if type=="string" then fromjson else . end`
-# AFM occasionally returns the JSON object double-encoded — i.e. the entire JSON
-# object serialised as a JSON string (e.g. "{\"title\":\"...\"}" with outer quotes).
-# The `if type=="string" then fromjson` branch handles that case by parsing once more.
-# The `else .` branch handles the normal case where AFM returns a plain JSON object.
-# `// empty` produces an empty string (not null/false) so the -z checks below work.
-# The `2>/dev/null || true` suppresses jq errors when RAW is unparseable prose —
-# those cases are caught by the -z TITLE/-z BODY fallback block immediately below.
+#   A. {"title": "...", "body": "..."}         ← ideal; use directly
+#   B. Double-encoded string of A               ← fromjson then extract
+#   C. {"Added":[...], "Changed":[...], ...}   ← AFM ignored the schema;
+#                                                  convert section arrays to Markdown
+#   D. Unparseable prose                        ← last resort: use raw text
+#
+# USED_FALLBACK=1 means C or D was triggered (logged in step summary).
 USED_FALLBACK=0
 TITLE=$(echo "$RAW" | jq -r 'if type=="string" then fromjson else . end | .title // empty' 2>/dev/null || true)
 BODY=$(echo  "$RAW" | jq -r 'if type=="string" then fromjson else . end | .body  // empty' 2>/dev/null || true)
 
 if [ -z "$TITLE" ] || [ -z "$BODY" ]; then
-  USED_FALLBACK=1
-  echo "::warning::AFM did not return valid JSON — falling back to raw output. Check the Log outputs step and consider tuning the prompt."
-  TITLE=$(echo "$RAW" | head -n 1 | cut -c1-100)
-  BODY="$RAW"
+  # Check if AFM returned a section-keyed object (Added/Changed/Fixed/Removed/Security)
+  # and convert it to Markdown rather than dumping raw JSON.
+  SECTION_BODY=$(echo "$RAW" | jq -r '
+    if type == "object" and (has("Added") or has("Changed") or has("Fixed") or has("Removed") or has("Security")) then
+      [
+        (if (.Added   // [] | length) > 0 then "## Added\n"   + (.Added[]   | "- " + .) else empty end),
+        (if (.Changed // [] | length) > 0 then "## Changed\n" + (.Changed[] | "- " + .) else empty end),
+        (if (.Fixed   // [] | length) > 0 then "## Fixed\n"   + (.Fixed[]   | "- " + .) else empty end),
+        (if (.Removed // [] | length) > 0 then "## Removed\n" + (.Removed[] | "- " + .) else empty end),
+        (if (.Security// [] | length) > 0 then "## Security\n"+ (.Security[]| "- " + .) else empty end)
+      ] | join("\n\n")
+    else empty end
+  ' 2>/dev/null || true)
+
+  if [ -n "$SECTION_BODY" ]; then
+    USED_FALLBACK=1
+    echo "::warning::AFM returned section-keyed JSON instead of {title,body} — converting to Markdown."
+    TITLE="$TAG"
+    BODY="$SECTION_BODY"
+  else
+    # Last resort: raw prose fallback
+    USED_FALLBACK=1
+    echo "::warning::AFM did not return valid JSON — falling back to raw output. Check the Log outputs step and consider tuning the prompt."
+    TITLE=$(echo "$RAW" | grep -v '^[[:space:]]*$' | head -n 1 | cut -c1-100)
+    BODY="$RAW"
+  fi
 fi
 
 if [ -z "$TITLE" ] || [ -z "$BODY" ]; then
@@ -242,8 +177,7 @@ if [ -z "$TITLE" ] || [ -z "$BODY" ]; then
   exit 1
 fi
 
-# 8. Cap body length — GitHub Releases supports ~125k chars; 120k gives a safe margin.
-# GitHub Actions output itself has no hard per-value limit that would be hit at this size.
+# 8. Cap body length
 if [ "${#BODY}" -gt 120000 ]; then
   echo "::warning::Generated body exceeds 120000 chars — truncating"
   BODY="${BODY:0:120000}"
@@ -252,9 +186,6 @@ fi
 echo "[afm] Generated: $TITLE"
 
 # 9. Write outputs (random delimiter prevents body content collision)
-# ALL THREE outputs (release_title, prev_tag, release_body) use the heredoc <<DELIM form.
-# Do NOT simplify release_title or prev_tag to bare `echo "key=value"` — AFM output could
-# theoretically contain a newline, which would silently corrupt $GITHUB_OUTPUT.
 OUTPUT_DELIM="AFM_OUT_$(openssl rand -hex 8)"
 {
   echo "release_title<<${OUTPUT_DELIM}"
