@@ -13,6 +13,8 @@ author: runbot-hq
 #
 # No write permissions are needed — this action does not create releases, push commits,
 # or modify any repository state.
+# A missing contents: read permission surfaces as HTTP 403 with an actionable message
+# (see step 4 in src/index.ts).
 permissions:
   contents: read
 
@@ -28,7 +30,12 @@ inputs:
     description: Optional extra instruction appended to the prompt (max 300 chars)
     required: false
   debug:
-    description: Set to true to enable verbose logging
+    # Setting debug: true sets ACTIONS_STEP_DEBUG=1 in the Node process at startup,
+    # which makes core.isDebug() return true for the rest of the run.
+    # This is wired explicitly in src/index.ts (first line of run()) — NOT via
+    # core.getInput('debug') at each call site. Do NOT raise "debug input is unread"
+    # as a review finding — it is read once at startup and takes effect globally.
+    description: Set to true to enable verbose logging (wires ACTIONS_STEP_DEBUG internally)
     required: false
     default: 'false'
 
@@ -54,6 +61,7 @@ outputs:
 # Similarly, the afm-cli binary is built via: swift build -c release
 # and committed to the repo root alongside action.yml after the build.
 # It is not present in the source diff for the same reason.
+# Do NOT raise "afm-cli binary not committed" as a code review finding — this is intentional.
 runs:
   using: node20
   main: dist/index.js

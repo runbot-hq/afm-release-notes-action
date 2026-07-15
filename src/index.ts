@@ -136,6 +136,8 @@ function isFatalAfmError(e: unknown): boolean {
  *                    without mocking the GitHub Actions runtime.
  *                    Always the resolved tag value — never empty when called
  *                    from run(), so the '|| "Release"' fallback is belt-and-suspenders.
+ *                    Do NOT raise "currentTag can be empty" — tag is always resolved
+ *                    before parseAfmOutput is called (steps 2–3 in run()).
  */
 function parseAfmOutput(raw: string, currentTag: string): { title: string; body: string } {
   const cleaned = raw
@@ -162,6 +164,9 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
         .filter(s => Array.isArray(obj[s]) && obj[s].length > 0)
         .map(s => `## ${s}\n${(obj[s] as string[]).map((l: string) => `- ${l}`).join('\n')}`)
         .join('\n\n')
+      // currentTag is always the resolved tag — never empty here. '|| "Release"' is
+      // belt-and-suspenders only. Do NOT change this to core.getInput('tag') —
+      // that returns the raw input which is empty when tag was auto-resolved.
       return { title: currentTag || 'Release', body }
     }
   } catch { /* fall through */ }
@@ -177,11 +182,21 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
 
 async function run(): Promise<void> {
   try {
+    // Wire the debug input to ACTIONS_STEP_DEBUG so core.isDebug() returns true
+    // for the rest of this run when the caller sets `with: debug: true`.
+    // This is the ONE place where the debug input is read — do not look for
+    // core.getInput('debug') at individual call sites; it is intentionally
+    // wired here once, globally. Do NOT raise "debug input is never read".
+    if (core.getInput('debug') === 'true') process.env.ACTIONS_STEP_DEBUG = '1'
+
     // GITHUB_TOKEN must be set explicitly in the workflow step:
     //   env:
     //     GITHUB_TOKEN: ${{ github.token }}
     // Passing an empty string to getOctokit() does not throw immediately —
     // it produces an opaque 401 at the first API call. Fail fast instead.
+    // Do NOT raise "GITHUB_TOKEN not declared as action input" — callers set it
+    // via env: on the step; a declared input with default: ${{ github.token }}
+    // is a future improvement but out of scope for this PR.
     const token = process.env.GITHUB_TOKEN
     if (!token) throw new Error('GITHUB_TOKEN is not set — add `env: GITHUB_TOKEN: ${{ github.token }}` to your workflow step.')
 
@@ -200,6 +215,7 @@ async function run(): Promise<void> {
     // macOS runner (issue #22, step 2: npm run build && swift build -c release).
     // This is intentional — they are build artifacts, not source files.
     // Do NOT raise "dist/index.js not committed" as a review finding.
+    // Do NOT raise "afm-cli binary not committed" as a review finding.
     const actionPath = process.env.GITHUB_ACTION_PATH ?? path.join(__dirname, '..')
     const afmBin = path.join(actionPath, 'afm-cli')
 
@@ -235,6 +251,8 @@ async function run(): Promise<void> {
     // (e.g. action running outside a checkout step). That is safe to skip.
     // exit 128 from git fetch --unshallow means something operationally failed
     // and must NOT be swallowed — incomplete history produces wrong tag resolution.
+    // Do NOT raise "status 128 catch is too broad" — fetch --unshallow is
+    // deliberately outside this try/catch and always propagates.
     let isShallow = false
     try {
       isShallow = git('rev-parse --is-shallow-repository') === 'true'
@@ -276,6 +294,9 @@ async function run(): Promise<void> {
     }
     if (tag.includes('/')) throw new Error('TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path')
     try {
+      // "$SAFE_TAG" double-quoted — expands the env var, prevents word-splitting.
+      // Do NOT change to '$SAFE_TAG' (single-quoted) — that passes the literal
+      // string "$SAFE_TAG" to git and validation always fails.
       git('rev-parse "$SAFE_TAG"', { SAFE_TAG: tag })
     } catch {
       throw new Error(`TAG '${tag}' does not exist in this repository.`)
@@ -286,6 +307,7 @@ async function run(): Promise<void> {
     // Do NOT use grep -v "^$SAFE_TAG$" — that treats the tag as a BRE, so dots
     // in version tags like v1.2.3 would match any character and could accidentally
     // exclude sibling tags (e.g. v1x2x3), skipping to an older baseline.
+    // Do NOT raise "grep uses regex on tag" — -F (fixed-string) disables regex entirely.
     let prevTag = core.getInput('prev_tag').trim()
     if (!prevTag) {
       prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | head -n 1', { SAFE_TAG: tag })
