@@ -17,6 +17,9 @@ function git(cmd: string, env?: Record<string, string>): string {
   //
   // CALLERS MUST NOT interpolate user-controlled values directly into cmd.
   // Always use the env parameter and reference values as $VAR_NAME.
+  // Note: type-level enforcement is not possible for shell strings in JS.
+  // The doc contract here is the only enforcement mechanism — all current
+  // call sites are verified correct. Do NOT add new call sites without review.
   return execSync(`git ${cmd}`, {
     encoding: 'utf8',
     shell: true,
@@ -36,9 +39,14 @@ function git(cmd: string, env?: Record<string, string>): string {
  * maxBuffer is set to 10 MB. Node's default is 1 MB which can be exceeded
  * by verbose model output before the 120_000 char body cap is applied downstream.
  *
+ * On timeout, spawnSync sets result.error to ETIMEDOUT (not result.status).
+ * This is handled by the result.error check below and propagates as a thrown
+ * error. The caller (step 6 in run()) enriches ETIMEDOUT with context before
+ * surfacing to core.setFailed.
+ *
  * Flag names mirror the FoundationModels API exactly (see main.swift):
  *   --prompt                   → session.respond(to:)
- *   --instructions             → Transcript.Instructions (Apple's term for system prompt)
+ *   --instructions             → LanguageModelSession(instructions:) (Apple's term for system prompt)
  *   --temperature              → GenerationOptions.temperature
  *   --maximum-response-tokens  → GenerationOptions.maximumResponseTokens
  */
@@ -82,6 +90,10 @@ function afmCli(bin: string, prompt: string, options?: {
  * a retry cannot recover from — model unavailable, MDM lockout, permission denied.
  * These map to exit(1) from the availability switch in main.swift.
  * Do NOT retry on these — the error will be identical on the second attempt.
+ *
+ * ETIMEDOUT is intentionally not fatal here — a timeout on attempt 1 is
+ * retried after 15s (cold-start model load). ETIMEDOUT on attempt 2 propagates
+ * with enriched context via the catch in step 6.
  */
 function isFatalAfmError(e: unknown): boolean {
   const msg = String(e).toLowerCase()
@@ -139,10 +151,11 @@ function parseAfmOutput(raw: string): { title: string; body: string } {
   // Format D: unrecognised — throw so caller retries with stricter prompt.
   // Do NOT convert this to a return — the retry block in run() depends on this throw.
   //
-  // Note: fence-stripping above uses replace() without /g so only the first
-  // fence occurrence is removed. If the model returns preamble + a fenced block,
-  // this parse will throw and the strict-prompt retry will handle it. That is
-  // the correct and intended behaviour — do NOT add /g to work around it.
+  // Fence-stripping above uses replace() without /g — only the first fence
+  // occurrence is removed. Preamble text before a fenced block will cause
+  // JSON.parse to throw here, which triggers the strict-prompt retry. That is
+  // the correct and intended behaviour. Do NOT add /g — it would mask the
+  // failure instead of routing it to the retry handler.
   throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`)
 }
 
@@ -169,6 +182,11 @@ async function run(): Promise<void> {
     // actionPath is the directory where action.yml lives.
     // afm-cli binary is committed there alongside action.yml.
     // GITHUB_ACTION_PATH is set by the runner for all action types including node20.
+    //
+    // NOTE: dist/index.js (the compiled TS bundle) and the afm-cli binary are
+    // NOT committed in this PR. Both require a local build step on the self-hosted
+    // macOS runner (issue #22, step 2: npm run build && swift build -c release).
+    // This is intentional — they are build artifacts, not source files.
     const actionPath = process.env.GITHUB_ACTION_PATH ?? path.join(__dirname, '..')
     const afmBin = path.join(actionPath, 'afm-cli')
 
@@ -314,6 +332,10 @@ async function run(): Promise<void> {
     // denied will not recover in 15s. isFatalAfmError() detects these and rethrows
     // immediately. The first error is always logged via core.debug so the root
     // cause is never silently dropped even when the retry succeeds.
+    //
+    // ETIMEDOUT is not treated as fatal — a slow cold-start can exceed 60s on
+    // first run. If attempt 2 also times out, the error is enriched with the
+    // binary path and attempt number before propagating to core.setFailed.
     core.info('[afm] Calling afm-cli...')
     let raw: string
     try {
@@ -323,7 +345,17 @@ async function run(): Promise<void> {
       if (isFatalAfmError(e)) throw e
       core.info('[afm] Attempt 1 failed — retrying in 15s (cold-start model load)...')
       await new Promise(r => setTimeout(r, 15_000))
-      raw = afmCli(afmBin, prompt, afmOptions)
+      try {
+        raw = afmCli(afmBin, prompt, afmOptions)
+      } catch (e2) {
+        // Enrich bare ETIMEDOUT / generic errors with context before surfacing.
+        const detail = String(e2)
+        throw new Error(
+          `[afm] Attempt 2 failed (binary: ${afmBin}): ${detail}. ` +
+          'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
+          'consider increasing the timeout or pre-warming the runner.'
+        )
+      }
     }
 
     if (!raw) throw new Error('afm-cli returned empty output')
