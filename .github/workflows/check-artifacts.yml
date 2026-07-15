@@ -1,32 +1,40 @@
-# Sanity check that fires on every push to main, including the bot artifact
-# commit from build-artifacts.yml. Validates afm-cli is a real executable file
-# (not a directory) and dist/index.js exists.
+# Sanity check that fires after build-artifacts.yml completes on main.
+# Using workflow_run instead of push avoids the race condition where
+# check-artifacts runs on the merge commit before the bot has had a chance
+# to build and commit afm-cli-bin and dist/index.js.
 #
 # If build-artifacts.yml is working correctly this check will always be green.
 name: Check committed artifacts
 
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows: ["Build and commit artifacts"]
+    types: [completed]
+    branches: [main]
 
 jobs:
   check-artifacts:
+    # Only run if the build workflow succeeded — no point checking artifacts
+    # if the build itself failed.
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Check out the commit that the build workflow pushed to (the bot
+          # artifact commit), not the merge commit that triggered the build.
+          ref: main
 
-      - name: Verify afm-cli binary and dist/index.js are committed
+      - name: Verify afm-cli-bin binary and dist/index.js are committed
         run: |
           missing=()
           # Use -f (regular file) not just existence — catches the case where the
-          # build step accidentally committed afm-cli/ as a directory entry instead
-          # of a root-level binary (the cp/mv directory-descend failure mode).
-          [ -f afm-cli ]   || missing+=("afm-cli binary (missing or is a directory — check build-artifacts.yml)")
+          # build step accidentally committed afm-cli-bin as a directory entry.
+          [ -f afm-cli-bin ]   || missing+=("afm-cli-bin binary (missing or is a directory — check build-artifacts.yml)")
           # -x tests the committed file mode bit, not runtime executability.
           # This is correct — Ubuntu cannot run a Mach-O binary regardless.
           # The check ensures install -m 755 set the bit before committing.
-          [ -x afm-cli ]   || missing+=("afm-cli missing executable bit (file mode)")
+          [ -x afm-cli-bin ]   || missing+=("afm-cli-bin missing executable bit (file mode)")
           [ -f dist/index.js ] || missing+=("dist/index.js")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing committed artifacts: ${missing[*]}"
