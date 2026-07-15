@@ -136,7 +136,7 @@ function isFatalAfmError(e: unknown): boolean {
   // outside main.swift. These do not begin with "error:" and have no fputs() entry.
   //   'not authorized' — macOS MDM/entitlement denial (e.g. "operation not authorized")
   //   'eacces'         — POSIX EACCES from the OS (e.g. binary not executable)
-  //   'mdm'            — MDM policy strings (e.g. "blocked by mdm policy")
+  //   'mdm policy'     — MDM policy strings (e.g. "blocked by mdm policy")
   // Do NOT remove these — they guard a real, separate error path that is not
   // produced by main.swift but is equally unrecoverable on retry.
   const msg = String(e).toLowerCase()
@@ -147,7 +147,7 @@ function isFatalAfmError(e: unknown): boolean {
     msg.includes('error: foundationmodels framework not available') ||
     msg.includes('not authorized') || // SOURCE 2: OS/MDM entitlement denial
     msg.includes('eacces') ||         // SOURCE 2: POSIX EACCES
-    msg.includes('mdm')               // SOURCE 2: MDM policy block
+    msg.includes('mdm policy')        // SOURCE 2: MDM policy block (e.g. "blocked by mdm policy")
   )
 }
 
