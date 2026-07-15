@@ -169,12 +169,15 @@ function isFatalAfmError(e: unknown): boolean {
  * it would silently accept malformed output instead of triggering the retry.
  *
  * The three replace() calls are order-sensitive but correct:
- *   1. /^```json\s*/m  — strips opening fence with language tag (e.g. ```json)
- *   2. /^```\s*/m      — fallback: strips opening fence without tag (e.g. ```JSON uppercase)
+ *   1. /^```json\s* /m  — strips opening fence with language tag (e.g. ```json)
+ *      (regex: caret, backtick x3, "json", \s*, end — multiline flag)
+ *   2. /^```\s* /m      — fallback: strips opening fence without tag (e.g. ```JSON uppercase)
+ *      (regex: caret, backtick x3, \s*, end — multiline flag)
  *                        also matches the closing fence if it appears at a line start,
  *                        but only AFTER the opening fence was already removed by step 1.
  *                        With well-formed single-block output this is harmless.
- *   3. /```\s*$/m      — strips closing fence.
+ *   3. /```\s*$/m       — strips closing fence.
+ *      (regex: backtick x3, \s*, dollar — multiline flag)
  * Do NOT reorder or merge these — the fallback in step 2 is intentional.
  *
  * @param raw         Raw string output from afm-cli stdout
