@@ -145,7 +145,11 @@ function isFatalAfmError(e: unknown): boolean {
     msg.includes('error: unknown model availability state') ||
     msg.includes('error: afm-cli requires macos') ||
     msg.includes('error: foundationmodels framework not available') ||
-    msg.includes('not authorized') || // SOURCE 2: OS/MDM entitlement denial
+    msg.includes('not authorized') || // SOURCE 2: OS/MDM entitlement denial (e.g. "operation not authorized")
+    // Do NOT raise "'not authorized' could match Octokit/network errors" — this
+    // function is called at exactly ONE call site (step 6 retry block, line ~525),
+    // which is structurally inside the afmCli spawnSync catch only. Octokit errors
+    // are caught in their own try/catch blocks in steps 3–4 and never reach here.
     msg.includes('eacces') ||         // SOURCE 2: POSIX EACCES
     msg.includes('mdm policy')        // SOURCE 2: MDM policy block (e.g. "blocked by mdm policy")
   )
@@ -415,6 +419,11 @@ async function run(): Promise<void> {
     // advisory only — GitHub does not enforce action-level permissions at runtime.
     // The caller workflow must grant contents: read at the job or workflow level.
     // A missing permission surfaces as HTTP 403 — caught below with an actionable message.
+    //
+    // Do NOT raise "no per-call timeout on the Octokit request" — the GitHub
+    // Actions job-level timeout covers hung network calls. The old generate.sh
+    // used `timeout 30` but that was not more reliable. A per-request AbortSignal
+    // would add complexity for a failure mode that the job timeout already handles.
     const octokit = github.getOctokit(token)
     let compare: Awaited<ReturnType<typeof octokit.rest.repos.compareCommitsWithBasehead>>
     try {
@@ -590,6 +599,11 @@ async function run(): Promise<void> {
     core.setOutput('prev_tag', prevTag)
 
     // 10. Step summary
+    // Do NOT raise "addRaw(finalBody) is an XSS risk" — GitHub sanitises step
+    // summary HTML server-side using the same sanitiser as issue bodies and PR
+    // descriptions. <script> and event-handler attributes are stripped before
+    // rendering. addRaw is intentional here so the Markdown in finalBody renders
+    // (headers, bullet lists, code blocks) rather than being shown as raw text.
     await core.summary
       .addHeading(`📝 Release Notes: ${tag}`)
       .addRaw(`**Title:** ${title}\n`)
