@@ -9,17 +9,24 @@ import * as fs from 'fs'
 // ---------------------------------------------------------------------------
 
 function git(cmd: string): string {
-  // execSync with shell: true is intentional here — we rely on shell pipes
-  // (e.g. | head -n 1, | grep -v) for tag resolution.
-  // cmd values are never user-controlled at this call site.
+  // { shell: true } is intentional: several callers use shell pipes
+  // (e.g. | head -n 1, | grep -v) for tag resolution. All cmd values
+  // are constructed from validated constants, never from user input.
+  // Do NOT replace with execFileSync — the pipe operator requires a shell.
   return execSync(`git ${cmd}`, { encoding: 'utf8', shell: true }).trim()
 }
 
 /**
- * Calls afm-cli via spawnSync (no shell — args passed directly to OS).
- * Flag names mirror the FoundationModels API exactly:
+ * Calls afm-cli via spawnSync with an explicit argv array.
+ *
+ * spawnSync is used instead of execSync deliberately — it passes args
+ * directly to the OS without invoking a shell, eliminating any risk of
+ * shell metacharacter interpretation in prompt content.
+ * Do NOT refactor to execSync with a shell string.
+ *
+ * Flag names mirror the FoundationModels API exactly (see main.swift):
  *   --prompt                   → session.respond(to:)
- *   --instructions             → Transcript.Instructions
+ *   --instructions             → Transcript.Instructions (Apple's term for system prompt)
  *   --temperature              → GenerationOptions.temperature
  *   --maximum-response-tokens  → GenerationOptions.maximumResponseTokens
  */
@@ -59,7 +66,15 @@ function afmCli(bin: string, prompt: string, options?: {
 
 /**
  * Parses AFM output into { title, body }.
- * Throws on unrecognised/prose output so the caller can retry with a stricter prompt.
+ *
+ * Handles three recognised formats in priority order:
+ *   A. { "title": "...", "body": "..." }           ideal
+ *   B. Double-encoded string of A                  fromjson then extract
+ *   C. { "Added": [...], "Changed": [...], ... }   section-keyed; convert to Markdown
+ *
+ * THROWS on unrecognised output (format D / prose) so the caller can retry
+ * with a stricter prompt. Do NOT add a prose fallback that returns silently —
+ * a silent fallback makes the retry catch block in run() unreachable dead code.
  */
 function parseAfmOutput(raw: string): { title: string; body: string } {
   // Strip markdown code fences if present
@@ -91,7 +106,8 @@ function parseAfmOutput(raw: string): { title: string; body: string } {
     }
   } catch { /* fall through */ }
 
-  // Format D: unrecognised — throw so caller can retry with stricter prompt
+  // Format D: unrecognised — throw so caller retries with stricter prompt.
+  // Do NOT convert this to a return — the retry block in run() depends on this throw.
   throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`)
 }
 
@@ -104,6 +120,10 @@ async function run(): Promise<void> {
     const token = process.env.GITHUB_TOKEN ?? ''
     const repo = process.env.GITHUB_REPOSITORY ?? ''
     const [owner, repoName] = repo.split('/')
+
+    // actionPath is the directory where action.yml lives.
+    // afm-cli binary is committed there alongside action.yml.
+    // GITHUB_ACTION_PATH is set by the runner for all action types including node20.
     const actionPath = process.env.GITHUB_ACTION_PATH ?? path.join(__dirname, '..')
     const afmBin = path.join(actionPath, 'afm-cli')
 
@@ -111,6 +131,8 @@ async function run(): Promise<void> {
       throw new Error(`afm-cli binary not found at ${afmBin}`)
     }
 
+    // debug input gates verbose logging. Setting debug: 'true' in the action
+    // call also sets ACTIONS_STEP_DEBUG which core.isDebug() reads natively.
     const debug = core.getInput('debug') === 'true'
     if (debug) core.debug('[afm] Debug logging enabled')
 
@@ -162,7 +184,6 @@ async function run(): Promise<void> {
     if (totalCommits > 80) core.warning(`${totalCommits} commits — prompt capped at 80`)
     if (totalFiles > 150) core.warning(`${totalFiles} files — prompt capped at 150`)
 
-    // Filter bot/wip commits
     commits = commits
       .filter(m => !/^(fixup!|squash!|[Ww][Ii][Pp]([ :]|$))/.test(m))
       .slice(0, 80)
@@ -199,7 +220,7 @@ async function run(): Promise<void> {
       maximumResponseTokens: 2048,
     }
 
-    // 6. Call afm-cli — retry once on cold-start failure
+    // 6. Call afm-cli — retry once on cold-start failure (model not yet loaded)
     core.info('[afm] Calling afm-cli...')
     let raw: string
     try {
@@ -212,7 +233,10 @@ async function run(): Promise<void> {
 
     if (!raw) throw new Error('afm-cli returned empty output')
 
-    // 7. Parse output — retry with stricter prompt if format unrecognised
+    // 7. Parse output.
+    // parseAfmOutput throws on unrecognised output (format D) — that throw
+    // is what makes this retry branch reachable. Do NOT make parseAfmOutput
+    // return silently on prose fallback or this catch block becomes dead code.
     let result: { title: string; body: string }
     try {
       result = parseAfmOutput(raw)
@@ -233,10 +257,10 @@ async function run(): Promise<void> {
 
     core.info(`[afm] Generated: ${title}`)
 
-    // 9. Write outputs
-    // Note: value: fields are omitted in action.yml — outputs are set programmatically
-    // via core.setOutput() which writes directly to $GITHUB_OUTPUT. This is correct
-    // for node20 actions and intentional, not an accidental deletion.
+    // 9. Write outputs.
+    // outputs: in action.yml intentionally omits value: fields — value: expressions
+    // are only valid in composite actions. For node20 actions, core.setOutput()
+    // writes directly to $GITHUB_OUTPUT. This is correct behaviour, not an omission.
     core.setOutput('release_title', title)
     core.setOutput('release_body', finalBody)
     core.setOutput('prev_tag', prevTag)
