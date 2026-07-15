@@ -8,12 +8,17 @@ import * as fs from 'fs'
 // Helpers
 // ---------------------------------------------------------------------------
 
-function git(cmd: string): string {
+function git(cmd: string, env?: Record<string, string>): string {
   // { shell: true } is intentional: several callers use shell pipes
-  // (e.g. | head -n 1, | grep -v) for tag resolution. All cmd values
-  // are constructed from validated constants, never from user input.
-  // Do NOT replace with execFileSync — the pipe operator requires a shell.
-  return execSync(`git ${cmd}`, { encoding: 'utf8', shell: true }).trim()
+  // (e.g. | head -n 1, | grep -v) for tag resolution. All user-controlled
+  // values (tag, prevTag) are passed via env vars and referenced as $VAR
+  // in the command string — never interpolated directly. Do NOT replace
+  // with execFileSync — the pipe operator requires a shell.
+  return execSync(`git ${cmd}`, {
+    encoding: 'utf8',
+    shell: true,
+    env: { ...process.env, ...env },
+  }).trim()
 }
 
 /**
@@ -77,7 +82,6 @@ function afmCli(bin: string, prompt: string, options?: {
  * a silent fallback makes the retry catch block in run() unreachable dead code.
  */
 function parseAfmOutput(raw: string): { title: string; body: string } {
-  // Strip markdown code fences if present
   const cleaned = raw
     .replace(/^```json\s*/m, '')
     .replace(/^```\s*/m, '')
@@ -131,11 +135,6 @@ async function run(): Promise<void> {
       throw new Error(`afm-cli binary not found at ${afmBin}`)
     }
 
-    // debug input gates verbose logging. Setting debug: 'true' in the action
-    // call also sets ACTIONS_STEP_DEBUG which core.isDebug() reads natively.
-    const debug = core.getInput('debug') === 'true'
-    if (debug) core.debug('[afm] Debug logging enabled')
-
     // 1. Shallow clone guard
     try {
       const isShallow = git('rev-parse --is-shallow-repository')
@@ -146,6 +145,9 @@ async function run(): Promise<void> {
     } catch { /* not a git repo edge case */ }
 
     // 2. Resolve TAG
+    // tag is validated (slash-guard + rev-parse) before any shell use.
+    // All shell calls that reference tag pass it via SAFE_TAG env var
+    // and use $SAFE_TAG in the command string — never direct interpolation.
     let tag = core.getInput('tag').trim()
     if (!tag) {
       tag = git('tag --sort=-version:refname | head -n 1')
@@ -153,12 +155,16 @@ async function run(): Promise<void> {
       core.info(`[afm] TAG not provided — auto-resolved to latest: ${tag}`)
     }
     if (tag.includes('/')) throw new Error('TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path')
-    try { git(`rev-parse ${tag}`) } catch { throw new Error(`TAG '${tag}' does not exist in this repository.`) }
+    try {
+      git('rev-parse $SAFE_TAG', { SAFE_TAG: tag })
+    } catch {
+      throw new Error(`TAG '${tag}' does not exist in this repository.`)
+    }
 
     // 3. Resolve PREV_TAG
     let prevTag = core.getInput('prev_tag').trim()
     if (!prevTag) {
-      prevTag = git(`tag --sort=-version:refname | grep -v "^${tag}$" | head -n 1`)
+      prevTag = git('tag --sort=-version:refname | grep -v "^$SAFE_TAG$" | head -n 1', { SAFE_TAG: tag })
     }
     if (!prevTag) {
       core.warning('No previous tag found — using first commit as baseline')
@@ -214,11 +220,10 @@ async function run(): Promise<void> {
       ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
     ].join('\n')
 
-    const afmOptions = {
-      instructions,
-      temperature: 0.7,
-      maximumResponseTokens: 2048,
-    }
+    // afmOptions intentionally omits temperature and maximumResponseTokens —
+    // passing neither flag lets afm-cli use Apple's model defaults (nil in Swift).
+    // Add them here only if you need to override the model's calibrated defaults.
+    const afmOptions = { instructions }
 
     // 6. Call afm-cli — retry once on cold-start failure (model not yet loaded)
     core.info('[afm] Calling afm-cli...')

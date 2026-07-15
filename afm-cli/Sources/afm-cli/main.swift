@@ -86,15 +86,16 @@ if let iIdx = CommandLine.arguments.firstIndex(of: "--instructions"),
 
 // MARK: - GenerationOptions
 //
-// Parameter names mirror GenerationOptions exactly:
+// Both temperature and maximumResponseTokens are optional (nil = Apple's default).
+// Do NOT hardcode defaults here — Apple's defaults are well-calibrated and
+// omitting the flag lets the model decide. The caller (src/index.ts) may
+// pass explicit values if needed, but this binary imposes nothing.
+//
+// Flag names mirror GenerationOptions exactly:
 //   --temperature              → GenerationOptions.temperature
 //   --maximum-response-tokens  → GenerationOptions.maximumResponseTokens
-//
-// maximumResponseTokens is Int? — nil means use the model's default context
-// window. Do NOT default to a hardcoded value here; let the caller decide
-// or omit the flag to use the model default.
 
-var temperature: Double = 0.7
+var temperature: Double? = nil
 var maximumResponseTokens: Int? = nil
 
 if let tIdx = CommandLine.arguments.firstIndex(of: "--temperature"),
