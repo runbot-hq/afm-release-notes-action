@@ -4,7 +4,7 @@
   "description": "Generate GitHub release notes using Apple Intelligence on-device model",
   "main": "dist/index.js",
   "scripts": {
-    "build": "ncc build src/index.ts -o dist --source-map --license licenses.txt",
+    "build": "ncc build src/index.ts -o dist --license licenses.txt",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
