@@ -16,149 +16,18 @@ inputs:
     description: Optional extra instruction appended to the prompt (max 300 chars)
     required: false
   debug:
-    description: Set to true to enable AFM_DEBUG=1 verbose sidecar logging
+    description: Set to true to enable verbose logging
     required: false
     default: 'false'
 
 outputs:
   release_title:
     description: AI-generated release title
-    value: ${{ steps.generate.outputs.release_title }}
   release_body:
     description: AI-generated release notes body (Markdown)
-    value: ${{ steps.generate.outputs.release_body }}
   prev_tag:
     description: The previous tag used for comparison
-    value: ${{ steps.generate.outputs.prev_tag }}
 
 runs:
-  using: composite
-  steps:
-    - name: Check runner OS
-      if: runner.os != 'macOS'
-      shell: bash
-      run: |
-        echo "::error::afm-release-notes-action requires a macOS runner. Label it [self-hosted, macOS, apple-intelligence]."
-        exit 1
-
-    - name: Prefer bundled Node 24
-      shell: bash
-      run: |
-        # 1. Bundled node24 (runner ships it in externals/)
-        BUNDLED_NODE="$(dirname "$(dirname "$RUNNER_TOOL_CACHE")")/externals/node24/bin"
-        if [ -d "$BUNDLED_NODE" ]; then
-          echo "$BUNDLED_NODE" >> "$GITHUB_PATH"
-          echo "[afm] Using bundled node: $BUNDLED_NODE"
-        else
-          echo "[afm] Bundled node24 not found at $BUNDLED_NODE — falling back to system node"
-        fi
-
-        # 2. Homebrew bin (gh, jq, etc.)
-        if [ -d "/opt/homebrew/bin" ]; then
-          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
-          echo "[afm] Added /opt/homebrew/bin to PATH"
-        fi
-
-        # 3. coreutils gnubin (provides unprefixed timeout on macOS if installed)
-        if [ -d "/opt/homebrew/opt/coreutils/libexec/gnubin" ]; then
-          echo "/opt/homebrew/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
-          echo "[afm] Added coreutils gnubin to PATH"
-        fi
-
-        # 4. Synthesise a `timeout` shim so all downstream steps have it regardless
-        # of whether coreutils is installed. Written with printf (not heredoc) to avoid
-        # YAML parse errors — heredoc delimiters inside run: | confuse the YAML parser.
-        SHIM_DIR=$(mktemp -d "${TMPDIR:-/tmp}/afm_bin_XXXXXX")
-        printf '%s\n' '#!/usr/bin/env bash' \
-          'for _t in /usr/bin/timeout /opt/homebrew/opt/coreutils/libexec/gnubin/timeout "$(command -v gtimeout 2>/dev/null)"; do' \
-          '  [ -x "$_t" ] && exec "$_t" "$@"' \
-          'done' \
-          'echo "[afm] WARNING: no real timeout binary found — running without time limit" >&2' \
-          'shift' \
-          'exec "$@"' > "$SHIM_DIR/timeout"
-        chmod +x "$SHIM_DIR/timeout"
-        echo "$SHIM_DIR" >> "$GITHUB_PATH"
-        echo "[afm] Installed timeout shim at $SHIM_DIR/timeout"
-
-    - name: Check Node version
-      shell: bash
-      run: |
-        # Regex matches Node 22+ (22–99 and 100+). v[3-9][0-9] covers 30–99;
-        # v[1-9][0-9]{2,} covers 100+. Do NOT simplify back to v[3-9][0-9] alone.
-        node --version | grep -qE 'v2[2-9]|v[3-9][0-9]|v[1-9][0-9]{2,}' || {
-          echo "::error::Node 22+ required. Found: $(node --version)"
-          exit 1
-        }
-
-    - name: Validate repo format
-      shell: bash
-      run: |
-        [[ "${{ github.repository }}" == */* ]] || {
-          echo "::error::Unexpected github.repository format: ${{ github.repository }}"
-          exit 1
-        }
-
-    # Cache strategy (three tiers):
-    #   1. Cache hit  — node_modules + dist/ restored, Build step skipped entirely.
-    #   2. Cache miss — npm ci + tsc run, node_modules + dist/ written to cache for next run.
-    #   3. Cold runner (no cache ever) — committed dist/index.js is the pre-built fallback;
-    #      npm ci + tsc still run and produce a fresh dist/ which then gets cached.
-    # Key hashes package-lock.json (deps), src/index.ts (source), and tsconfig.json (compiler
-    # config — e.g. target ES version change must bust the cache even if source is unchanged).
-    # src/index.ts is intentionally included — a source change with no dep change must still
-    # bust the cache or a stale dist/ will be served. Do NOT remove it from the hash.
-    # Do NOT remove dist/ from the path or the Build step guard becomes meaningless on cache hit.
-    - name: Cache afm-sidecar
-      id: sidecar-cache
-      uses: actions/cache@v4
-      with:
-        path: |
-          ${{ github.action_path }}/afm-sidecar/node_modules
-          ${{ github.action_path }}/afm-sidecar/dist
-        key: afm-sidecar-${{ hashFiles('**/afm-sidecar/package-lock.json', '**/afm-sidecar/src/index.ts', '**/afm-sidecar/tsconfig.json') }}
-
-    - name: Build afm-sidecar
-      if: steps.sidecar-cache.outputs.cache-hit != 'true'
-      shell: bash
-      run: |
-        cd ${{ github.action_path }}/afm-sidecar
-        npm ci
-        npm run build
-
-    - name: Preflight — verify Apple Intelligence responds
-      shell: bash
-      # AFM_SIDECAR_DIST is passed via env: (not interpolated into the run: string) so
-      # paths with spaces are safe. Do NOT inline ${{ github.action_path }} directly into
-      # the run: block — it is not quoted by the YAML expansion and will word-split.
-      env:
-        AFM_SIDECAR_DIST: ${{ github.action_path }}/afm-sidecar/dist/index.js
-      run: |
-        PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/afm_preflight_XXXXXX.json")
-        echo '{"raw_prompt":"Reply with the single word: ready","intent":"test","request_id":"preflight","created_at":""}' > "$PAYLOAD"
-        ERR=$(mktemp "${TMPDIR:-/tmp}/afm_preflight_err_XXXXXX.txt")
-        RESULT=$(timeout 30 node "$AFM_SIDECAR_DIST" --payload "$PAYLOAD" 2>"$ERR" || true)
-        rm -f "$PAYLOAD"
-        if [ -z "$RESULT" ]; then
-          echo "::error::Preflight failed on runner '${RUNNER_NAME}' — no response from Apple Intelligence."
-          echo "::error::Stderr: $(cat $ERR)"
-          echo "::error::Ensure macOS 15+ with Apple Intelligence enabled per-user in System Settings. Check MDM restrictions."
-          rm -f "$ERR"; exit 1
-        fi
-        rm -f "$ERR"
-        echo "[afm] Preflight OK: $RESULT"
-
-    - name: Generate release notes
-      id: generate
-      shell: bash
-      run: ${{ github.action_path }}/scripts/generate.sh
-      env:
-        TAG: ${{ inputs.tag }}
-        PREV_TAG: ${{ inputs.prev_tag }}
-        # PROMPT_EXTRA is safe: passed via env: (not interpolated into run: shell string),
-        # so shell injection is not possible. The script truncates to 300 chars and passes
-        # it through jq --arg which escapes it into JSON. No quoting guard needed here.
-        PROMPT_EXTRA: ${{ inputs.prompt_extra }}
-        AFM_DEBUG: ${{ inputs.debug == 'true' && '1' || '0' }}
-        AFM_SIDECAR_DIST: ${{ github.action_path }}/afm-sidecar/dist/index.js
-        GITHUB_TOKEN: ${{ github.token }}
-        REPO: ${{ github.repository }}
+  using: node20
+  main: dist/index.js
