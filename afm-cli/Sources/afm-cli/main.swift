@@ -20,18 +20,15 @@ import Foundation
 #if canImport(FoundationModels)
 import FoundationModels
 
-// canImport(FoundationModels) is a compile-time check that the SDK includes the
-// framework. It does NOT guarantee the binary runs on macOS 26+ — a binary built
-// against the macOS 26 SDK could theoretically be run on an older OS.
+// The body is factored into afmMain() so it can carry @available(macOS 26.0, *),
+// which the Swift compiler requires on any function referencing FoundationModels
+// types — even inside a #if canImport block.
 //
-// The compiler requires @available(macOS 26.0, *) on any function that references
-// FoundationModels types, even inside a #if canImport block. The guard #available
-// at the call site is the runtime enforcement; @available here is the compile-time
-// annotation that satisfies the compiler's availability checker.
-//
-// The body is factored into this function (rather than left at top-level) solely
-// to allow the @available annotation — top-level code cannot carry @available.
-// Do NOT add @main or restructure into a struct; top-level async main.swift is correct.
+// At the call site, `if #available` (not `guard #available`) is required:
+// the Swift compiler only accepts `if #available` as a sufficient availability
+// check for calling an @available-annotated function from top-level code.
+// `guard #available` does NOT satisfy the compiler here, despite being
+// semantically equivalent at runtime. Do NOT change back to guard.
 @available(macOS 26.0, *)
 func afmMain() async {
 
@@ -108,9 +105,7 @@ func afmMain() async {
     // deliberately — NOT the memberwise init GenerationOptions(temperature:maximumResponseTokens:).
     // FoundationModels does not expose that memberwise init publicly. Calling it
     // causes a compile error at swift build -c release.
-    // Do NOT revert to the memberwise init. The mutation pattern is the documented
-    // public API and also sidesteps any Double vs Float SDK variance at the property
-    // assignment site rather than at a call-site implicit coercion.
+    // Do NOT revert to the memberwise init.
 
     var temperature: Double? = nil
     var maximumResponseTokens: Int? = nil
@@ -136,22 +131,18 @@ func afmMain() async {
     do {
         let response = try await session.respond(to: prompt, options: options)
         print(response.content)
-        // exit(0) omitted — Swift exits 0 naturally after this function returns.
     } catch {
         fputs("Error: inference failed — \(error)\n", stderr)
         exit(1)
     }
 }
 
-// Runtime availability guard — belt-and-suspenders against running a macOS 26
-// SDK binary on an older OS. afmMain() carries @available(macOS 26.0, *) which
-// satisfies the compiler; this guard is the runtime enforcement.
-guard #available(macOS 26.0, *) else {
+if #available(macOS 26.0, *) {
+    await afmMain()
+} else {
     fputs("Error: afm-cli requires macOS 26+\n", stderr)
     exit(1)
 }
-
-await afmMain()
 
 #else
 fputs("Error: FoundationModels framework not available on this platform\n", stderr)
