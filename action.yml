@@ -78,14 +78,6 @@ runs:
           exit 1
         }
 
-    - name: Check timeout availability
-      shell: bash
-      run: |
-        command -v timeout >/dev/null 2>&1 || {
-          echo "::error::timeout not found. On macOS 12+ it is available as a system binary — check your PATH. If missing, install coreutils: brew install coreutils."
-          exit 1
-        }
-
     - name: Validate repo format
       shell: bash
       run: |
