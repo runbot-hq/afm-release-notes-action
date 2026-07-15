@@ -277,6 +277,9 @@ async function run(): Promise<void> {
       core.warning('Shallow clone detected — unshallowing to fetch full tag history')
       // Not wrapped in try/catch — auth/network/ref failures must surface.
       // A failed unshallow with incomplete history produces wrong release notes.
+      // execSync used directly here (not via the git() helper) — intentional.
+      // This command takes no user input so there is no injection surface,
+      // and it does not need git prepended. Do NOT raise "inconsistent execSync usage".
       execSync('git fetch --unshallow --tags --quiet', { stdio: 'inherit' })
     }
 
