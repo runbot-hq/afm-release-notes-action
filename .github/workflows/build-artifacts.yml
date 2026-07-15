@@ -69,6 +69,13 @@ jobs:
           if git diff --cached --quiet; then
             echo "Artifacts unchanged — nothing to commit."
           else
-            git commit -m "chore: rebuild artifacts [skip ci]"
-            git push
+            git commit -m "chore: rebuild artifacts"
+            # Explicit refspec — do NOT use bare `git push`. Without an explicit
+            # refspec, push relies on the tracking-ref state set by actions/checkout,
+            # which is not guaranteed under all checkout configurations (e.g. a
+            # detached HEAD from a ref: override would silently fail or push nowhere).
+            git push origin HEAD:main
           fi
+          # Do NOT add [skip ci] to the commit message — check-artifacts.yml is
+          # intentionally designed to fire on this artifact commit as a downstream
+          # validator. [skip ci] would suppress it and defeat the purpose.

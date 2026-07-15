@@ -276,7 +276,7 @@ async function run(): Promise<void> {
 
     // actionPath is the directory where action.yml lives.
     // afm-cli binary is committed there alongside action.yml.
-    // GITHUB_ACTION_PATH is set by the runner for all action types including node20.
+    // GITHUB_ACTION_PATH is set by the runner for all action types including node24.
     //
     // NOTE: dist/index.js (the compiled TS bundle) and the afm-cli binary are
     // NOT committed in this PR. Both require a local build step on the self-hosted
@@ -291,7 +291,7 @@ async function run(): Promise<void> {
       // This action requires a self-hosted macOS arm64 runner with Apple Intelligence.
       // On Linux or Windows runners afm-cli will not exist — the action cannot run.
       // The old composite action had an explicit runner.os check; this error message
-      // is the node20 equivalent — it fails fast with the same clarity.
+      // is the node24 equivalent — it fails fast with the same clarity.
       throw new Error(
         `afm-cli binary not found at ${afmBin}. ` +
         'This action requires a self-hosted macOS 26+ arm64 runner with Apple Intelligence enabled. ' +
@@ -598,9 +598,9 @@ async function run(): Promise<void> {
 
     // 9. Write outputs.
     // outputs: in action.yml intentionally omits value: fields — value: expressions
-    // are only valid in composite actions. For node20 actions, core.setOutput()
+    // are only valid in composite actions. For node24 actions, core.setOutput()
     // writes directly to $GITHUB_OUTPUT. This is correct behaviour, not an omission.
-    // Do NOT add value: fields to action.yml outputs — they are invalid in node20 actions.
+    // Do NOT add value: fields to action.yml outputs — they are invalid in node24 actions.
     core.setOutput('release_title', title)
     core.setOutput('release_body', finalBody)
     core.setOutput('prev_tag', prevTag)
