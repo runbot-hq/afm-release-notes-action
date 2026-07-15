@@ -14,6 +14,9 @@ function git(cmd: string, env?: Record<string, string>): string {
   // values (tag, prevTag) are passed via env vars and referenced as $VAR
   // in the command string — never interpolated directly. Do NOT replace
   // with execFileSync — the pipe operator requires a shell.
+  //
+  // CALLERS MUST NOT interpolate user-controlled values directly into cmd.
+  // Always use the env parameter and reference values as $VAR_NAME.
   return execSync(`git ${cmd}`, {
     encoding: 'utf8',
     shell: true,
@@ -75,6 +78,24 @@ function afmCli(bin: string, prompt: string, options?: {
 }
 
 /**
+ * Returns true if the afm-cli error message indicates a fatal condition that
+ * a retry cannot recover from — model unavailable, MDM lockout, permission denied.
+ * These map to exit(1) from the availability switch in main.swift.
+ * Do NOT retry on these — the error will be identical on the second attempt.
+ */
+function isFatalAfmError(e: unknown): boolean {
+  const msg = String(e).toLowerCase()
+  return (
+    msg.includes('unavailable') ||
+    msg.includes('mdm') ||
+    msg.includes('not authorized') ||
+    msg.includes('permission denied') ||
+    msg.includes('not available') ||
+    msg.includes('eacces')
+  )
+}
+
+/**
  * Parses AFM output into { title, body }.
  *
  * Handles three recognised formats in priority order:
@@ -117,6 +138,11 @@ function parseAfmOutput(raw: string): { title: string; body: string } {
 
   // Format D: unrecognised — throw so caller retries with stricter prompt.
   // Do NOT convert this to a return — the retry block in run() depends on this throw.
+  //
+  // Note: fence-stripping above uses replace() without /g so only the first
+  // fence occurrence is removed. If the model returns preamble + a fenced block,
+  // this parse will throw and the strict-prompt retry will handle it. That is
+  // the correct and intended behaviour — do NOT add /g to work around it.
   throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`)
 }
 
@@ -134,8 +160,11 @@ async function run(): Promise<void> {
     const token = process.env.GITHUB_TOKEN
     if (!token) throw new Error('GITHUB_TOKEN is not set — add `env: GITHUB_TOKEN: ${{ github.token }}` to your workflow step.')
 
+    // GITHUB_REPOSITORY is set by the runner as "owner/repo".
+    // Split can yield undefined values on non-standard runner configs — guard explicitly.
     const repo = process.env.GITHUB_REPOSITORY ?? ''
     const [owner, repoName] = repo.split('/')
+    if (!owner || !repoName) throw new Error(`GITHUB_REPOSITORY is not set or has unexpected format (got: "${repo}")`)
 
     // actionPath is the directory where action.yml lives.
     // afm-cli binary is committed there alongside action.yml.
@@ -155,6 +184,17 @@ async function run(): Promise<void> {
       )
     }
 
+    // Verify the binary is executable, not just present. A file committed without
+    // the execute bit (common via GitHub API or Windows-origin commits) will cause
+    // spawnSync to return EACCES. Catch it here with a clear message.
+    try {
+      fs.accessSync(afmBin, fs.constants.X_OK)
+    } catch {
+      throw new Error(
+        `afm-cli binary at ${afmBin} is not executable. Run: chmod +x afm-cli and recommit.`
+      )
+    }
+
     // 1. Shallow clone guard
     try {
       const isShallow = git('rev-parse --is-shallow-repository')
@@ -165,9 +205,14 @@ async function run(): Promise<void> {
     } catch { /* not a git repo edge case */ }
 
     // 2. Resolve TAG
-    // tag is validated (slash-guard + rev-parse) before any shell use.
-    // All shell calls that reference tag pass it via SAFE_TAG env var
-    // and use $SAFE_TAG in the command string — never direct interpolation.
+    // tag is validated (slash-guard + rev-parse) before any shell or prompt use.
+    // All shell calls reference tag via $SAFE_TAG env var — never direct interpolation.
+    //
+    // Prompt injection via tag: tag is interpolated into the prompt string below,
+    // but this is not an injection vector — git rev-parse validates the tag exists
+    // in the repository. A tag containing adversarial content would require the
+    // attacker to have already pushed that tag to the repo, at which point the
+    // repository itself is compromised. No additional sanitisation is warranted.
     let tag = core.getInput('tag').trim()
     if (!tag) {
       tag = git('tag --sort=-version:refname | head -n 1')
@@ -263,12 +308,19 @@ async function run(): Promise<void> {
     // Add them here only if you need to override the model's calibrated defaults.
     const afmOptions = { instructions }
 
-    // 6. Call afm-cli — retry once on cold-start failure (model not yet loaded)
+    // 6. Call afm-cli.
+    // Retry once on cold-start failure (model not yet loaded in memory).
+    // Do NOT retry on fatal errors — MDM lockout, AI unavailable, and permission
+    // denied will not recover in 15s. isFatalAfmError() detects these and rethrows
+    // immediately. The first error is always logged via core.debug so the root
+    // cause is never silently dropped even when the retry succeeds.
     core.info('[afm] Calling afm-cli...')
     let raw: string
     try {
       raw = afmCli(afmBin, prompt, afmOptions)
     } catch (e) {
+      core.debug(`[afm] Attempt 1 error: ${String(e)}`)
+      if (isFatalAfmError(e)) throw e
       core.info('[afm] Attempt 1 failed — retrying in 15s (cold-start model load)...')
       await new Promise(r => setTimeout(r, 15_000))
       raw = afmCli(afmBin, prompt, afmOptions)
@@ -304,7 +356,7 @@ async function run(): Promise<void> {
     // outputs: in action.yml intentionally omits value: fields — value: expressions
     // are only valid in composite actions. For node20 actions, core.setOutput()
     // writes directly to $GITHUB_OUTPUT. This is correct behaviour, not an omission.
-    // Do NOT add value: fields to action.yml outputs — it will break the node20 action.
+    // Do NOT add value: fields to action.yml outputs — they are invalid in node20 actions.
     core.setOutput('release_title', title)
     core.setOutput('release_body', finalBody)
     core.setOutput('prev_tag', prevTag)
