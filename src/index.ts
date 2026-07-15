@@ -10,15 +10,19 @@ import * as fs from 'fs'
 
 function git(cmd: string, env?: Record<string, string>): string {
   // { shell: true } is intentional: several callers use shell pipes
-  // (e.g. | head -n 1, | grep -v) for tag resolution. All user-controlled
-  // values (tag, prevTag) are passed via env vars and referenced as '$VAR'
-  // (single-quoted) in the command string — never interpolated directly.
-  // Single-quoting env var references prevents word-splitting on values
-  // that contain whitespace. Do NOT replace with execFileSync — the pipe
-  // operator requires a shell. Do NOT use unquoted $VAR_NAME for user values.
+  // (e.g. | head -n 1, | grep -vxF) for tag resolution. All user-controlled
+  // values (tag, prevTag) are passed via env vars and referenced as "$VAR"
+  // (double-quoted) in the command string — never interpolated directly.
   //
+  // Quoting rules for $SAFE_TAG and similar env vars:
+  //   Use double-quotes: "$SAFE_TAG"  — expands the var AND prevents word-split
+  //   Do NOT single-quote: '$SAFE_TAG' — single quotes suppress ALL expansion;
+  //                                      git receives the literal string "$SAFE_TAG"
+  //   Do NOT leave unquoted: $SAFE_TAG — word-splits on whitespace in the value
+  //
+  // Do NOT replace with execFileSync — the pipe operator requires a shell.
   // CALLERS MUST NOT interpolate user-controlled values directly into cmd.
-  // Always use the env parameter and reference values as '$VAR_NAME' (quoted).
+  // Always use the env parameter and reference values as "$VAR_NAME" (double-quoted).
   // Note: type-level enforcement is not possible for shell strings in JS.
   // The doc contract here is the only enforcement mechanism — all current
   // call sites are verified correct. Do NOT add new call sites without review.
@@ -130,6 +134,8 @@ function isFatalAfmError(e: unknown): boolean {
  * @param currentTag  Current tag string, used as title fallback for format C.
  *                    Passed explicitly to keep this function pure and testable
  *                    without mocking the GitHub Actions runtime.
+ *                    Always the resolved tag value — never empty when called
+ *                    from run(), so the '|| "Release"' fallback is belt-and-suspenders.
  */
 function parseAfmOutput(raw: string, currentTag: string): { title: string; body: string } {
   const cleaned = raw
@@ -221,29 +227,41 @@ async function run(): Promise<void> {
     }
 
     // 1. Shallow clone guard
+    // The try wraps only the rev-parse check. If the repo is shallow, the
+    // fetch --unshallow call runs outside the catch scope — any failure there
+    // (auth, network, ref error) propagates directly without being swallowed.
+    //
+    // exit 128 from git rev-parse means "not a git repository" in this context
+    // (e.g. action running outside a checkout step). That is safe to skip.
+    // exit 128 from git fetch --unshallow means something operationally failed
+    // and must NOT be swallowed — incomplete history produces wrong tag resolution.
+    let isShallow = false
     try {
-      const isShallow = git('rev-parse --is-shallow-repository')
-      if (isShallow === 'true') {
-        core.warning('Shallow clone detected — unshallowing to fetch full tag history')
-        execSync('git fetch --unshallow --tags --quiet', { stdio: 'inherit' })
-      }
+      isShallow = git('rev-parse --is-shallow-repository') === 'true'
     } catch (e) {
-      // Only swallow "not a git repo" errors (ENOENT, exit 128 from git).
-      // Network failures, auth failures, and other operational errors must
-      // surface — proceeding on an incomplete tag history produces wrong output.
+      // Only swallow "not a git repo" errors from rev-parse (ENOENT, exit 128,
+      // or the literal message). Any other error is unexpected and rethrows.
       const msg = String(e).toLowerCase()
-      const isNotARepo = msg.includes('not a git repository') ||
+      const isNotARepo =
+        msg.includes('not a git repository') ||
         msg.includes('enoent') ||
         (e instanceof Error && 'status' in e && (e as NodeJS.ErrnoException & { status?: number }).status === 128)
-      if (!isNotARepo) throw new Error(`git fetch --unshallow failed: ${String(e)}`)
+      if (!isNotARepo) throw new Error(`git rev-parse --is-shallow-repository failed: ${String(e)}`)
+    }
+    if (isShallow) {
+      core.warning('Shallow clone detected — unshallowing to fetch full tag history')
+      // Not wrapped in try/catch — auth/network/ref failures must surface.
+      // A failed unshallow with incomplete history produces wrong release notes.
+      execSync('git fetch --unshallow --tags --quiet', { stdio: 'inherit' })
     }
 
     // 2. Resolve TAG
     // tag is validated (slash-guard + rev-parse) before any shell or prompt use.
-    // All shell calls reference tag via '$SAFE_TAG' (single-quoted env var) —
-    // never direct interpolation. Single-quoting prevents word-splitting on
-    // tag values that contain whitespace (technically valid in git tag names).
-    // The slash-guard rejects '/' but not whitespace — quoting is the correct fix.
+    // Shell calls reference tag via "$SAFE_TAG" (double-quoted env var) —
+    // never direct interpolation. Double-quoting prevents word-splitting while
+    // still expanding the env var. Do NOT use single-quotes ('$SAFE_TAG') —
+    // single quotes suppress ALL shell expansion; git would receive the literal
+    // string "$SAFE_TAG" instead of the tag value.
     //
     // Prompt injection via tag: tag is interpolated into the prompt string below,
     // but this is not an injection vector — git rev-parse validates the tag exists
@@ -258,15 +276,19 @@ async function run(): Promise<void> {
     }
     if (tag.includes('/')) throw new Error('TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path')
     try {
-      git("rev-parse '$SAFE_TAG'", { SAFE_TAG: tag })
+      git('rev-parse "$SAFE_TAG"', { SAFE_TAG: tag })
     } catch {
       throw new Error(`TAG '${tag}' does not exist in this repository.`)
     }
 
     // 3. Resolve PREV_TAG
+    // grep -vxF uses fixed-string (-F) and full-line (-x) matching, NOT regex.
+    // Do NOT use grep -v "^$SAFE_TAG$" — that treats the tag as a BRE, so dots
+    // in version tags like v1.2.3 would match any character and could accidentally
+    // exclude sibling tags (e.g. v1x2x3), skipping to an older baseline.
     let prevTag = core.getInput('prev_tag').trim()
     if (!prevTag) {
-      prevTag = git("tag --sort=-version:refname | grep -v '^$SAFE_TAG$' | head -n 1", { SAFE_TAG: tag })
+      prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | head -n 1', { SAFE_TAG: tag })
     }
     if (!prevTag) {
       core.warning('No previous tag found — using first commit as baseline')
