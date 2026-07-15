@@ -23,7 +23,10 @@ jobs:
           # build step accidentally committed afm-cli/ as a directory entry instead
           # of a root-level binary (the cp/mv directory-descend failure mode).
           [ -f afm-cli ]   || missing+=("afm-cli binary (missing or is a directory — check build-artifacts.yml)")
-          [ -x afm-cli ]   || missing+=("afm-cli is not executable")
+          # -x tests the committed file mode bit, not runtime executability.
+          # This is correct — Ubuntu cannot run a Mach-O binary regardless.
+          # The check ensures install -m 755 set the bit before committing.
+          [ -x afm-cli ]   || missing+=("afm-cli missing executable bit (file mode)")
           [ -f dist/index.js ] || missing+=("dist/index.js")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing committed artifacts: ${missing[*]}"
