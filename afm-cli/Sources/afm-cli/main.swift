@@ -6,7 +6,7 @@ import Foundation
 //   1. No domain knowledge. This binary knows nothing about release notes,
 //      JSON schemas, or output formats. It takes text in, returns text out.
 //   2. Flag names mirror the FoundationModels API exactly — no invented vocabulary.
-//      --instructions             → Transcript.Instructions (Apple's term, not "system prompt")
+//      --instructions             → LanguageModelSession(instructions:) (Apple's term, not "system prompt")
 //      --temperature              → GenerationOptions.temperature
 //      --maximum-response-tokens  → GenerationOptions.maximumResponseTokens
 //   3. All JSON parsing, prompt assembly, and output formatting belongs in the
@@ -59,27 +59,27 @@ case .unavailable(let reason):
 
 // MARK: - Session setup
 //
-// --instructions maps to Transcript.Instructions, which is Apple's API term
-// for what other frameworks call a "system prompt". We use Apple's naming
-// deliberately so flag names remain 1:1 aliases for API parameters.
+// LanguageModelSession(instructions:) is Apple's documented public API for
+// providing a system prompt at session creation. It maps directly to
+// Transcript.Instructions internally but is the correct, stable, public
+// surface to call.
 //
-// Transcript.Instructions is passed at session construction, not appended to
-// the user prompt string. Apple treats these differently internally — using
-// Transcript.Instructions gives better model behaviour than prepending text
-// to --prompt. Do NOT collapse these into a single --prompt argument.
+// The previous implementation manually constructed Transcript.Instructions
+// and routed through LanguageModelSession(transcript:) — the session-
+// rehydration initializer intended for resuming prior conversations from a
+// serialised transcript. That path worked but was unnecessarily low-level
+// and fragile against internal SDK changes. Do NOT revert to it.
+//
+// --instructions is Apple's term for what other frameworks call "system prompt".
+// We use Apple's naming deliberately so flag names remain 1:1 aliases for
+// API parameters. Do NOT rename to --system-prompt.
 
 let session: LanguageModelSession
 
 if let iIdx = CommandLine.arguments.firstIndex(of: "--instructions"),
    CommandLine.arguments.indices.contains(iIdx + 1) {
     let instructionText = CommandLine.arguments[iIdx + 1]
-    let instructions = Transcript.Instructions(
-        segments: [.text(.init(content: instructionText))],
-        toolDefinitions: []
-    )
-    session = LanguageModelSession(
-        transcript: Transcript(entries: [.instructions(instructions)])
-    )
+    session = LanguageModelSession(instructions: instructionText)
 } else {
     session = LanguageModelSession()
 }
