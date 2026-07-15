@@ -9,10 +9,15 @@ import * as fs from 'fs'
 // ---------------------------------------------------------------------------
 
 function git(cmd: string, env?: Record<string, string>): string {
-  // { shell: true } is intentional: several callers use shell pipes
+  // { shell: '/bin/sh' } is intentional: several callers use shell pipes
   // (e.g. | head -n 1, | grep -vxF) for tag resolution. All user-controlled
   // values (tag, prevTag) are passed via env vars and referenced as "$VAR"
   // (double-quoted) in the command string — never interpolated directly.
+  //
+  // shell is '/bin/sh' not true — TypeScript 5.9 tightened ExecSyncOptions.shell
+  // to string | undefined; boolean is no longer assignable. '/bin/sh' is correct
+  // and equivalent: Node's child_process uses /bin/sh when shell: true anyway.
+  // Do NOT revert to shell: true — it fails to compile with typescript@5.9+.
   //
   // Quoting rules for $SAFE_TAG and similar env vars:
   //   Use double-quotes: "$SAFE_TAG"  — expands the var AND prevents word-split
@@ -40,7 +45,7 @@ function git(cmd: string, env?: Record<string, string>): string {
   }
   return execSync(`git ${cmd}`, {
     encoding: 'utf8',
-    shell: true,
+    shell: '/bin/sh',
     env: { ...process.env, ...env },
   }).trim()
 }
