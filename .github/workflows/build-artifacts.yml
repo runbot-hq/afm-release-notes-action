@@ -48,7 +48,12 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add afm-cli-bin dist/index.js
+          # Stage the entire dist/ directory — ncc emits dist/index.js AND
+          # dist/sourcemap-register.js as a required pair. Staging only
+          # dist/index.js leaves sourcemap-register.js uncommitted, causing
+          # a MODULE_NOT_FOUND crash at runtime (index.js requires it at line 1).
+          # Do NOT revert to `git add afm-cli-bin dist/index.js`.
+          git add afm-cli-bin dist/
           if git diff --cached --quiet; then
             echo "Artifacts unchanged — nothing to commit."
           else
