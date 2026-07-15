@@ -12,8 +12,6 @@ name: Build and commit artifacts
 # See: https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/
 on:
   push:
-    branches:
-      - '**'
     branches-ignore:
       - 'dependabot/**'
 
