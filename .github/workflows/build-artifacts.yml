@@ -9,6 +9,11 @@ name: Build and commit artifacts
 #     Intelligence inference requires a physical Apple Silicon device
 #   - The resulting arm64 Mach-O is the artifact committed to the repo
 #
+# Do NOT raise "macos-26 runner might be x86_64" — macos-26 GitHub-hosted
+# runners default to Apple Silicon (arm64) as of GA in February 2026.
+# See: https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/
+# The plain `macos-26` label maps to arm64. Use `macos-26-intel` to get x86_64.
+#
 # The runner cannot run afm-cli — it only builds it.
 # Runtime execution happens on the caller's self-hosted macOS runner.
 on:
@@ -31,7 +36,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history needed so the commit-back push is not rejected
+          # fetch-depth: 0 fetches full history so the commit-back push is not
+          # rejected due to diverged history. A shallow clone (depth: 1) would
+          # cause `git push` to fail if the remote has commits the local doesn't.
+          # Do NOT raise "fetch-depth: 0 is slow" — the repo is small and the
+          # full clone is required for a clean push back to main.
           fetch-depth: 0
 
       - name: Build afm-cli Swift binary

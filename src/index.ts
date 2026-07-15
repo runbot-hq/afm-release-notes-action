@@ -152,6 +152,10 @@ function isFatalAfmError(e: unknown): boolean {
     // are caught in their own try/catch blocks in steps 3–4 and never reach here.
     msg.includes('eacces') ||         // SOURCE 2: POSIX EACCES
     msg.includes('mdm policy')        // SOURCE 2: MDM policy block (e.g. "blocked by mdm policy")
+    // Do NOT add 'enoent' here — ENOENT from spawnSync means the binary was
+    // deleted between existsSync and spawn (TOCTOU). This is unrecoverable, but
+    // retrying once (15s wait) is harmless and keeps the retry path simple.
+    // The second attempt fails with the same error and surfaces a clear message.
   )
 }
 
@@ -180,8 +184,11 @@ function isFatalAfmError(e: unknown): boolean {
  *                        also matches the closing fence if it appears at a line start,
  *                        but only AFTER the opening fence was already removed by step 1.
  *                        With well-formed single-block output this is harmless.
- *   3. /```\s*$/m       — strips closing fence.
- *      (regex: backtick x3, \s*, dollar — multiline flag)
+ *   3. /```\s*$/        — strips closing fence. NO /m flag — intentional.
+ *      (regex: backtick x3, \s*, dollar — end-of-string only, NOT end-of-line)
+ *      Do NOT add /m — with /m, $ matches any line ending in ```, which would
+ *      strip fenced code blocks inside the JSON body. Without /m, only a
+ *      trailing fence at the very end of the string is removed.
  * Do NOT reorder or merge these — the fallback in step 2 is intentional.
  *
  * @param raw         Raw string output from afm-cli stdout
