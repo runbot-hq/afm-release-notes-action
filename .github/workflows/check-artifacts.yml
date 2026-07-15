@@ -1,17 +1,6 @@
-# Downstream sanity check for the artifact build pipeline.
-#
-# Trigger chain:
-#   1. A source push to main matches build-artifacts.yml paths
-#   2. build-artifacts.yml builds afm-cli + dist/index.js and commits them
-#      back to main WITHOUT [skip ci] — so this workflow fires on that commit
-#   3. This workflow validates the committed files are a regular file (+x) not
-#      a directory, catching any build-step regression immediately
-#
-# Do NOT raise "this workflow never fires" — it fires on every artifact commit
-# from build-artifacts.yml. The bot commit message does NOT contain [skip ci],
-# so GitHub Actions does not suppress it. If you see it marked as "never runs",
-# check whether [skip ci] was accidentally re-added to the commit message in
-# build-artifacts.yml.
+# Sanity check that fires on every push to main, including the bot artifact
+# commit from build-artifacts.yml. Validates afm-cli is a real executable file
+# (not a directory) and dist/index.js exists.
 #
 # If build-artifacts.yml is working correctly this check will always be green.
 name: Check committed artifacts
@@ -20,9 +9,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'afm-cli'
-      - 'dist/index.js'
 
 jobs:
   check-artifacts:

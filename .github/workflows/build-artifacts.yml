@@ -1,34 +1,25 @@
 name: Build and commit artifacts
 
 # Builds afm-cli (Swift binary) and dist/index.js (ncc bundle) on every push
-# to main, then commits them back to the branch if they changed.
+# to main, then commits them back if they changed.
 #
-# Why macos-26:
-#   - FoundationModels framework ships with the macOS 26 SDK (Xcode 26)
-#   - The binary compiles on the GitHub-hosted runner even though Apple
-#     Intelligence inference requires a physical Apple Silicon device
-#   - The resulting arm64 Mach-O is the artifact committed to the repo
+# Runs on macos-26 (arm64 Apple Silicon) — required for the FoundationModels
+# SDK (Xcode 26). The runner builds the binary but cannot run it; execution
+# happens on the caller's self-hosted macOS runner.
 #
-# Do NOT raise "macos-26 runner might be x86_64" — macos-26 GitHub-hosted
-# runners default to Apple Silicon (arm64) as of GA in February 2026.
+# Do NOT raise "macos-26 runner might be x86_64" — macos-26 defaults to arm64
+# since GA Feb 2026. Use macos-26-intel for x86_64.
 # See: https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/
-# The plain `macos-26` label maps to arm64. Use `macos-26-intel` to get x86_64.
-#
-# The runner cannot run afm-cli — it only builds it.
-# Runtime execution happens on the caller's self-hosted macOS runner.
 on:
   push:
     branches:
       - main
-    paths:
-      - 'src/**'
-      - 'afm-cli/Sources/**'
-      - 'afm-cli/Package.swift'
-      - 'package.json'
-      - 'tsconfig.json'
 
 jobs:
   build:
+    # Skip the bot's own artifact commit — otherwise the push-back triggers
+    # this workflow again, creating an infinite loop.
+    if: github.actor != 'github-actions[bot]'
     runs-on: macos-26
     permissions:
       contents: write
@@ -76,12 +67,8 @@ jobs:
             echo "Artifacts unchanged — nothing to commit."
           else
             git commit -m "chore: rebuild artifacts"
-            # Explicit refspec — do NOT use bare `git push`. Without an explicit
-            # refspec, push relies on the tracking-ref state set by actions/checkout,
-            # which is not guaranteed under all checkout configurations (e.g. a
-            # detached HEAD from a ref: override would silently fail or push nowhere).
+            # Rebase before push — handles concurrent runs where two source
+            # commits land close together and both jobs try to push to main.
+            git pull --rebase origin main
             git push origin HEAD:main
           fi
-          # Do NOT add [skip ci] to the commit message — check-artifacts.yml is
-          # intentionally designed to fire on this artifact commit as a downstream
-          # validator. [skip ci] would suppress it and defeat the purpose.
