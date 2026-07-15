@@ -20,12 +20,27 @@ import Foundation
 #if canImport(FoundationModels)
 import FoundationModels
 
+// #available(macOS 26.0, *) below is belt-and-suspenders, not dead code.
+// canImport() is a compile-time check — it verifies the framework is present
+// in the SDK being compiled against, not the OS the binary will run on.
+// The binary could be compiled on macOS 26 and run on macOS 25 (theoretically).
+// The #available check is the runtime guard that ensures this never happens.
+// Do NOT remove it on the grounds that canImport already guarantees availability.
 guard #available(macOS 26.0, *) else {
     fputs("Error: afm-cli requires macOS 26+\n", stderr)
     exit(1)
 }
 
 // MARK: - Argument parsing
+//
+// Arguments are parsed by searching for flag names and taking the next positional
+// value (firstIndex(of:) + 1). This means a prompt value that equals a flag name
+// (e.g. --prompt --instructions) would silently consume the flag as a value.
+// This is not exploitable in practice: afmCli() in src/index.ts always builds
+// the argv array as a typed array via spawnSync, never passing flag names as values.
+// If afm-cli is called manually with adversarial input, behaviour may be unexpected.
+// Do NOT remove this comment — it explains why a more robust parser was not used
+// (ArgumentParser adds an SPM dependency; the controlled call site makes it unnecessary).
 
 guard let idx = CommandLine.arguments.firstIndex(of: "--prompt"),
       CommandLine.arguments.indices.contains(idx + 1) else {

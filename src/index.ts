@@ -91,9 +91,9 @@ function afmCli(bin: string, prompt: string, options?: {
  * These map to exit(1) from the availability switch in main.swift.
  * Do NOT retry on these — the error will be identical on the second attempt.
  *
- * ETIMEDOUT is intentionally not fatal here — a timeout on attempt 1 is
- * retried after 15s (cold-start model load). ETIMEDOUT on attempt 2 propagates
- * with enriched context via the catch in step 6.
+ * ETIMEDOUT is intentionally NOT in this list — a slow cold-start can exceed
+ * 60s on first run and is worth one retry after a 15s warm-up pause.
+ * If attempt 2 also times out, the error is enriched with context in step 6.
  */
 function isFatalAfmError(e: unknown): boolean {
   const msg = String(e).toLowerCase()
@@ -118,8 +118,13 @@ function isFatalAfmError(e: unknown): boolean {
  * THROWS on unrecognised output (format D / prose) so the caller can retry
  * with a stricter prompt. Do NOT add a prose fallback that returns silently —
  * a silent fallback makes the retry catch block in run() unreachable dead code.
+ *
+ * @param raw    Raw string output from afm-cli stdout
+ * @param currentTag  Current tag string, used as title fallback for format C.
+ *                    Passed explicitly to keep this function pure and testable
+ *                    without mocking the GitHub Actions runtime.
  */
-function parseAfmOutput(raw: string): { title: string; body: string } {
+function parseAfmOutput(raw: string, currentTag: string): { title: string; body: string } {
   const cleaned = raw
     .replace(/^```json\s*/m, '')
     .replace(/^```\s*/m, '')
@@ -144,7 +149,7 @@ function parseAfmOutput(raw: string): { title: string; body: string } {
         .filter(s => Array.isArray(obj[s]) && obj[s].length > 0)
         .map(s => `## ${s}\n${(obj[s] as string[]).map((l: string) => `- ${l}`).join('\n')}`)
         .join('\n\n')
-      return { title: core.getInput('tag') || 'Release', body }
+      return { title: currentTag || 'Release', body }
     }
   } catch { /* fall through */ }
 
@@ -187,6 +192,7 @@ async function run(): Promise<void> {
     // NOT committed in this PR. Both require a local build step on the self-hosted
     // macOS runner (issue #22, step 2: npm run build && swift build -c release).
     // This is intentional — they are build artifacts, not source files.
+    // Do NOT raise "dist/index.js not committed" as a review finding.
     const actionPath = process.env.GITHUB_ACTION_PATH ?? path.join(__dirname, '..')
     const afmBin = path.join(actionPath, 'afm-cli')
 
@@ -220,7 +226,16 @@ async function run(): Promise<void> {
         core.warning('Shallow clone detected — unshallowing to fetch full tag history')
         execSync('git fetch --unshallow --tags --quiet', { stdio: 'inherit' })
       }
-    } catch { /* not a git repo edge case */ }
+    } catch (e) {
+      // Only swallow "not a git repo" errors (ENOENT, exit 128 from git).
+      // Network failures, auth failures, and other operational errors must
+      // surface — proceeding on an incomplete tag history produces wrong output.
+      const msg = String(e).toLowerCase()
+      const isNotARepo = msg.includes('not a git repository') ||
+        msg.includes('enoent') ||
+        (e instanceof Error && 'status' in e && (e as NodeJS.ErrnoException & { status?: number }).status === 128)
+      if (!isNotARepo) throw new Error(`git fetch --unshallow failed: ${String(e)}`)
+    }
 
     // 2. Resolve TAG
     // tag is validated (slash-guard + rev-parse) before any shell or prompt use.
@@ -271,6 +286,8 @@ async function run(): Promise<void> {
     // model input. The > 80 / > 150 warnings below fire correctly on the first
     // page — if the API returns exactly 250 commits, the warning still fires
     // (250 > 80). Silently capped releases are noted in the step summary.
+    //
+    // Requires: contents: read permission on GITHUB_TOKEN (see action.yml permissions block).
     const octokit = github.getOctokit(token)
     const compare = await octokit.rest.repos.compareCommitsWithBasehead({
       owner,
@@ -364,14 +381,16 @@ async function run(): Promise<void> {
     // parseAfmOutput throws on unrecognised output (format D) — that throw
     // is what makes this retry branch reachable. Do NOT make parseAfmOutput
     // return silently on prose fallback or this catch block becomes dead code.
+    // tag is passed explicitly so parseAfmOutput stays pure and unit-testable
+    // without mocking the GitHub Actions runtime.
     let result: { title: string; body: string }
     try {
-      result = parseAfmOutput(raw)
+      result = parseAfmOutput(raw, tag)
     } catch (e) {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
       const strictPrompt = `${prompt}\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}`
       raw = afmCli(afmBin, strictPrompt, afmOptions)
-      result = parseAfmOutput(raw) // throws and fails the action if still malformed
+      result = parseAfmOutput(raw, tag) // throws and fails the action if still malformed
     }
 
     const { title, body } = result

@@ -4,6 +4,18 @@ description: >
   Returns release_title, release_body, and prev_tag as outputs. Does not create or modify any release.
 author: runbot-hq
 
+# Minimum permissions required for this action.
+# contents: read is required for compareCommitsWithBasehead (GitHub API diff fetch).
+# Callers must grant at least this permission in their workflow:
+#
+#   permissions:
+#     contents: read
+#
+# No write permissions are needed — this action does not create releases, push commits,
+# or modify any repository state.
+permissions:
+  contents: read
+
 inputs:
   tag:
     description: 'Tag to generate release notes for (e.g. v1.2.3) — leave blank to auto-resolve to latest git tag'
