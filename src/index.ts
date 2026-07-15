@@ -1,6 +1,6 @@
 import * as core from '@actions/core'
 import * as github from '@actions/github'
-import { execSync } from 'child_process'
+import { spawnSync, execSync } from 'child_process'
 import * as path from 'path'
 import * as fs from 'fs'
 
@@ -9,22 +9,58 @@ import * as fs from 'fs'
 // ---------------------------------------------------------------------------
 
 function git(cmd: string): string {
-  return execSync(`git ${cmd}`, { encoding: 'utf8' }).trim()
+  // execSync with shell: true is intentional here — we rely on shell pipes
+  // (e.g. | head -n 1, | grep -v) for tag resolution.
+  // cmd values are never user-controlled at this call site.
+  return execSync(`git ${cmd}`, { encoding: 'utf8', shell: true }).trim()
 }
 
-function afmCli(prompt: string, systemPrompt?: string): string {
-  const bin = path.join(__dirname, '..', 'afm-cli')
-  if (!fs.existsSync(bin)) {
-    throw new Error(`afm-cli binary not found at ${bin}`)
+/**
+ * Calls afm-cli via spawnSync (no shell — args passed directly to OS).
+ * Flag names mirror the FoundationModels API exactly:
+ *   --prompt                   → session.respond(to:)
+ *   --instructions             → Transcript.Instructions
+ *   --temperature              → GenerationOptions.temperature
+ *   --maximum-response-tokens  → GenerationOptions.maximumResponseTokens
+ */
+function afmCli(bin: string, prompt: string, options?: {
+  instructions?: string
+  temperature?: number
+  maximumResponseTokens?: number
+}): string {
+  const args: string[] = ['--prompt', prompt]
+
+  if (options?.instructions) {
+    args.push('--instructions', options.instructions)
   }
-  const args = ['--prompt', prompt]
-  if (systemPrompt) args.push('--system-prompt', systemPrompt)
-  return execSync(`"${bin}" ${args.map(a => `'${a.replace(/'/g, "'\\''")}'`).join(' ')}`, {
+  if (options?.temperature !== undefined) {
+    args.push('--temperature', String(options.temperature))
+  }
+  if (options?.maximumResponseTokens !== undefined) {
+    args.push('--maximum-response-tokens', String(options.maximumResponseTokens))
+  }
+
+  if (core.isDebug()) {
+    core.debug(`[afm] spawnSync: ${bin} ${args.map(a => JSON.stringify(a)).join(' ')}`)
+  }
+
+  const result = spawnSync(bin, args, {
     encoding: 'utf8',
     timeout: 60_000,
-  }).trim()
+  })
+
+  if (result.error) throw result.error
+  if (result.status !== 0) {
+    throw new Error(`afm-cli exited ${result.status}: ${result.stderr?.trim()}`)
+  }
+
+  return result.stdout.trim()
 }
 
+/**
+ * Parses AFM output into { title, body }.
+ * Throws on unrecognised/prose output so the caller can retry with a stricter prompt.
+ */
 function parseAfmOutput(raw: string): { title: string; body: string } {
   // Strip markdown code fences if present
   const cleaned = raw
@@ -37,7 +73,7 @@ function parseAfmOutput(raw: string): { title: string; body: string } {
   try {
     const parsed = JSON.parse(cleaned)
     const obj = typeof parsed === 'string' ? JSON.parse(parsed) : parsed
-    if (obj.title && obj.body) return { title: obj.title, body: obj.body }
+    if (obj?.title && obj?.body) return { title: String(obj.title), body: String(obj.body) }
   } catch { /* fall through */ }
 
   // Format C: section-keyed { Added: [], Changed: [], ... }
@@ -55,10 +91,8 @@ function parseAfmOutput(raw: string): { title: string; body: string } {
     }
   } catch { /* fall through */ }
 
-  // Format D: prose fallback
-  core.warning('AFM did not return valid JSON — using raw prose as body')
-  const firstLine = cleaned.split('\n').find(l => l.trim()) ?? cleaned.slice(0, 100)
-  return { title: firstLine.trim().slice(0, 100), body: cleaned }
+  // Format D: unrecognised — throw so caller can retry with stricter prompt
+  throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +104,15 @@ async function run(): Promise<void> {
     const token = process.env.GITHUB_TOKEN ?? ''
     const repo = process.env.GITHUB_REPOSITORY ?? ''
     const [owner, repoName] = repo.split('/')
-    const actionPath = process.env.GITHUB_ACTION_PATH ?? __dirname
+    const actionPath = process.env.GITHUB_ACTION_PATH ?? path.join(__dirname, '..')
+    const afmBin = path.join(actionPath, 'afm-cli')
+
+    if (!fs.existsSync(afmBin)) {
+      throw new Error(`afm-cli binary not found at ${afmBin}`)
+    }
+
+    const debug = core.getInput('debug') === 'true'
+    if (debug) core.debug('[afm] Debug logging enabled')
 
     // 1. Shallow clone guard
     try {
@@ -88,7 +130,7 @@ async function run(): Promise<void> {
       if (!tag) throw new Error('No tags found in repository — cannot auto-resolve TAG.')
       core.info(`[afm] TAG not provided — auto-resolved to latest: ${tag}`)
     }
-    if (tag.includes('/')) throw new Error(`TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path`)
+    if (tag.includes('/')) throw new Error('TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path')
     try { git(`rev-parse ${tag}`) } catch { throw new Error(`TAG '${tag}' does not exist in this repository.`) }
 
     // 3. Resolve PREV_TAG
@@ -100,7 +142,7 @@ async function run(): Promise<void> {
       core.warning('No previous tag found — using first commit as baseline')
       prevTag = git('rev-list --max-parents=0 HEAD')
     }
-    if (prevTag.includes('/')) throw new Error(`prev_tag contains a slash — pass a plain tag name`)
+    if (prevTag.includes('/')) throw new Error('prev_tag contains a slash — pass a plain tag name')
     core.info(`[afm] Comparing ${prevTag} → ${tag}`)
 
     // 4. Fetch diff context via GitHub API
@@ -127,7 +169,9 @@ async function run(): Promise<void> {
     files = files.slice(0, 150)
 
     // 5. Build prompt
-    let promptExtra = core.getInput('prompt_extra').slice(0, 300)
+    const promptExtra = core.getInput('prompt_extra').slice(0, 300)
+
+    const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
 
     const prompt = [
       'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
@@ -149,32 +193,34 @@ async function run(): Promise<void> {
       ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
     ].join('\n')
 
-    const systemPrompt = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
+    const afmOptions = {
+      instructions,
+      temperature: 0.7,
+      maximumResponseTokens: 2048,
+    }
 
-    // 6. Call afm-cli — retry once on malformed output
-    const afmBin = path.join(actionPath, 'afm-cli')
+    // 6. Call afm-cli — retry once on cold-start failure
     core.info('[afm] Calling afm-cli...')
-
     let raw: string
     try {
-      raw = afmCli(prompt, systemPrompt)
+      raw = afmCli(afmBin, prompt, afmOptions)
     } catch (e) {
-      core.info('[afm] Attempt 1 failed — retrying in 15s...')
+      core.info('[afm] Attempt 1 failed — retrying in 15s (cold-start model load)...')
       await new Promise(r => setTimeout(r, 15_000))
-      raw = afmCli(prompt, systemPrompt)
+      raw = afmCli(afmBin, prompt, afmOptions)
     }
 
     if (!raw) throw new Error('afm-cli returned empty output')
 
-    // 7. Parse output — retry with rephrased prompt if malformed
+    // 7. Parse output — retry with stricter prompt if format unrecognised
     let result: { title: string; body: string }
     try {
       result = parseAfmOutput(raw)
-    } catch {
-      core.warning('Output malformed — retrying with stricter prompt')
+    } catch (e) {
+      core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
       const strictPrompt = `${prompt}\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}`
-      raw = afmCli(strictPrompt, systemPrompt)
-      result = parseAfmOutput(raw)
+      raw = afmCli(afmBin, strictPrompt, afmOptions)
+      result = parseAfmOutput(raw) // throws and fails the action if still malformed
     }
 
     const { title, body } = result
@@ -188,6 +234,9 @@ async function run(): Promise<void> {
     core.info(`[afm] Generated: ${title}`)
 
     // 9. Write outputs
+    // Note: value: fields are omitted in action.yml — outputs are set programmatically
+    // via core.setOutput() which writes directly to $GITHUB_OUTPUT. This is correct
+    // for node20 actions and intentional, not an accidental deletion.
     core.setOutput('release_title', title)
     core.setOutput('release_body', finalBody)
     core.setOutput('prev_tag', prevTag)
