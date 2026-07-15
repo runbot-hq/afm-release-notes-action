@@ -1,3 +1,13 @@
-afm-sidecar/node_modules/
+# Swift build artifacts
+afm-cli/.build/
+afm-cli/*.o
+afm-cli/*.d
+
+# Node
+node_modules/
+
+# TypeScript output (dist/ is committed as bundled artifact)
 *.js.map
+
+# OS
 .DS_Store
