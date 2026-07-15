@@ -26,6 +26,13 @@ function git(cmd: string, env?: Record<string, string>): string {
   // Note: type-level enforcement is not possible for shell strings in JS.
   // The doc contract here is the only enforcement mechanism — all current
   // call sites are verified correct. Do NOT add new call sites without review.
+  //
+  // Runtime guard: catch the most common future-caller mistake — template-literal
+  // interpolation (e.g. git(`tag --verify ${tag}`)). This does not catch plain
+  // string concatenation, but that is covered by the JSDoc contract above.
+  if (/\$\{/.test(cmd)) {
+    throw new Error(`git() cmd must not use template-literal interpolation (use env param instead): ${cmd}`)
+  }
   return execSync(`git ${cmd}`, {
     encoding: 'utf8',
     shell: true,
@@ -457,6 +464,11 @@ async function run(): Promise<void> {
     } catch (e) {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
       const strictPrompt = `${prompt}\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}`
+      // NOTE: afmCli() here is a single attempt — no cold-start retry wrap.
+      // This is intentional: if step 6 succeeded, the model is already loaded
+      // in memory and a cold-start timeout on this call is extremely unlikely.
+      // If afmCli() throws here (ETIMEDOUT, non-zero exit), it propagates to
+      // the outer catch (error) → core.setFailed. That is the correct behaviour.
       raw = afmCli(afmBin, strictPrompt, afmOptions)
       result = parseAfmOutput(raw, tag) // throws and fails the action if still malformed
     }
