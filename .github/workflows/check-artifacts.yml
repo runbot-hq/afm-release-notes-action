@@ -1,5 +1,10 @@
 name: Check committed artifacts
 
+# This workflow fires on push to main only — not on pull_request or feature branches.
+# Artifacts (afm-cli binary + dist/index.js) require a self-hosted macOS runner
+# build step that cannot happen in CI before merge. The check catches a bad merge
+# immediately after it lands on main. Do NOT move this to pull_request trigger —
+# the artifacts will never be present on a feature branch before the local build.
 on:
   push:
     branches:
@@ -15,6 +20,8 @@ jobs:
         run: |
           missing=()
           [ -f afm-cli ]                      || missing+=("afm-cli binary")
+          # -x gated on -f: if binary is absent, skip the exec-bit check to avoid
+          # two misleading entries ("afm-cli binary" AND "afm-cli is not executable").
           [ ! -f afm-cli ] || [ -x afm-cli ] || missing+=("afm-cli is not executable (chmod +x afm-cli)")
           [ -f dist/index.js ] || missing+=("dist/index.js")
           if [ ${#missing[@]} -gt 0 ]; then

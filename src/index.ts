@@ -159,6 +159,15 @@ function isFatalAfmError(e: unknown): boolean {
  * which routes to the strict-prompt retry in the caller. Do NOT add /g —
  * it would silently accept malformed output instead of triggering the retry.
  *
+ * The three replace() calls are order-sensitive but correct:
+ *   1. /^```json\s*/m  — strips opening fence with language tag (e.g. ```json)
+ *   2. /^```\s*/m      — fallback: strips opening fence without tag (e.g. ```JSON uppercase)
+ *                        also matches the closing fence if it appears at a line start,
+ *                        but only AFTER the opening fence was already removed by step 1.
+ *                        With well-formed single-block output this is harmless.
+ *   3. /```\s*$/m      — strips closing fence.
+ * Do NOT reorder or merge these — the fallback in step 2 is intentional.
+ *
  * @param raw         Raw string output from afm-cli stdout
  * @param currentTag  Current tag string, used as title fallback for format C.
  *                    Passed explicitly to keep this function pure and testable
