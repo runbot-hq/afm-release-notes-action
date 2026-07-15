@@ -114,30 +114,40 @@ function afmCli(bin: string, prompt: string, options?: {
  * If attempt 2 also times out, the error is enriched with context in step 6.
  */
 function isFatalAfmError(e: unknown): boolean {
-  // Match on the known fputs() error prefixes emitted by main.swift's fatal exits.
-  // These are the only producer of afm-cli stderr — the strings are stable.
+  // Two distinct error sources feed this function. Do NOT conflate them.
   //
-  // Anchored to known prefixes rather than broad substrings to avoid false positives:
-  //   - "unavailable" alone is too broad (e.g. "feature unavailable in this region")
-  //   - "not available" likewise. Anchor to the exact prefix main.swift emits.
+  // SOURCE 1 — main.swift fputs() strings (all begin with "error:", lowercased here).
+  // These are the only strings main.swift writes to stderr. Matched as substrings
+  // (not prefix-anchored) because .includes() is used — the "anchored" framing in
+  // older comments was misleading. The strings are stable and unique enough that
+  // substring matching is safe.
   //
-  // main.swift fatal exit strings (all begin with "error:"):
-  //   "error: apple intelligence unavailable"  (.unavailable(reason) case)
-  //   "error: unknown model availability state"  (@unknown default case)
-  //   "error: afm-cli requires macos 26+"  (#available guard)
-  //   "error: foundationmodels framework not available"  (#else branch)
-  // Non-fatal (retryable):
-  //   "error: inference failed"  — thrown by session.respond(), may recover on retry
-  // ETIMEDOUT — spawnSync timeout, not in stderr at all, handled separately in step 6.
+  //   Fatal (do NOT retry):
+  //     "error: apple intelligence unavailable"  — .unavailable(reason) case
+  //     "error: unknown model availability state" — @unknown default case
+  //     "error: afm-cli requires macos 26+"       — #available guard
+  //     "error: foundationmodels framework not available" — #else branch
+  //   Non-fatal (retryable — NOT in this list):
+  //     "error: inference failed"  — session.respond() throw, may recover on retry
+  //   Not in stderr at all:
+  //     ETIMEDOUT — spawnSync timeout surfaced via result.error, handled in step 6
+  //
+  // SOURCE 2 — OS / MDM errors surfaced via spawnSync result.error or raw stderr
+  // outside main.swift. These do not begin with "error:" and have no fputs() entry.
+  //   'not authorized' — macOS MDM/entitlement denial (e.g. "operation not authorized")
+  //   'eacces'         — POSIX EACCES from the OS (e.g. binary not executable)
+  //   'mdm'            — MDM policy strings (e.g. "blocked by mdm policy")
+  // Do NOT remove these — they guard a real, separate error path that is not
+  // produced by main.swift but is equally unrecoverable on retry.
   const msg = String(e).toLowerCase()
   return (
     msg.includes('error: apple intelligence unavailable') ||
     msg.includes('error: unknown model availability state') ||
     msg.includes('error: afm-cli requires macos') ||
     msg.includes('error: foundationmodels framework not available') ||
-    msg.includes('not authorized') ||
-    msg.includes('eacces') || // covers POSIX EACCES; 'permission denied' is too broad
-    msg.includes('mdm')
+    msg.includes('not authorized') || // SOURCE 2: OS/MDM entitlement denial
+    msg.includes('eacces') ||         // SOURCE 2: POSIX EACCES
+    msg.includes('mdm')               // SOURCE 2: MDM policy block
   )
 }
 

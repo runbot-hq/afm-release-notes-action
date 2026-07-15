@@ -12,6 +12,16 @@ on:
     paths:
       # Only run when files that could affect artifact validity change.
       # Docs/config-only pushes to main skip this job to save runner minutes.
+      #
+      # Path entry breakdown:
+      #   'afm-cli'              — the compiled binary at the repo root (exact file,
+      #                            NOT the afm-cli/ directory — directory changes are
+      #                            covered by the afm-cli/Sources/** and Package.swift
+      #                            entries below)
+      #   'dist/**'              — the bundled JS artifact
+      #   'src/**'               — TS source changes that require a dist rebuild
+      #   'afm-cli/Sources/**'   — Swift source changes that require a binary rebuild
+      #   'afm-cli/Package.swift'— Swift package manifest changes
       - 'afm-cli'
       - 'dist/**'
       - 'src/**'
