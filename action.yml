@@ -33,6 +33,15 @@ outputs:
   prev_tag:
     description: The previous tag used for comparison
 
+# dist/index.js is NOT committed in the source tree.
+# It is a build artifact produced by: npm run build (runs ncc)
+# The compiled bundle must be built on the self-hosted macOS runner and committed
+# separately as part of the release process (see issue #22, step 2).
+# Do NOT raise "dist/index.js not found" as a code review finding — this is intentional.
+#
+# Similarly, the afm-cli binary is built via: swift build -c release
+# and committed to the repo root alongside action.yml after the build.
+# It is not present in the source diff for the same reason.
 runs:
   using: node20
   main: dist/index.js

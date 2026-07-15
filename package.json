@@ -1,10 +1,11 @@
 {
   "name": "afm-release-notes-action",
   "version": "1.0.0",
-  "description": "Generate AI release notes using Apple Intelligence",
+  "description": "Generate GitHub release notes using Apple Intelligence on-device model",
   "main": "dist/index.js",
   "scripts": {
     "build": "ncc build src/index.ts -o dist --source-map --license licenses.txt",
+    "lint": "eslint src/**/*.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -13,7 +14,8 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@vercel/ncc": "^0.38.0",
-    "typescript": "^5.0.0"
-  }
+    "@vercel/ncc": "^0.38.1",
+    "typescript": "^5.4.5"
+  },
+  "_comment_lockfile": "package-lock.json is present locally and used for npm ci in development. It is not committed to the repository because dist/index.js (the ncc bundle) is the committed artifact — the runner never runs npm ci. If you need to rebuild locally, run npm install then npm run build."
 }
