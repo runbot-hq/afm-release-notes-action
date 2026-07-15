@@ -317,12 +317,29 @@ async function run(): Promise<void> {
     // The permissions: block in action.yml documents this requirement but is
     // advisory only — GitHub does not enforce action-level permissions at runtime.
     // The caller workflow must grant contents: read at the job or workflow level.
+    // A missing permission surfaces as HTTP 403 — caught below with an actionable message.
     const octokit = github.getOctokit(token)
-    const compare = await octokit.rest.repos.compareCommitsWithBasehead({
-      owner,
-      repo: repoName,
-      basehead: `${prevTag}...${tag}`,
-    })
+    let compare: Awaited<ReturnType<typeof octokit.rest.repos.compareCommitsWithBasehead>>
+    try {
+      compare = await octokit.rest.repos.compareCommitsWithBasehead({
+        owner,
+        repo: repoName,
+        basehead: `${prevTag}...${tag}`,
+      })
+    } catch (e) {
+      // Enrich 403 with an actionable message — the raw Octokit error gives no hint
+      // that the fix is a permissions: block in the caller workflow.
+      const status = (e as { status?: number })?.status
+      if (status === 403) {
+        throw new Error(
+          `GitHub API returned 403 when comparing ${prevTag}...${tag}. ` +
+          'Ensure the calling workflow grants contents: read permission:\n' +
+          '  permissions:\n' +
+          '    contents: read'
+        )
+      }
+      throw e
+    }
 
     let commits = compare.data.commits.map(c => c.commit.message.slice(0, 120))
     let files = compare.data.files?.map(f => `${f.status} ${f.filename}`) ?? []
