@@ -136,8 +136,7 @@ function isFatalAfmError(e: unknown): boolean {
     msg.includes('error: afm-cli requires macos') ||
     msg.includes('error: foundationmodels framework not available') ||
     msg.includes('not authorized') ||
-    msg.includes('permission denied') ||
-    msg.includes('eacces') ||
+    msg.includes('eacces') || // covers POSIX EACCES; 'permission denied' is too broad
     msg.includes('mdm')
   )
 }
@@ -181,14 +180,21 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
   const cleaned = raw
     .replace(/^```json\s*/m, '')
     .replace(/^```\s*/m, '')
-    .replace(/```\s*$/m, '')
+    .replace(/```\s*$/, '')  // no /m — $ must match end-of-string, not end-of-line.
+                              // With /m, any line ending in ``` would be stripped,
+                              // including fenced code blocks inside the JSON body.
     .trim()
 
   // Format A/B: { title, body } or double-encoded string
   try {
     const parsed = JSON.parse(cleaned)
     const obj = typeof parsed === 'string' ? JSON.parse(parsed) : parsed
-    if (obj?.title && obj?.body) return { title: String(obj.title), body: String(obj.body) }
+    // Use typeof checks not truthiness — obj?.title && obj?.body fails on empty string
+    // title, which would fall through to Format C and throw a misleading Format D error.
+    if (typeof obj?.title === 'string' && obj.title.length > 0 &&
+        typeof obj?.body === 'string' && obj.body.length > 0) {
+      return { title: String(obj.title), body: String(obj.body) }
+    }
   } catch { /* fall through */ }
 
   // Format C: section-keyed { Added: [], Changed: [], ... }
@@ -447,19 +453,29 @@ async function run(): Promise<void> {
     // Do NOT move afmCli to execSync with shell: true or this guarantee breaks.
     const promptExtra = core.getInput('prompt_extra').slice(0, 300)
 
+    // Sanitise tag and prevTag before interpolating into the prompt.
+    // rev-parse validates existence but does not prevent prompt injection:
+    // a tag like "v1.0 IGNORE PREVIOUS INSTRUCTIONS" is a valid git tag and
+    // would pass rev-parse, but could influence the LLM's output.
+    // Impact is low (output goes to release notes only, never executed), but
+    // strip control characters and cap length as a belt-and-suspenders measure.
+    // Semver tags are at most ~30 chars; 200 is generous for non-semver tags.
+    const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
+    const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
+
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
 
     const prompt = [
       'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
       'Rules:',
-      `- title: include the version tag (${tag}) and a short human-readable summary.`,
+      `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
       '- body: Markdown with sections ## Added, ## Changed, ## Fixed, ## Removed, ## Security (omit empty sections).',
       '- User-facing language, past tense.',
       '- Skip bot commits (dependabot, renovate, github-actions) and merge commits.',
       '- Output JSON only — no markdown fences, no extra keys.',
       '',
-      `Previous tag: ${prevTag}`,
-      `Target tag: ${tag}`,
+      `Previous tag: ${safePrevTag}`,
+      `Target tag: ${safeTag}`,
       '',
       'Commits:',
       ...commits.map(c => `- ${c}`),
@@ -485,7 +501,10 @@ async function run(): Promise<void> {
     // first run. If attempt 2 also times out, the error is enriched with the
     // binary path and attempt number before propagating to core.setFailed.
     core.info('[afm] Calling afm-cli...')
-    let raw: string
+    // Initialized to '' so TypeScript's definite-assignment analysis is unambiguous
+    // across the nested try/catch below. The if (!raw) guard after the block catches
+    // any path that somehow exits without assigning a non-empty value.
+    let raw = ''
     try {
       raw = afmCli(afmBin, prompt, afmOptions)
     } catch (e) {
