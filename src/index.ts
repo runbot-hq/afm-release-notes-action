@@ -29,6 +29,9 @@ function git(cmd: string, env?: Record<string, string>): string {
  * shell metacharacter interpretation in prompt content.
  * Do NOT refactor to execSync with a shell string.
  *
+ * maxBuffer is set to 10 MB. Node's default is 1 MB which can be exceeded
+ * by verbose model output before the 120_000 char body cap is applied.
+ *
  * Flag names mirror the FoundationModels API exactly (see main.swift):
  *   --prompt                   → session.respond(to:)
  *   --instructions             → Transcript.Instructions (Apple's term for system prompt)
@@ -59,6 +62,7 @@ function afmCli(bin: string, prompt: string, options?: {
   const result = spawnSync(bin, args, {
     encoding: 'utf8',
     timeout: 60_000,
+    maxBuffer: 10 * 1024 * 1024, // 10 MB — default 1 MB can be exceeded by verbose model output
   })
 
   if (result.error) throw result.error
@@ -121,7 +125,14 @@ function parseAfmOutput(raw: string): { title: string; body: string } {
 
 async function run(): Promise<void> {
   try {
-    const token = process.env.GITHUB_TOKEN ?? ''
+    // GITHUB_TOKEN must be set explicitly in the workflow step:
+    //   env:
+    //     GITHUB_TOKEN: ${{ github.token }}
+    // Passing an empty string to getOctokit() does not throw immediately —
+    // it produces an opaque 401 at the first API call. Fail fast instead.
+    const token = process.env.GITHUB_TOKEN
+    if (!token) throw new Error('GITHUB_TOKEN is not set — add `env: GITHUB_TOKEN: ${{ github.token }}` to your workflow step.')
+
     const repo = process.env.GITHUB_REPOSITORY ?? ''
     const [owner, repoName] = repo.split('/')
 
@@ -132,7 +143,13 @@ async function run(): Promise<void> {
     const afmBin = path.join(actionPath, 'afm-cli')
 
     if (!fs.existsSync(afmBin)) {
-      throw new Error(`afm-cli binary not found at ${afmBin}`)
+      // This action requires a self-hosted macOS arm64 runner with Apple Intelligence.
+      // On Linux or Windows runners afm-cli will not exist — the action cannot run.
+      throw new Error(
+        `afm-cli binary not found at ${afmBin}. ` +
+        'This action requires a self-hosted macOS 26+ arm64 runner with Apple Intelligence enabled. ' +
+        'It cannot run on GitHub-hosted Linux or Windows runners.'
+      )
     }
 
     // 1. Shallow clone guard
@@ -174,6 +191,12 @@ async function run(): Promise<void> {
     core.info(`[afm] Comparing ${prevTag} → ${tag}`)
 
     // 4. Fetch diff context via GitHub API
+    // compareCommitsWithBasehead is intentionally not paginated. The API caps
+    // at 250 commits and 300 files per response. For releases larger than that,
+    // commits and files are silently truncated by the API — the > 80 / > 150
+    // warning logic below will still fire if the first page exceeds those thresholds.
+    // Full pagination is not implemented because prompt size is already capped
+    // at 80 commits / 150 files — fetching more pages would not change the output.
     const octokit = github.getOctokit(token)
     const compare = await octokit.rest.repos.compareCommitsWithBasehead({
       owner,
