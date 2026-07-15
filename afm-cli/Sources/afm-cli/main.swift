@@ -142,7 +142,7 @@ if let m = maximumResponseTokens { options.maximumResponseTokens = m }
 do {
     let response = try await session.respond(to: prompt, options: options)
     print(response.content)
-    exit(0)
+    // exit(0) omitted — Swift top-level execution exits 0 naturally after this block.
 } catch {
     fputs("Error: inference failed — \(error)\n", stderr)
     exit(1)

@@ -27,6 +27,11 @@ function git(cmd: string, env?: Record<string, string>): string {
   // The doc contract here is the only enforcement mechanism — all current
   // call sites are verified correct. Do NOT add new call sites without review.
   //
+  // NOT all git operations use this helper — `git fetch --unshallow` in step 1
+  // uses execSync directly (no user input, no `git` prefix needed, stdio: inherit
+  // for streaming output). That is the only intentional bypass.
+  // Do NOT raise "inconsistent git() usage" — the exemption is deliberate.
+  //
   // Runtime guard: catch the most common future-caller mistake — template-literal
   // interpolation (e.g. git(`tag --verify ${tag}`)). This does not catch plain
   // string concatenation, but that is covered by the JSDoc contract above.
@@ -109,14 +114,31 @@ function afmCli(bin: string, prompt: string, options?: {
  * If attempt 2 also times out, the error is enriched with context in step 6.
  */
 function isFatalAfmError(e: unknown): boolean {
+  // Match on the known fputs() error prefixes emitted by main.swift's fatal exits.
+  // These are the only producer of afm-cli stderr — the strings are stable.
+  //
+  // Anchored to known prefixes rather than broad substrings to avoid false positives:
+  //   - "unavailable" alone is too broad (e.g. "feature unavailable in this region")
+  //   - "not available" likewise. Anchor to the exact prefix main.swift emits.
+  //
+  // main.swift fatal exit strings (all begin with "error:"):
+  //   "error: apple intelligence unavailable"  (.unavailable(reason) case)
+  //   "error: unknown model availability state"  (@unknown default case)
+  //   "error: afm-cli requires macos 26+"  (#available guard)
+  //   "error: foundationmodels framework not available"  (#else branch)
+  // Non-fatal (retryable):
+  //   "error: inference failed"  — thrown by session.respond(), may recover on retry
+  // ETIMEDOUT — spawnSync timeout, not in stderr at all, handled separately in step 6.
   const msg = String(e).toLowerCase()
   return (
-    msg.includes('unavailable') ||
-    msg.includes('mdm') ||
+    msg.includes('error: apple intelligence unavailable') ||
+    msg.includes('error: unknown model availability state') ||
+    msg.includes('error: afm-cli requires macos') ||
+    msg.includes('error: foundationmodels framework not available') ||
     msg.includes('not authorized') ||
     msg.includes('permission denied') ||
-    msg.includes('not available') ||
-    msg.includes('eacces')
+    msg.includes('eacces') ||
+    msg.includes('mdm')
   )
 }
 
@@ -374,8 +396,7 @@ async function run(): Promise<void> {
         basehead: `${prevTag}...${tag}`,
       })
     } catch (e) {
-      // Enrich 403 with an actionable message — the raw Octokit error gives no hint
-      // that the fix is a permissions: block in the caller workflow.
+      // Enrich known HTTP errors with actionable messages — raw Octokit errors are opaque.
       const status = (e as { status?: number })?.status
       if (status === 403) {
         throw new Error(
@@ -383,6 +404,14 @@ async function run(): Promise<void> {
           'Ensure the calling workflow grants contents: read permission:\n' +
           '  permissions:\n' +
           '    contents: read'
+        )
+      }
+      if (status === 404) {
+        throw new Error(
+          `GitHub API returned 404 when comparing ${prevTag}...${tag}. ` +
+          'Ensure both refs exist and are reachable from this repository. ' +
+          'If prev_tag was auto-resolved via rev-list, the commit may not be ' +
+          'reachable from the GitHub API in a shallow or forked context.'
         )
       }
       throw e

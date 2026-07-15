@@ -14,8 +14,8 @@ jobs:
       - name: Verify afm-cli binary and dist/index.js are committed
         run: |
           missing=()
-          [ -f afm-cli ]       || missing+=("afm-cli binary")
-          [ -x afm-cli ]       || missing+=("afm-cli is not executable (chmod +x afm-cli)")
+          [ -f afm-cli ]                      || missing+=("afm-cli binary")
+          [ ! -f afm-cli ] || [ -x afm-cli ] || missing+=("afm-cli is not executable (chmod +x afm-cli)")
           [ -f dist/index.js ] || missing+=("dist/index.js")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing committed artifacts: ${missing[*]}"
