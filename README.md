@@ -16,7 +16,7 @@ afm-cli-bin       Prebuilt Swift binary — committed to repo, sourced from runb
 
 `src/index.ts` handles all logic: tag resolution, GitHub API diff fetch, prompt assembly, retry, and output parsing. `afm-cli-bin` is domain-ignorant — it takes `--prompt <text>` and returns plain text. Both are committed as build artifacts; no build step or network call runs on the runner.
 
-`afm-cli` Swift source lives in [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli). When a new binary is released there, update `afm-cli-bin` here by downloading the release asset and committing it.
+`afm-cli` Swift source lives in [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli). When the binary is updated, download `afm-cli-bin` from the `main` branch of that repo and commit it here.
 
 ---
 
@@ -175,7 +175,14 @@ git commit -m "chore: rebuild artifacts"
 > required sibling. Staging only `dist/index.js` will cause a `MODULE_NOT_FOUND` crash
 > at runtime.
 
-`afm-cli-bin` is published and maintained in [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli). To rebuild it, push to `main` in that repo — CI will rebuild and re-upload the release asset automatically.
+`afm-cli-bin` is maintained in [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli). To update it, fetch the binary from `main` of that repo and commit it here:
+
+```bash
+gh run download --repo runbot-hq/afm-cli --name afm-cli-bin
+install -m 755 afm-cli-bin ./afm-cli-bin
+git add afm-cli-bin
+git commit -m "chore: update afm-cli-bin from runbot-hq/afm-cli main"
+```
 
 ---
 

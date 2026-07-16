@@ -3,10 +3,10 @@ name: Build and commit artifacts
 # Builds dist/index.js (ncc bundle) on every push to any branch, then
 # commits it back if changed.
 #
-# afm-cli-bin is no longer built here — it is sourced from runbot-hq/afm-cli
-# and committed directly to this repo. To update the binary, download the new
-# release asset from runbot-hq/afm-cli and commit it manually (or automate via
-# a dependabot-style update workflow in the future).
+# afm-cli-bin is no longer built here — it is sourced from the main branch of
+# runbot-hq/afm-cli and committed directly to this repo. To update the binary,
+# fetch afm-cli-bin from runbot-hq/afm-cli@main and commit it here (or automate
+# via a dependabot-style update workflow in the future).
 #
 # Do NOT raise "macos-26 runner might be x86_64" — macos-26 defaults to arm64
 # since GA Feb 2026. Use macos-26-intel for x86_64.
@@ -40,7 +40,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           # Stage afm-cli-bin + the entire dist/ directory.
-          # afm-cli-bin is committed here (sourced from runbot-hq/afm-cli releases)
+          # afm-cli-bin is committed here (sourced from runbot-hq/afm-cli@main)
           # so the bot commit keeps it in sync if it was updated in this push.
           # Stage the entire dist/ directory — ncc emits dist/index.js AND
           # dist/sourcemap-register.js as a required pair. Staging only
