@@ -25,16 +25,16 @@ jobs:
           # artifact commit), not the merge commit that triggered the build.
           ref: main
 
-      - name: Verify afm-cli-bin binary and dist/index.js are committed
+      - name: Verify afm-cli-bin and dist/index.js are committed
         run: |
           missing=()
           # Use -f (regular file) not just existence — catches the case where the
           # build step accidentally committed afm-cli-bin as a directory entry.
-          [ -f afm-cli-bin ]   || missing+=("afm-cli-bin binary (missing or is a directory — check build-artifacts.yml)")
+          [ -f afm-cli-bin ]   || missing+=("afm-cli-bin binary (missing or is a directory — download from runbot-hq/afm-cli and commit)")
           # -x tests the committed file mode bit, not runtime executability.
           # This is correct — Ubuntu cannot run a Mach-O binary regardless.
-          # The check ensures install -m 755 set the bit before committing.
-          [ -x afm-cli-bin ]   || missing+=("afm-cli-bin missing executable bit (file mode)")
+          # The check ensures the binary was committed with chmod 755.
+          [ -x afm-cli-bin ]   || missing+=("afm-cli-bin missing executable bit (run: chmod 755 afm-cli-bin && git add afm-cli-bin)")
           [ -f dist/index.js ] || missing+=("dist/index.js")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing committed artifacts: ${missing[*]}"

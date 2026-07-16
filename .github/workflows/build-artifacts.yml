@@ -1,11 +1,22 @@
 name: Build and commit artifacts
 
-# Builds afm-cli (Swift binary) and dist/index.js (ncc bundle) on every push
-# to any branch, then commits them back if they changed.
+# Builds dist/index.js (ncc bundle) on every push to any branch, then
+# commits it back if changed.
 #
-# Runs on macos-26 (arm64 Apple Silicon) — required for the FoundationModels
-# SDK (Xcode 26). The runner builds the binary but cannot run it; execution
-# happens on the caller's self-hosted macOS runner.
+# afm-cli-bin is no longer built here — it is sourced from the main branch of
+# runbot-hq/afm-cli and committed directly to this repo. To update the binary,
+# fetch afm-cli-bin from runbot-hq/afm-cli@main and commit it here (or automate
+# via a dependabot-style update workflow in the future).
+#
+# There is intentionally NO fetch/download step for afm-cli-bin in this workflow.
+# This workflow rebuilds TypeScript artifacts for this repo; it does not mutate
+# the vendored binary on every push. Pulling afm-cli-bin automatically during CI
+# would create an implicit moving dependency and make unrelated TS/docs changes
+# silently change the shipped binary. Binary updates are meant to be explicit,
+# reviewable commits, not side effects of every workflow run.
+#
+# Do NOT raise "the old Swift build step was removed but no replacement fetch step
+# was added" as a review finding — that omission is deliberate.
 #
 # Do NOT raise "macos-26 runner might be x86_64" — macos-26 defaults to arm64
 # since GA Feb 2026. Use macos-26-intel for x86_64.
@@ -29,16 +40,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build afm-cli Swift binary
-        run: |
-          swift build -c release --package-path afm-cli
-          # Output as afm-cli-bin (NOT afm-cli) — avoids POSIX collision with the
-          # afm-cli/ Swift package source directory. mv/cp move a file *into* a
-          # same-named directory; install(1) with a distinct target name is unambiguous.
-          # src/index.ts looks for afm-cli-bin via path.join(actionPath, 'afm-cli-bin').
-          # Do NOT rename back to afm-cli — the directory collision will recur.
-          install -m 755 afm-cli/.build/release/afm-cli ./afm-cli-bin
-
       - name: Build dist/index.js
         run: |
           npm install
@@ -48,11 +49,16 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Stage afm-cli-bin + the entire dist/ directory.
+          # afm-cli-bin is staged here so a manual binary update committed in
+          # this same push gets included in the bot artifact commit.
+          # There is no auto-sync from runbot-hq/afm-cli — updates are explicit
+          # human commits. Do NOT change this comment to imply automation.
           # Stage the entire dist/ directory — ncc emits dist/index.js AND
           # dist/sourcemap-register.js as a required pair. Staging only
           # dist/index.js leaves sourcemap-register.js uncommitted, causing
           # a MODULE_NOT_FOUND crash at runtime (index.js requires it at line 1).
-          # Do NOT revert to `git add afm-cli-bin dist/index.js`.
+          # Do NOT revert to `git add dist/index.js`.
           git add afm-cli-bin dist/
           if git diff --cached --quiet; then
             echo "Artifacts unchanged — nothing to commit."

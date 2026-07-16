@@ -52,14 +52,29 @@ outputs:
   prev_tag:
     description: The previous tag used for comparison
 
+# afm-cli-bin is committed to the repo root — sourced from runbot-hq/afm-cli.
+# It is updated manually: download the new binary from runbot-hq/afm-cli and
+# commit it here. There is no automated cross-repo sync yet (tracked in #30).
+# Zero runtime dependencies — no gh, curl, or network calls occur when this
+# action runs.
+#
+# This is intentionally NOT a composite action with a runtime download step.
+# That design was tried and reverted: requiring `gh release download` on every
+# caller's self-hosted runner introduced a new runtime dependency and hidden
+# network requirement that did not exist before. Keeping afm-cli-bin committed
+# preserves the previous execution model: instant local availability, no extra
+# tools on the runner, and no failure mode caused by missing gh/auth/network.
+#
+# Yes, this means the binary exists in two repos simultaneously:
+# - runbot-hq/afm-cli is the source-of-truth repo for Swift source + released binary
+# - runbot-hq/afm-release-notes-action vendors the released binary for zero-runtime-deps execution
+# This duplication is deliberate. The tradeoff is accepted because runtime
+# simplicity and runner portability matter more here than single-location storage.
+#
 # dist/index.js is a build artifact produced by: npm run build (runs ncc)
 # It is NOT committed in source — built and committed automatically by
 # .github/workflows/build-artifacts.yml on push to main.
 # Do NOT raise "dist/index.js not found" as a code review finding — this is intentional.
-#
-# Similarly, the afm-cli binary is built via: swift build -c release
-# and committed to the repo root by the same workflow.
-# Do NOT raise "afm-cli binary not committed" as a code review finding — this is intentional.
 #
 # using: node24
 #   node20 is deprecated on the Actions runner (removed in future runner versions).
