@@ -178,8 +178,8 @@ git commit -m "chore: rebuild artifacts"
 `afm-cli-bin` is maintained in [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli). To update it, fetch the binary from `main` of that repo and commit it here:
 
 ```bash
-gh run download --repo runbot-hq/afm-cli --name afm-cli-bin
-install -m 755 afm-cli-bin ./afm-cli-bin
+gh release download --repo runbot-hq/afm-cli --tag v1 --pattern 'afm-cli-bin'
+chmod 755 afm-cli-bin
 git add afm-cli-bin
 git commit -m "chore: update afm-cli-bin from runbot-hq/afm-cli main"
 ```
