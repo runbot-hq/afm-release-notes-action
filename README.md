@@ -9,14 +9,14 @@ Generate AI release notes using Apple Intelligence (on-device AFM) on a self-hos
 ## How It Works
 
 ```
-action.yml        composite action — downloads afm-cli-bin, then runs dist/index.js
+action.yml        node24 action — main: dist/index.js
 src/index.ts      TypeScript business logic (bundled to dist/index.js via ncc)
-afm-cli-bin       Prebuilt Swift binary — downloaded at runtime from runbot-hq/afm-cli@v1
+afm-cli-bin       Prebuilt Swift binary — committed to repo, sourced from runbot-hq/afm-cli
 ```
 
-`src/index.ts` handles all logic: tag resolution, GitHub API diff fetch, prompt assembly, retry, and output parsing. `afm-cli-bin` is domain-ignorant — it takes `--prompt <text>` and returns plain text.
+`src/index.ts` handles all logic: tag resolution, GitHub API diff fetch, prompt assembly, retry, and output parsing. `afm-cli-bin` is domain-ignorant — it takes `--prompt <text>` and returns plain text. Both are committed as build artifacts; no build step or network call runs on the runner.
 
-`afm-cli-bin` is published as a release asset in [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli) and downloaded at runtime by `action.yml` (pinned to the `v1` floating tag). `dist/index.js` is committed as a build artifact by CI; no build step runs on the runner.
+`afm-cli` Swift source lives in [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli). When a new binary is released there, update `afm-cli-bin` here by downloading the release asset and committing it.
 
 ---
 
@@ -141,8 +141,7 @@ jobs:
 
 - Apple Silicon Mac, macOS 26+, Apple Intelligence enabled in System Settings (per-user — check MDM restrictions)
 - Runner labeled `[self-hosted, macOS, apple-intelligence]`
-- `gh` CLI available on the runner (standard on GitHub-hosted and most self-hosted runners) — used to download `afm-cli-bin` at runtime from [runbot-hq/afm-cli@v1](https://github.com/runbot-hq/afm-cli)
-- `dist/index.js` is committed as a build artifact; no build step runs on the runner
+- No runtime dependencies — `afm-cli-bin` (sourced from [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli)) and `dist/index.js` are committed; nothing is downloaded or installed at runtime
 
 > `actions/checkout` must use `fetch-depth: 0` — a shallow clone will fail tag resolution.
 
