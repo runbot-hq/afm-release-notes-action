@@ -59,7 +59,8 @@ jobs:
           # dist/index.js leaves sourcemap-register.js uncommitted, causing
           # a MODULE_NOT_FOUND crash at runtime (index.js requires it at line 1).
           # Do NOT revert to `git add dist/index.js`.
-          git add afm-cli-bin dist/
+          [ -f afm-cli-bin ] && git add afm-cli-bin
+          git add dist/
           if git diff --cached --quiet; then
             echo "Artifacts unchanged — nothing to commit."
           else
