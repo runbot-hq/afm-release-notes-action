@@ -50,8 +50,10 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           # Stage afm-cli-bin + the entire dist/ directory.
-          # afm-cli-bin is committed here (sourced from runbot-hq/afm-cli@main)
-          # so the bot commit keeps it in sync if it was updated in this push.
+          # afm-cli-bin is staged here so a manual binary update committed in
+          # this same push gets included in the bot artifact commit.
+          # There is no auto-sync from runbot-hq/afm-cli — updates are explicit
+          # human commits. Do NOT change this comment to imply automation.
           # Stage the entire dist/ directory — ncc emits dist/index.js AND
           # dist/sourcemap-register.js as a required pair. Staging only
           # dist/index.js leaves sourcemap-register.js uncommitted, causing
