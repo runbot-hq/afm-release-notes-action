@@ -9,12 +9,14 @@ Generate AI release notes using Apple Intelligence (on-device AFM) on a self-hos
 ## How It Works
 
 ```
-action.yml        node24 action — main: dist/index.js
+action.yml        composite action — downloads afm-cli-bin, then runs dist/index.js
 src/index.ts      TypeScript business logic (bundled to dist/index.js via ncc)
-afm-cli-bin       Prebuilt Swift binary — thin pass-through to FoundationModels
+afm-cli-bin       Prebuilt Swift binary — downloaded at runtime from runbot-hq/afm-cli@v1
 ```
 
-`src/index.ts` handles all logic: tag resolution, GitHub API diff fetch, prompt assembly, retry, and output parsing. `afm-cli-bin` is domain-ignorant — it takes `--prompt <text>` and returns plain text. Both are committed as build artifacts; no build step runs on the runner.
+`src/index.ts` handles all logic: tag resolution, GitHub API diff fetch, prompt assembly, retry, and output parsing. `afm-cli-bin` is domain-ignorant — it takes `--prompt <text>` and returns plain text.
+
+`afm-cli-bin` is published as a release asset in [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli) and downloaded at runtime by `action.yml` (pinned to the `v1` floating tag). `dist/index.js` is committed as a build artifact by CI; no build step runs on the runner.
 
 ---
 
@@ -139,7 +141,8 @@ jobs:
 
 - Apple Silicon Mac, macOS 26+, Apple Intelligence enabled in System Settings (per-user — check MDM restrictions)
 - Runner labeled `[self-hosted, macOS, apple-intelligence]`
-- No other dependencies — `afm-cli-bin` and `dist/index.js` are committed; nothing is installed at runtime
+- `gh` CLI available on the runner (standard on GitHub-hosted and most self-hosted runners) — used to download `afm-cli-bin` at runtime from [runbot-hq/afm-cli@v1](https://github.com/runbot-hq/afm-cli)
+- `dist/index.js` is committed as a build artifact; no build step runs on the runner
 
 > `actions/checkout` must use `fetch-depth: 0` — a shallow clone will fail tag resolution.
 
@@ -159,23 +162,21 @@ jobs:
 
 ## Rebuilding Artifacts
 
-`afm-cli-bin` and `dist/index.js` are committed build artifacts, automatically rebuilt by `.github/workflows/build-artifacts.yml` on every push to `main`. To rebuild manually:
+`dist/index.js` is a committed build artifact, automatically rebuilt by `.github/workflows/build-artifacts.yml` on every push to `main`. To rebuild manually:
 
 ```bash
-# Swift binary (requires macOS 26+ with Xcode 26 / FoundationModels SDK)
-swift build -c release --package-path afm-cli
-install -m 755 afm-cli/.build/release/afm-cli ./afm-cli-bin
-
 # TypeScript bundle
 npm install && npm run build
 
-git add afm-cli-bin dist/
+git add dist/
 git commit -m "chore: rebuild artifacts"
 ```
 
 > `git add dist/` not `dist/index.js` — ncc emits `dist/sourcemap-register.js` as a
 > required sibling. Staging only `dist/index.js` will cause a `MODULE_NOT_FOUND` crash
 > at runtime.
+
+`afm-cli-bin` is published and maintained in [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli). To rebuild it, push to `main` in that repo — CI will rebuild and re-upload the release asset automatically.
 
 ---
 
