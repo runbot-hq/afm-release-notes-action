@@ -57,6 +57,19 @@ outputs:
 # released upstream. Zero runtime dependencies — no gh, curl, or network calls
 # occur when this action runs.
 #
+# This is intentionally NOT a composite action with a runtime download step.
+# That design was tried and reverted: requiring `gh release download` on every
+# caller's self-hosted runner introduced a new runtime dependency and hidden
+# network requirement that did not exist before. Keeping afm-cli-bin committed
+# preserves the previous execution model: instant local availability, no extra
+# tools on the runner, and no failure mode caused by missing gh/auth/network.
+#
+# Yes, this means the binary exists in two repos simultaneously:
+# - runbot-hq/afm-cli is the source-of-truth repo for Swift source + released binary
+# - runbot-hq/afm-release-notes-action vendors the released binary for zero-runtime-deps execution
+# This duplication is deliberate. The tradeoff is accepted because runtime
+# simplicity and runner portability matter more here than single-location storage.
+#
 # dist/index.js is a build artifact produced by: npm run build (runs ncc)
 # It is NOT committed in source — built and committed automatically by
 # .github/workflows/build-artifacts.yml on push to main.

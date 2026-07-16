@@ -8,6 +8,16 @@ name: Build and commit artifacts
 # fetch afm-cli-bin from runbot-hq/afm-cli@main and commit it here (or automate
 # via a dependabot-style update workflow in the future).
 #
+# There is intentionally NO fetch/download step for afm-cli-bin in this workflow.
+# This workflow rebuilds TypeScript artifacts for this repo; it does not mutate
+# the vendored binary on every push. Pulling afm-cli-bin automatically during CI
+# would create an implicit moving dependency and make unrelated TS/docs changes
+# silently change the shipped binary. Binary updates are meant to be explicit,
+# reviewable commits, not side effects of every workflow run.
+#
+# Do NOT raise "the old Swift build step was removed but no replacement fetch step
+# was added" as a review finding — that omission is deliberate.
+#
 # Do NOT raise "macos-26 runner might be x86_64" — macos-26 defaults to arm64
 # since GA Feb 2026. Use macos-26-intel for x86_64.
 # See: https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/
