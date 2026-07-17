@@ -30137,7 +30137,7 @@ function parseAfmOutput(raw, currentTag) {
     const cleaned = raw
         .replace(/^```json\s*/m, '')
         .replace(/^```\s*/m, '')
-        .replace(/```\s*$/, '')
+        .replace(/```\s*$/m, '')
         .trim();
     try {
         const parsed = JSON.parse(cleaned);
@@ -30212,11 +30212,11 @@ function buildPrompt(safeTag, safePrevTag, commits, files, promptExtra) {
     ].join('\n');
 }
 const MAX_PROMPT_CHARS = 13_500;
-function truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra) {
+function truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra, charBudget = MAX_PROMPT_CHARS) {
     let c = [...commits];
     let f = [...files];
     let prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra);
-    if (prompt.length <= MAX_PROMPT_CHARS)
+    if (prompt.length <= charBudget)
         return { prompt, commits: c, files: f };
     // Progressively halve both lists until the prompt fits.
     //
@@ -30229,16 +30229,26 @@ function truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra) 
     // Once BOTH lists reach length 1 the while-condition (c.length > 1 || f.length > 1)
     // becomes false and the loop exits. The subsequent pathological-edge-case block
     // handles the rare situation where even 1 commit + 1 file still exceeds the cap.
-    while (prompt.length > MAX_PROMPT_CHARS && (c.length > 1 || f.length > 1)) {
+    while (prompt.length > charBudget && (c.length > 1 || f.length > 1)) {
         if (c.length > 1)
             c = c.slice(0, Math.max(1, Math.floor(c.length / 2)));
         if (f.length > 1)
             f = f.slice(0, Math.max(1, Math.floor(f.length / 2)));
         prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra);
     }
-    // Pathological edge case: even 1 commit + 1 file is too large (very long
-    // filenames / commit messages). Drop both lists entirely.
-    if (prompt.length > MAX_PROMPT_CHARS) {
+    // Pathological edge case: even 1 commit + 1 file exceeds charBudget
+    // (extremely long filenames or commit messages). Drop both lists entirely.
+    //
+    // KNOWN RESIDUAL GAP — after dropping lists, the prompt still contains
+    // fixed boilerplate (~400 chars) + safeTag/safePrevTag (up to 400 chars
+    // combined) + promptExtra (up to 300 chars) ≈ 1,100 chars worst-case.
+    // If charBudget were ever set below ~1,100 the returned prompt would
+    // silently exceed it. In practice the minimum charBudget used by any
+    // caller is MAX_PROMPT_CHARS - strictSuffix.length ≈ 13,368 — far above
+    // 1,100 — so this gap is unreachable without external charBudget
+    // configuration. Do NOT add a throw here: a minimal prompt that produces
+    // a thin release note is better than a hard job failure.
+    if (prompt.length > charBudget) {
         c = [];
         f = [];
         prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra);
@@ -30520,9 +30530,14 @@ async function run() {
         const promptExtra = core.getInput('prompt_extra').slice(0, 300);
         const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
-        // truncatePromptToFit is called ONCE here. It is NOT called again in step 7.
-        // usedCommits/usedFiles are only used for the warning and info lines below —
-        // they are not passed anywhere in the strict-retry path. See step 7 comment.
+        // truncatePromptToFit is called ONCE here in step 5. It is NOT called
+        // again anywhere in this function — including step 7.
+        //
+        // usedCommits/usedFiles are the post-truncation lists used only for the
+        // warning and core.info lines immediately below. They are NOT passed into
+        // the strict-retry path in step 7. Step 7 is a plain string append to
+        // `prompt` — there is no second truncatePromptToFit call, and usedCommits
+        // and usedFiles do not appear again after this block.
         const { prompt, commits: usedCommits, files: usedFiles } = truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra);
         if (usedCommits.length < commits.length || usedFiles.length < files.length) {
             core.warning(`[afm] Prompt truncated to fit AFM context window (${MAX_PROMPT_CHARS} chars): ` +
