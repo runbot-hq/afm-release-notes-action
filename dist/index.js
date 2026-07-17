@@ -29966,6 +29966,7 @@ const github = __importStar(__nccwpck_require__(3228));
 const child_process_1 = __nccwpck_require__(5317);
 const path = __importStar(__nccwpck_require__(6928));
 const fs = __importStar(__nccwpck_require__(9896));
+const os = __importStar(__nccwpck_require__(857));
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -29991,6 +29992,34 @@ function git(cmd, env) {
         shell: '/bin/sh',
         env: { ...process.env, ...env },
     }).trim();
+}
+/**
+ * Downloads afm-cli-bin from runbot-hq/afm-cli latest release into RUNNER_TEMP
+ * using curl (universally available on macOS — no extra runner dependencies).
+ *
+ * execFileSync is used deliberately — args are a plain array passed directly
+ * to the OS, no shell involved, no injection risk from the URL constant.
+ *
+ * The binary is written to RUNNER_TEMP (not the workspace) so it is:
+ *   - Cleaned up automatically after the job
+ *   - Not committed or staged into the caller's repo checkout
+ *   - Shared across steps in the same job if needed
+ *
+ * If the download fails (network error, 404, etc.) curl exits non-zero and
+ * execFileSync throws, which propagates to core.setFailed via the run() catch.
+ */
+function downloadAfmCli(dest) {
+    core.info('[afm] Downloading afm-cli-bin from runbot-hq/afm-cli latest release...');
+    (0, child_process_1.execFileSync)('curl', [
+        '--fail',
+        '--silent',
+        '--show-error',
+        '--location',
+        'https://github.com/runbot-hq/afm-cli/releases/latest/download/afm-cli-bin',
+        '--output', dest,
+    ]);
+    fs.chmodSync(dest, 0o755);
+    core.info(`[afm] Downloaded afm-cli-bin to ${dest}`);
 }
 /**
  * Calls afm-cli-bin via spawnSync with an explicit argv array.
@@ -30133,22 +30162,21 @@ async function run() {
         const [owner, repoName] = repo.split('/');
         if (!owner || !repoName)
             throw new Error(`GITHUB_REPOSITORY is not set or has unexpected format (got: "${repo}")`);
-        const actionPath = process.env.GITHUB_ACTION_PATH ?? path.join(__dirname, '..');
-        // The binary is committed as afm-cli-bin (not afm-cli) to avoid a name
-        // collision with the afm-cli/ Swift package source directory at the repo root.
-        // POSIX mv/cp move a file *into* a same-named directory if one exists.
-        // Do NOT change this back to 'afm-cli' — the directory collision will recur.
-        const afmBin = path.join(actionPath, 'afm-cli-bin');
+        // afm-cli-bin is downloaded at runtime from runbot-hq/afm-cli latest release
+        // via curl into RUNNER_TEMP. curl ships with macOS as part of the OS —
+        // no extra runner dependencies. RUNNER_TEMP is cleaned up after the job.
+        const afmBin = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'afm-cli-bin');
         if (!fs.existsSync(afmBin)) {
-            throw new Error(`afm-cli-bin binary not found at ${afmBin}. ` +
-                'This action requires a self-hosted macOS 26+ arm64 runner with Apple Intelligence enabled. ' +
-                'It cannot run on GitHub-hosted Linux or Windows runners.');
+            downloadAfmCli(afmBin);
+        }
+        else {
+            core.info(`[afm] afm-cli-bin already present at ${afmBin}, skipping download`);
         }
         try {
             fs.accessSync(afmBin, fs.constants.X_OK);
         }
         catch {
-            throw new Error(`afm-cli-bin binary at ${afmBin} is not executable. Run: chmod +x afm-cli-bin and recommit.`);
+            throw new Error(`afm-cli-bin at ${afmBin} is not executable. This is unexpected after download — please file a bug.`);
         }
         // 1. Shallow clone guard
         let isShallow = false;
