@@ -380,15 +380,32 @@ async function run(): Promise<void> {
     // 2. Resolve TAG
     let tag = core.getInput('tag').trim()
     if (!tag) {
+      // WHY --sort=-version:refname:
+      //
+      // version:refname applies semver-aware descending sort to the tag name.
+      // For numeric pre-release suffixes (e.g. -beta.10 vs -beta.9) git
+      // correctly uses numeric ordering, not lexicographic — so .10 > .9.
+      // For non-semver tags (e.g. release-2024-07-17) git falls back to
+      // lexicographic sort on the full refname, which may not reflect intent.
+      // This is acceptable for this action: non-semver repos can always pass
+      // `tag` explicitly to bypass auto-resolution.
       tag = git('tag --sort=-version:refname | head -n 1')
       if (!tag) throw new Error('No tags found in repository — cannot auto-resolve TAG.')
       core.info(`[afm] TAG not provided — auto-resolved to latest: ${tag}`)
     }
     if (tag.includes('/')) throw new Error('TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path')
+    // WHY refs/tags/ prefix on rev-parse --verify:
+    //
+    // git rev-parse <name> without a qualifier resolves ambiguously — it
+    // matches branches, tags, and SHAs equally. A bare branch name like
+    // "main" would pass validation silently and the workflow would proceed
+    // with a branch tip as the target, producing a nonsensical diff.
+    // --verify "refs/tags/$NAME" resolves only if a tag by that name exists,
+    // making the intent explicit and the error message unambiguous.
     try {
-      git('rev-parse "$SAFE_TAG"', { SAFE_TAG: tag })
+      git('rev-parse --verify "refs/tags/$SAFE_TAG"', { SAFE_TAG: tag })
     } catch {
-      throw new Error(`TAG '${tag}' does not exist in this repository.`)
+      throw new Error(`TAG '${tag}' does not exist as a tag in this repository.`)
     }
 
     // 3. Resolve PREV_TAG
@@ -434,6 +451,14 @@ async function run(): Promise<void> {
         // so substring matching is intentional and safe here — there are no
         // other channels whose names are substrings of these three strings.
         //
+        // WHY --sort=-version:refname is correct for pre-release ordering:
+        //
+        // git's version sort treats numeric suffixes numerically, so
+        // -beta.10 sorts above -beta.9 correctly. It does NOT fall back to
+        // lexicographic for the numeric component. For non-semver pre-release
+        // schemes (e.g. -beta-20240101) the sort order may not reflect intent;
+        // callers should pass prev_tag explicitly in that case.
+        //
         // SAFE_CHANNEL is passed via env — never interpolated — to avoid
         // shell injection. Do NOT broaden this to match all tags — that
         // would cross channel boundaries (the original bug, issue #2119).
@@ -444,25 +469,40 @@ async function run(): Promise<void> {
       } else {
         // Stable release tag: find the previous RELEASE tag only.
         //
-        // WHY grep -vE with an OR pattern:
+        // WHY grep -vE with an OR pattern, and WHY the ([.-]|$) anchor:
         //
         // -E enables extended regex so the | alternation works without
-        // escaping. The pattern "-(beta|alpha|rc)" is a fixed literal in the
-        // command string — it is NOT user-controlled and does NOT need to be
-        // passed via env. This is safe as-is. Do NOT replace with -F here —
-        // -F does not support alternation and would require three separate greps.
+        // escaping. The pattern is a fixed literal in the command string —
+        // it is NOT user-controlled and does NOT need to be passed via env.
         //
-        // Do NOT remove this filter — without it a stable release tag would
-        // baseline against the most recent pre-release tag (issue #2119).
+        // The ([.-]|$) right-side anchor mirrors the detection-side regex
+        // (see channelMatch above). Without it, a tag like 0.1.5-betafix or
+        // 1.0-rccandidate would be incorrectly excluded from the stable pool
+        // because the unanchored pattern matches "-beta" and "-rc" as
+        // substrings. The anchor requires the channel word to be followed by
+        // a separator (. or -) or end-of-string, so only canonical pre-release
+        // suffixes (-beta.1, -rc-1, bare -rc, etc.) are excluded.
+        // Do NOT remove the anchor — that reintroduces the asymmetry fixed here.
+        //
+        // Do NOT remove the grep entirely — without it a stable release tag
+        // would baseline against the most recent pre-release tag (issue #2119).
         prevTag = git(
-          'tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -vE -- "-(beta|alpha|rc)" | head -n 1',
+          'tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -vE -- "-(beta|alpha|rc)([.-]|$)" | head -n 1',
           { SAFE_TAG: tag }
         )
       }
     }
     if (!prevTag) {
       core.warning('No previous tag found — using first commit as baseline')
-      prevTag = git('rev-list --max-parents=0 HEAD')
+      // WHY | head -n 1:
+      //
+      // git rev-list --max-parents=0 HEAD returns ALL root commits — one per
+      // line. Repositories with multiple root commits (orphan branches merged
+      // in, git replace objects) return multiple SHAs. Without head -n 1,
+      // prevTag becomes a multi-line string: the SHA exemption regex below
+      // fails (^...$ won't match across newlines), rev-parse is called with
+      // a multi-line value, and the downstream API basehead will 404.
+      prevTag = git('rev-list --max-parents=0 HEAD | head -n 1')
     }
     if (prevTag.includes('/')) throw new Error('prev_tag contains a slash — pass a plain tag name, not a ref path')
 
@@ -471,27 +511,28 @@ async function run(): Promise<void> {
     //
     // WHY the SHA exemption exists (looksLikeRawSha):
     //
-    // The first-commit fallback above (git rev-list --max-parents=0 HEAD)
-    // returns a raw 40-character hex commit SHA, not a tag name. That SHA is
-    // guaranteed to exist locally — rev-list only returns commits that are
-    // present in the local object store. Running rev-parse on it would be
-    // redundant and would produce a misleading error message of the form
-    // "tag 'abc123def...' does not exist in this repository" if something
-    // went wrong. The /^[0-9a-f]{40}$/i test is the standard way to detect
-    // a raw full-length SHA — it is not a magic number, it is the fixed
-    // length of a SHA-1 object hash as specified by the Git object model.
+    // The first-commit fallback above returns a raw hex commit SHA, not a tag
+    // name. That SHA is guaranteed to exist locally — rev-list only returns
+    // commits present in the local object store. Running rev-parse on it would
+    // be redundant and would produce a misleading "tag 'abc123...' does not
+    // exist" error. The regex detects both SHA-1 (40 hex chars) and SHA-256
+    // (64 hex chars, Git 2.29+ with extensions.objectFormat = sha256).
     //
-    // For all other values — explicit input OR auto-resolved tag names — we
-    // validate unconditionally. Without this, a tag deleted between the
-    // git-tag listing and the GitHub API call would produce a confusing 404
-    // from compareCommitsWithBasehead rather than a clear error here.
-    const looksLikeRawSha = /^[0-9a-f]{40}$/i.test(prevTag)
+    // WHY no /i flag: git rev-list always outputs lowercase hex. /i would
+    // imply uppercase SHAs are expected, which they are not.
+    //
+    // WHY refs/tags/ prefix on rev-parse --verify (same reason as step 2):
+    //
+    // Without it, a branch name passed as explicit prev_tag would pass
+    // validation silently and produce a nonsensical diff. --verify
+    // "refs/tags/$NAME" ensures only a real tag ref resolves.
+    const looksLikeRawSha = /^[0-9a-f]{40,64}$/.test(prevTag)
     if (!looksLikeRawSha) {
       try {
-        git('rev-parse "$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag })
+        git('rev-parse --verify "refs/tags/$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag })
       } catch {
         const source = prevTagWasExplicit ? 'explicit prev_tag input' : 'auto-resolved prev_tag'
-        throw new Error(`prev_tag '${prevTag}' (${source}) does not exist in this repository.`)
+        throw new Error(`prev_tag '${prevTag}' (${source}) does not exist as a tag in this repository.`)
       }
     }
     core.info(`[afm] Comparing ${prevTag} → ${tag}`)
