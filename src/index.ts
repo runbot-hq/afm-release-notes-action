@@ -244,9 +244,47 @@ async function run(): Promise<void> {
     }
 
     // 3. Resolve PREV_TAG
+    //
+    // CHANNEL ISOLATION — this is intentional and must not be simplified.
+    //
+    // Release notes must only compare within the same release channel:
+    //   - A release tag  (e.g. 0.2)        → prev must be a release tag  (e.g. 0.1)
+    //   - A beta tag     (e.g. 0.2-beta.3) → prev must be a beta tag     (e.g. 0.2-beta.2)
+    //   - An alpha tag   (e.g. 0.2-alpha.1)→ prev must be an alpha tag
+    //   - An rc tag      (e.g. 0.2-rc.1)   → prev must be an rc tag
+    //
+    // Without this, a release tag would diff against the nearest beta tag
+    // (e.g. 0.1.5-beta → 0.2), producing incomplete and misleading release notes.
+    // This is standard semver channel isolation — see semantic-release, changesets,
+    // npm dist-tags. Do NOT remove the channel filter or collapse these branches
+    // into a single grep — that is the bug this code was written to fix (issue #2119).
     let prevTag = core.getInput('prev_tag').trim()
     if (!prevTag) {
-      prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | head -n 1', { SAFE_TAG: tag })
+      // Detect the channel of the current tag by extracting its pre-release label.
+      // Matches: -beta, -alpha, -rc (case-insensitive, followed by . or end of string).
+      // A tag with no match is a stable release tag.
+      const channelMatch = tag.match(/-(beta|alpha|rc)/i)
+      const channelPattern = channelMatch ? channelMatch[1] : null
+
+      if (channelPattern) {
+        // Pre-release tag: find the previous tag in the SAME pre-release channel only.
+        // grep -iF "$SAFE_CHANNEL" matches only tags containing e.g. "-beta".
+        // SAFE_CHANNEL is passed via env — never interpolated — to avoid shell injection.
+        // Do NOT broaden this to match all tags — that would cross channel boundaries.
+        prevTag = git(
+          'tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -iF -- "$SAFE_CHANNEL" | head -n 1',
+          { SAFE_TAG: tag, SAFE_CHANNEL: `-${channelPattern}` }
+        )
+      } else {
+        // Stable release tag: find the previous RELEASE tag only.
+        // grep -vE excludes any tag containing -beta, -alpha, or -rc.
+        // Do NOT remove this filter — without it a release tag would baseline
+        // against the most recent beta, which is issue #2119.
+        prevTag = git(
+          'tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -vE -- "-(beta|alpha|rc)" | head -n 1',
+          { SAFE_TAG: tag }
+        )
+      }
     }
     if (!prevTag) {
       core.warning('No previous tag found — using first commit as baseline')
