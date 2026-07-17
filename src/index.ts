@@ -268,7 +268,16 @@ function buildPrompt(
 
 /**
  * Rebuilds the prompt string from its components, capping the total length
- * to MAX_PROMPT_CHARS to stay within AFM's 4096-token context window.
+ * to charBudget (defaults to MAX_PROMPT_CHARS) to stay within AFM's 4096-token
+ * context window.
+ *
+ * WHY charBudget is a parameter and not always MAX_PROMPT_CHARS:
+ *
+ * The strict-retry path in run() appends a ~130-char suffix to the prompt
+ * before sending it to AFM. To guarantee that suffix is never truncated,
+ * the caller passes MAX_PROMPT_CHARS - strictSuffix.length as the budget,
+ * so the returned prompt always has room for the full suffix. The default
+ * (MAX_PROMPT_CHARS) is used for the normal first-attempt call.
  *
  * WHY 13_500 chars and not 16_384 (4096 * 4):
  *
@@ -295,16 +304,17 @@ function truncatePromptToFit(
   safePrevTag: string,
   commits: string[],
   files: string[],
-  promptExtra: string
+  promptExtra: string,
+  charBudget: number = MAX_PROMPT_CHARS
 ): { prompt: string; commits: string[]; files: string[] } {
   let c = [...commits]
   let f = [...files]
 
   let prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
-  if (prompt.length <= MAX_PROMPT_CHARS) return { prompt, commits: c, files: f }
+  if (prompt.length <= charBudget) return { prompt, commits: c, files: f }
 
-  // Progressively halve both lists until the prompt fits.
-  while (prompt.length > MAX_PROMPT_CHARS && (c.length > 1 || f.length > 1)) {
+  // Progressively halve both lists until the prompt fits within charBudget.
+  while (prompt.length > charBudget && (c.length > 1 || f.length > 1)) {
     if (c.length > 1) c = c.slice(0, Math.max(1, Math.floor(c.length / 2)))
     if (f.length > 1) f = f.slice(0, Math.max(1, Math.floor(f.length / 2)))
     prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
@@ -312,7 +322,7 @@ function truncatePromptToFit(
 
   // Pathological edge case: even 1 commit + 1 file is too large (very long
   // filenames / commit messages). Drop both lists entirely.
-  if (prompt.length > MAX_PROMPT_CHARS) {
+  if (prompt.length > charBudget) {
     c = []
     f = []
     prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
@@ -557,6 +567,13 @@ async function run(): Promise<void> {
     const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
     const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
 
+    // strictSuffix is defined here (before the first truncatePromptToFit call) so
+    // its .length can be subtracted from the budget when building the strict-retry
+    // prompt. Defined once to ensure the budget calculation and the actual append
+    // always reference the same string — do NOT duplicate or edit this string
+    // without updating the charBudget call in step 7.
+    const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
+
     const { prompt, commits: usedCommits, files: usedFiles } = truncatePromptToFit(
       safeTag, safePrevTag, commits, files, promptExtra
     )
@@ -603,16 +620,20 @@ async function run(): Promise<void> {
       result = parseAfmOutput(raw, tag)
     } catch (e) {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
-      // WHY strictPrompt is clamped to MAX_PROMPT_CHARS:
+      // WHY we re-truncate with a reduced budget instead of slicing after append:
       //
-      // Appending the ~130-char IMPORTANT suffix to prompt would push the total
-      // over MAX_PROMPT_CHARS for any prompt sitting at or near the cap. The
-      // resulting ~13,630 chars (≈3,408 tokens) is still safely under AFM's 4,096
-      // token limit today, but this assumption would silently break if
-      // MAX_PROMPT_CHARS is raised or the suffix grows. Clamping is free and
-      // keeps the guard consistent with the truncatePromptToFit contract.
-      const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
-      const strictPrompt = (prompt + strictSuffix).slice(0, MAX_PROMPT_CHARS)
+      // Slicing (prompt + strictSuffix) to MAX_PROMPT_CHARS would always amputate
+      // the suffix for any prompt near the cap — the very instruction meant to fix
+      // malformed output gets silently dropped. Instead, we re-run truncatePromptToFit
+      // with charBudget = MAX_PROMPT_CHARS - strictSuffix.length, so the returned
+      // prompt is guaranteed to leave room for the full suffix. strictSuffix is then
+      // appended unconditionally. The resulting prompt is at most MAX_PROMPT_CHARS
+      // chars total, which is identical to the first-attempt budget.
+      const { prompt: strictBase } = truncatePromptToFit(
+        safeTag, safePrevTag, usedCommits, usedFiles, promptExtra,
+        MAX_PROMPT_CHARS - strictSuffix.length
+      )
+      const strictPrompt = strictBase + strictSuffix
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {
