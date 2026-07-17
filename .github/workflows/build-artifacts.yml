@@ -49,9 +49,16 @@ jobs:
           # npm run build dirtied dist/ — git refuses to rebase with unstaged
           # changes. Stash first, rebase on top of the latest remote state,
           # then pop so the build output is restored before staging.
+          #
+          # Guard: git stash exits 0 even when there is nothing to stash, but
+          # creates no stash entry. git stash pop on an empty stash stack exits 1.
+          # Record whether a stash entry was created before rebasing so we only
+          # pop when there is something to pop.
+          STASH_BEFORE=$(git stash list | head -n1)
           git stash
+          STASH_AFTER=$(git stash list | head -n1)
           git pull --rebase origin "$GITHUB_REF_NAME"
-          git stash pop
+          [ "$STASH_BEFORE" != "$STASH_AFTER" ] && git stash pop || true
           # Stage the entire dist/ directory — ncc emits dist/index.js AND
           # dist/sourcemap-register.js as a required pair. Staging only
           # dist/index.js leaves sourcemap-register.js uncommitted, causing

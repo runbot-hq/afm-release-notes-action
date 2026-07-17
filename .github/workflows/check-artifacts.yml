@@ -52,12 +52,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: '.node-version'
+
       - name: Rebuild dist/ and check for drift
         run: |
           npm install
           npm run build
           if ! git diff --exit-code dist/; then
-            echo "::error::dist/ is stale — run 'npm run build' locally and commit the result."
+            echo "::error::dist/ is stale — push a commit that includes the rebuilt dist/."
             exit 1
           fi
           echo "dist/ is up to date."
