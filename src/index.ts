@@ -182,6 +182,15 @@ function isFatalAfmError(e: unknown): boolean {
  * anchor to line boundaries. Without /m on the closing-fence pattern,
  * trailing whitespace after the fence causes the replace to silently no-op,
  * leaving the fence in the string and causing JSON.parse to fail.
+ *
+ * Sentinel: PARSE_FAILED is a dedicated Symbol used as the initial value of
+ * `parsed`. This distinguishes a JSON.parse failure (catch assigns PARSE_FAILED,
+ * which is !== PARSE_FAILED? no — see below) from a successful parse that
+ * returned the JS value null (JSON.parse("null") === null, which is falsy but
+ * is valid JSON). Using null as a sentinel conflates these two cases.
+ * With the Symbol: catch leaves parsed === PARSE_FAILED → skip format dispatch.
+ * JSON.parse("null") sets parsed = null → enters format dispatch → falls through
+ * all format checks → throws the unrecognised-format error → retry fires.
  */
 function parseAfmOutput(raw: string, currentTag: string): { title: string; body: string } {
   const cleaned = raw
@@ -190,14 +199,15 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
     .replace(/```\s*$/m, '')  // /m required — $ must anchor to end-of-line, not end-of-string
     .trim()
 
-  let parsed: unknown
+  // PARSE_FAILED is a dedicated sentinel so JSON.parse("null") (valid JSON,
+  // returns JS null) is not conflated with a parse failure.
+  const PARSE_FAILED = Symbol('PARSE_FAILED')
+  let parsed: unknown = PARSE_FAILED
   try {
     parsed = JSON.parse(cleaned)
-  } catch {
-    parsed = null
-  }
+  } catch { /* not valid JSON — parsed stays PARSE_FAILED */ }
 
-  if (parsed !== null) {
+  if (parsed !== PARSE_FAILED) {
     // Format B: double-encoded string — decode one more level.
     // Wrapped in try/catch: if the model returned a quoted plain string
     // (not valid JSON inside), JSON.parse throws a SyntaxError here.

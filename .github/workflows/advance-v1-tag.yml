@@ -68,6 +68,16 @@ jobs:
 
           HTTP_STATUS=$(echo "$PATCH_RESPONSE" | grep -m1 '^HTTP/' | awk '{print $2}')
 
+          # Guard against an empty HTTP_STATUS — can happen if gh suppresses
+          # headers or routes them to stderr unexpectedly. Fail loudly with the
+          # full response rather than falling through to the else branch with a
+          # confusing 'unexpected status :' message.
+          if [ -z "$HTTP_STATUS" ]; then
+            echo "::error::Could not extract HTTP status from PATCH response:"
+            echo "$PATCH_RESPONSE"
+            exit 1
+          fi
+
           if [ "$HTTP_STATUS" = "200" ]; then
             echo "::notice::v1 tag advanced to $COMMIT_SHA"
           elif [ "$HTTP_STATUS" = "422" ]; then
