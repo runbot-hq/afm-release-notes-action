@@ -177,12 +177,17 @@ function isFatalAfmError(e: unknown): boolean {
  * Format B double-decode (JSON.parse on a string value) is wrapped in its own
  * try/catch so a quoted plain string from the model produces the descriptive
  * "did not match any known format" error rather than a raw SyntaxError.
+ *
+ * Fence stripping: all three replace patterns use the /m flag so ^ and $
+ * anchor to line boundaries. Without /m on the closing-fence pattern,
+ * trailing whitespace after the fence causes the replace to silently no-op,
+ * leaving the fence in the string and causing JSON.parse to fail.
  */
 function parseAfmOutput(raw: string, currentTag: string): { title: string; body: string } {
   const cleaned = raw
     .replace(/^```json\s*/m, '')
     .replace(/^```\s*/m, '')
-    .replace(/```\s*$/, '')
+    .replace(/```\s*$/m, '')  // /m required — $ must anchor to end-of-line, not end-of-string
     .trim()
 
   let parsed: unknown
