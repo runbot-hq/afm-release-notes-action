@@ -63,14 +63,19 @@ jobs:
           # Stash guard: git stash exits 0 even when there is nothing to stash
           # but creates no stash entry. git stash pop on an empty stash stack
           # exits 1 and kills the step. We compare the stash list before/after
-          # to detect whether an entry was actually created, and only pop if so.
-          # Do NOT replace with `git stash pop || true` — that silently swallows
-          # a real pop failure (e.g. merge conflict on restore).
+          # to detect whether an entry was actually created, and only pop if one was.
+          # The || true below ONLY silences the no-stash case (STASH_BEFORE == STASH_AFTER).
+          # A real git stash pop failure (e.g. merge conflict on restore) propagates
+          # as a non-zero exit from this step, failing the job before git add runs.
+          # Do NOT replace the conditional with `git stash pop || true` — that
+          # silently swallows a real pop failure and allows a corrupt dist/ to be committed.
           STASH_BEFORE=$(git stash list | head -n1)
           git stash
           STASH_AFTER=$(git stash list | head -n1)
           git pull --rebase origin "$GITHUB_REF_NAME"
-          [ "$STASH_BEFORE" != "$STASH_AFTER" ] && git stash pop || true
+          if [ "$STASH_BEFORE" != "$STASH_AFTER" ]; then
+            git stash pop
+          fi
 
           # Stage the entire dist/ directory — ncc emits dist/index.js AND
           # dist/sourcemap-register.js as a required pair. Staging only
