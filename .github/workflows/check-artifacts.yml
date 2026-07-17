@@ -72,7 +72,14 @@ jobs:
 
       - name: Rebuild dist/ and check for drift
         run: |
-          npm install
+          # npm ci is required here (not npm install) — this is a staleness check,
+          # not a build. npm install silently updates package-lock.json and resolves
+          # against different transitive dep versions if the lockfile is out of date,
+          # which would build against different deps than what is committed and could
+          # cause false-negative diffs (stale dist/ passes) or false-positive diffs
+          # (fresh dist/ fails). npm ci installs exactly what is in package-lock.json
+          # and fails if it is out of sync with package.json. Do NOT revert to npm install.
+          npm ci
           npm run build
           if ! git diff --exit-code dist/; then
             echo "::error::dist/ is stale — push a commit that includes the rebuilt dist/."
