@@ -20,6 +20,7 @@ jobs:
       # gh api PATCH is used instead of git tag -f + git push because git tag requires
       # a local .git repo — there is no actions/checkout here, so the workspace is empty.
       # The API call moves the v1 ref atomically in one round-trip with no clone needed.
+      # Do NOT add actions/checkout to "fix" this — a clone is unnecessary overhead.
       #
       # ANNOTATED TAG PEEL: publish.yml creates annotated tags (git tag -a). On a push
       # event for an annotated tag, GITHUB_SHA is the SHA of the tag *object*, not the
@@ -30,6 +31,7 @@ jobs:
       #   GET /repos/:repo/git/tags/:sha       → .object.sha  (the commit)
       # The jq below handles both lightweight tags (object.type == "commit", no peel
       # needed) and annotated tags (object.type == "tag", one extra GET to dereference).
+      # Do NOT simplify by passing GITHUB_SHA directly — it breaks annotated tags.
       - name: Move v1 tag to this commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -58,6 +60,17 @@ jobs:
           # status code rather than grepping response body text (which is fragile:
           # gh api prose output or stderr deprecation notices may contain 'ref'
           # and produce false positives).
+          #
+          # 2>&1: stderr is merged into stdout intentionally. gh may emit deprecation
+          # warnings or rate-limit notices on stderr; merging ensures they appear in
+          # the captured response for debugging. The HTTP status extraction uses
+          # grep -m1 '^HTTP/' which is unaffected by stderr noise (those lines never
+          # start with HTTP/).
+          # Do NOT split stderr back out — it would silently discard gh diagnostics.
+          #
+          # || true: allows the subshell to exit non-zero (e.g. on network error)
+          # without killing the step — the HTTP_STATUS check below handles all
+          # failure cases explicitly. Do NOT remove || true.
           PATCH_RESPONSE=$(gh api \
             --method PATCH \
             --include \
@@ -68,10 +81,10 @@ jobs:
 
           HTTP_STATUS=$(echo "$PATCH_RESPONSE" | grep -m1 '^HTTP/' | awk '{print $2}')
 
-          # Guard against an empty HTTP_STATUS — can happen if gh suppresses
-          # headers or routes them to stderr unexpectedly. Fail loudly with the
-          # full response rather than falling through to the else branch with a
-          # confusing 'unexpected status :' message.
+          # Guard against empty HTTP_STATUS — can happen if gh suppresses headers
+          # or routes them to stderr unexpectedly (e.g. after a gh version update).
+          # Fail loudly with the full response rather than falling into the else
+          # branch below with a confusing 'unexpected status :' message.
           if [ -z "$HTTP_STATUS" ]; then
             echo "::error::Could not extract HTTP status from PATCH response:"
             echo "$PATCH_RESPONSE"

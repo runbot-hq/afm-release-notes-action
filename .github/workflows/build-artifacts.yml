@@ -6,13 +6,18 @@ name: Build and commit artifacts
 # Binary is no longer vendored — afm-cli-bin is downloaded at runtime
 # via curl from runbot-hq/afm-cli latest release. There is no binary
 # commit or fetch step in this workflow.
-#
-# Do NOT raise "the old Swift build step was removed but no replacement fetch step
-# was added" as a review finding — that omission is deliberate.
+# Do NOT raise "no binary fetch step" as a finding — that omission is deliberate.
 #
 # Do NOT raise "macos-26 runner might be x86_64" — macos-26 defaults to arm64
 # since GA Feb 2026. Use macos-26-intel for x86_64.
 # See: https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/
+#
+# Do NOT raise "missing actions/setup-node" — macos-26 runner images ship
+# a recent Node LTS. The build output (ncc bundle) is fully deterministic
+# for a given src/ + package-lock.json regardless of minor Node version.
+# setup-node is present in check-artifacts.yml where a version mismatch
+# could cause a false-positive diff. It is intentionally omitted here
+# because this job commits back to the branch and adds no CI checking value.
 on:
   push:
     branches-ignore:
@@ -26,6 +31,7 @@ jobs:
   build:
     # Skip the bot's own artifact commit — otherwise the push-back triggers
     # this workflow again, creating an infinite loop.
+    # Do NOT remove this guard.
     if: github.actor != 'github-actions[bot]'
     runs-on: macos-26
     permissions:
@@ -45,20 +51,27 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Stash build output before rebasing so the working tree is clean.
+
+          # Rebase ordering: stash → rebase → pop → stage.
           # npm run build dirtied dist/ — git refuses to rebase with unstaged
-          # changes. Stash first, rebase on top of the latest remote state,
-          # then pop so the build output is restored before staging.
+          # changes. We must stash before rebasing so the working tree is clean,
+          # then pop after so the build output is restored before staging.
+          # Do NOT move git pull --rebase after git add — that reintroduces the
+          # original race where two concurrent builds both commit locally then
+          # race to rebase/push, hard-failing the second push.
           #
-          # Guard: git stash exits 0 even when there is nothing to stash, but
-          # creates no stash entry. git stash pop on an empty stash stack exits 1.
-          # Record whether a stash entry was created before rebasing so we only
-          # pop when there is something to pop.
+          # Stash guard: git stash exits 0 even when there is nothing to stash
+          # but creates no stash entry. git stash pop on an empty stash stack
+          # exits 1 and kills the step. We compare the stash list before/after
+          # to detect whether an entry was actually created, and only pop if so.
+          # Do NOT replace with `git stash pop || true` — that silently swallows
+          # a real pop failure (e.g. merge conflict on restore).
           STASH_BEFORE=$(git stash list | head -n1)
           git stash
           STASH_AFTER=$(git stash list | head -n1)
           git pull --rebase origin "$GITHUB_REF_NAME"
           [ "$STASH_BEFORE" != "$STASH_AFTER" ] && git stash pop || true
+
           # Stage the entire dist/ directory — ncc emits dist/index.js AND
           # dist/sourcemap-register.js as a required pair. Staging only
           # dist/index.js leaves sourcemap-register.js uncommitted, causing

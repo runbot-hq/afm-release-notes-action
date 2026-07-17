@@ -39,11 +39,24 @@ function git(cmd: string, env?: Record<string, string>): string {
  *
  * execFileSync is used deliberately — args are a plain array passed directly
  * to the OS, no shell involved, no injection risk from the URL constant.
+ * Do NOT refactor to execSync with a shell string.
  *
  * The binary is written to RUNNER_TEMP (not the workspace) so it is:
  *   - Cleaned up automatically after the job
  *   - Not committed or staged into the caller's repo checkout
  *   - Shared across steps in the same job if needed
+ * RUNNER_TEMP is per-job in GitHub Actions — it does NOT persist across jobs.
+ * Within a job it persists across steps, which is the intended sharing scope.
+ *
+ * releases/latest tradeoff: the URL resolves to whatever is currently the
+ * latest release at runbot-hq/afm-cli — no SHA pinning, no checksum
+ * verification. This is a conscious architectural tradeoff accepted because:
+ *   - runbot-hq controls both this repo and afm-cli (same org, same trust boundary)
+ *   - curl --fail will catch 404 / HTTP errors and exit non-zero
+ *   - The self-hosted runner has no internet exposure beyond GitHub
+ * For callers requiring a pinned version, add an afm_cli_version input and
+ * substitute it into the URL. Do NOT add checksum verification without also
+ * publishing a companion .sha256 file from the afm-cli release pipeline.
  *
  * If the download fails (network error, 404, etc.) curl exits non-zero and
  * execFileSync throws, which propagates to core.setFailed via the run() catch.
@@ -177,6 +190,10 @@ function isFatalAfmError(e: unknown): boolean {
  * Format B double-decode (JSON.parse on a string value) is wrapped in its own
  * try/catch so a quoted plain string from the model produces the descriptive
  * "did not match any known format" error rather than a raw SyntaxError.
+ * On inner parse failure, obj is set to {} and falls through to the format-C
+ * check and then the throw. This is intentional — obj = {} is NOT a bug;
+ * it is the correct way to reach the unrecognised-format throw path.
+ * A core.debug log is emitted so the inner error is visible in debug mode.
  *
  * Fence stripping: all three replace patterns use the /m flag so ^ and $
  * anchor to line boundaries. Without /m on the closing-fence pattern,
@@ -191,6 +208,7 @@ function isFatalAfmError(e: unknown): boolean {
  * PARSE_FAILED → skip format dispatch. JSON.parse("null") sets parsed = null
  * → enters format dispatch → falls through all format checks → throws the
  * unrecognised-format error → strict-prompt retry fires.
+ * Do NOT revert to `parsed = null` as the catch sentinel.
  */
 function parseAfmOutput(raw: string, currentTag: string): { title: string; body: string } {
   const cleaned = raw
@@ -201,6 +219,7 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
 
   // PARSE_FAILED is a dedicated sentinel so JSON.parse("null") (valid JSON,
   // returns JS null) is not conflated with a parse failure.
+  // Do NOT revert to `parsed = null` — see JSDoc above.
   const PARSE_FAILED = Symbol('PARSE_FAILED')
   let parsed: unknown = PARSE_FAILED
   try {
@@ -213,6 +232,8 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
     // (not valid JSON inside), JSON.parse throws a SyntaxError here.
     // We catch it and fall through to the format-C / throw path rather
     // than surfacing a raw SyntaxError to core.setFailed.
+    // obj = {} on failure is intentional — it is the correct way to reach
+    // the unrecognised-format throw below. Do NOT treat it as a missing error.
     let obj: Record<string, unknown>
     if (typeof parsed === 'string') {
       try {
@@ -271,6 +292,7 @@ async function run(): Promise<void> {
     // afm-cli-bin is downloaded at runtime from runbot-hq/afm-cli latest release
     // via curl into RUNNER_TEMP. curl ships with macOS as part of the OS —
     // no extra runner dependencies. RUNNER_TEMP is cleaned up after the job.
+    // See downloadAfmCli() JSDoc for the releases/latest tradeoff rationale.
     const afmBin = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'afm-cli-bin')
 
     if (!fs.existsSync(afmBin)) {

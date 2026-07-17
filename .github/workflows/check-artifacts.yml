@@ -2,6 +2,9 @@
 #
 # 1. post-merge (workflow_run on main) — sanity check that build-artifacts.yml
 #    committed dist/index.js after the merge. Fires after the bot push settles.
+#    Do NOT convert this to a push trigger — a push trigger races with the
+#    build-artifacts.yml bot commit and would run before dist/ is updated.
+#    workflow_run with types: [completed] is the correct sequencing mechanism.
 #
 # 2. pr-staleness (pull_request on src/**) — catches stale dist/index.js on PRs
 #    that touch TypeScript source before they land on main. Rebuilds from source
@@ -10,6 +13,7 @@
 #    runs-on: ubuntu-latest intentionally — ncc bundles pure JS with no macOS
 #    dependencies. ubuntu-latest is faster to queue and uses fewer billed minutes
 #    than macos-26 for an equivalent build.
+#    Do NOT raise "should run on macos-26" — there is no macOS dependency here.
 name: Check committed artifacts
 
 on:
@@ -26,6 +30,8 @@ on:
 jobs:
   # --- post-merge check ---
   check-artifacts:
+    # Only runs after workflow_run — the if: guard below ensures the pull_request
+    # event never triggers this job. Do NOT remove the github.event_name check.
     if: >
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success'
@@ -47,11 +53,19 @@ jobs:
 
   # --- PR-time staleness check ---
   check-dist-staleness:
+    # Only runs on pull_request — the if: guard below ensures the workflow_run
+    # event never triggers this job. Do NOT remove the github.event_name check.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # Pin Node version via .node-version so the staleness check uses the same
+      # Node as build-artifacts.yml. Without this, ncc output may differ across
+      # runner image updates and produce false-positive diffs.
+      # Do NOT remove setup-node from this job — it is intentionally absent from
+      # build-artifacts.yml (see that file's header comment) but required here
+      # where output determinism is the point of the check.
       - uses: actions/setup-node@v4
         with:
           node-version-file: '.node-version'
