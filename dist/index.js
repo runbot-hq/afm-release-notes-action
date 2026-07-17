@@ -30166,75 +30166,6 @@ function parseAfmOutput(raw, currentTag) {
     // stricter prompt. Do NOT return a default here — see JSDoc above.
     throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`);
 }
-/**
- * Rebuilds the prompt string from its components, capping the total length
- * to MAX_PROMPT_CHARS to stay within AFM's 4096-token context window.
- *
- * WHY 13_500 chars and not 16_384 (4096 * 4):
- *
- * The 4 chars/token estimate is conservative — real token counts for
- * code/commit messages are often 3–3.5 chars/token. 13_500 gives ~720
- * tokens of headroom for the instructions string (passed separately to
- * AFM as a system prompt) and the generated response. The instructions
- * string is ~180 chars (~45 tokens) so actual headroom is ~675 tokens.
- * Do NOT raise this limit without re-measuring real token counts.
- *
- * WHY progressively halve instead of binary-search:
- *
- * The loop runs at most log2(80) ≈ 7 times. Binary search adds code
- * complexity for negligible gain at these list sizes.
- *
- * WHY we keep at least 0 items (empty lists) rather than throwing:
- *
- * A prompt with just the tag names and rules is still valid input for AFM
- * — it will produce a minimal release note rather than failing the job.
- * Failing here would be worse than a thin release note.
- */
-function buildPrompt(safeTag, safePrevTag, commits, files, promptExtra) {
-    return [
-        'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
-        'Rules:',
-        `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
-        '- body: Markdown with sections ## Added, ## Changed, ## Fixed, ## Removed, ## Security (omit empty sections).',
-        '- User-facing language, past tense.',
-        '- Skip bot commits (dependabot, renovate, github-actions) and merge commits.',
-        '- Output JSON only — no markdown fences, no extra keys.',
-        '',
-        `Previous tag: ${safePrevTag}`,
-        `Target tag: ${safeTag}`,
-        '',
-        'Commits:',
-        ...commits.map(c => `- ${c}`),
-        '',
-        'Changed files:',
-        ...files.map(f => `- ${f}`),
-        ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
-    ].join('\n');
-}
-const MAX_PROMPT_CHARS = 13_500;
-function truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra) {
-    let c = [...commits];
-    let f = [...files];
-    let prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra);
-    if (prompt.length <= MAX_PROMPT_CHARS)
-        return { prompt, commits: c, files: f };
-    // Progressively halve both lists until the prompt fits.
-    while (prompt.length > MAX_PROMPT_CHARS && (c.length > 1 || f.length > 1)) {
-        if (c.length > 1)
-            c = c.slice(0, Math.max(1, Math.floor(c.length / 2)));
-        if (f.length > 1)
-            f = f.slice(0, Math.max(1, Math.floor(f.length / 2)));
-        prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra);
-    }
-    // Pathological edge case: even 1 commit + 1 file is too large (very long
-    // filenames / commit messages). Drop both lists entirely.
-    if (prompt.length > MAX_PROMPT_CHARS) {
-        c = [];
-        f = [];
-        prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra);
-    }
-    return { prompt, commits: c, files: f };
-}
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -30434,21 +30365,40 @@ async function run() {
             .filter(m => !/^(fixup!|squash!|[Ww][Ii][Pp]([ :]|$))/.test(m))
             .slice(0, 80);
         files = files.slice(0, 150);
-        // 5. Build prompt, then hard-cap to MAX_PROMPT_CHARS (13_500) before
-        //    sending to AFM. AFM has a fixed 4096-token context window; exceeding
-        //    it throws exceededContextWindowSize. The per-list caps above (80 commits,
-        //    150 files) are not sufficient on their own — a release with many long
-        //    commit messages or filenames can still exceed the limit.
+        // 5. Build prompt
+        //
+        // WHY promptExtra is capped at 300 chars and not sanitised further:
+        //
+        // prompt_extra is caller-supplied free text injected into the AFM prompt.
+        // The 300-char cap limits how much of the prompt the caller can influence,
+        // keeping the core instructions dominant. No further sanitisation is needed
+        // because the entire prompt is passed to afmCli via spawnSync argv — the
+        // OS never interprets it as a shell string (see afmCli JSDoc). Control
+        // characters are stripped from tag names (safeTag/safePrevTag) separately
+        // because those are also written to the step summary via addRaw.
         const promptExtra = core.getInput('prompt_extra').slice(0, 300);
         const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
-        const { prompt, commits: usedCommits, files: usedFiles } = truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra);
-        if (usedCommits.length < commits.length || usedFiles.length < files.length) {
-            core.warning(`[afm] Prompt truncated to fit AFM context window (${MAX_PROMPT_CHARS} chars): ` +
-                `commits ${commits.length} → ${usedCommits.length}, files ${files.length} → ${usedFiles.length}`);
-        }
-        core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`);
         const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}';
+        const prompt = [
+            'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
+            'Rules:',
+            `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
+            '- body: Markdown with sections ## Added, ## Changed, ## Fixed, ## Removed, ## Security (omit empty sections).',
+            '- User-facing language, past tense.',
+            '- Skip bot commits (dependabot, renovate, github-actions) and merge commits.',
+            '- Output JSON only — no markdown fences, no extra keys.',
+            '',
+            `Previous tag: ${safePrevTag}`,
+            `Target tag: ${safeTag}`,
+            '',
+            'Commits:',
+            ...commits.map(c => `- ${c}`),
+            '',
+            'Changed files:',
+            ...files.map(f => `- ${f}`),
+            ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
+        ].join('\n');
         const afmOptions = { instructions };
         // 6. Call afm-cli
         core.info('[afm] Calling afm-cli...');
@@ -30518,7 +30468,7 @@ async function run() {
         await core.summary
             .addHeading(`📝 Release Notes: ${tag}`)
             .addRaw(`**Title:** ${title}\n`)
-            .addRaw(`**Compared:** \`${safePrevTag}\` → \`${safeTag}\` (${totalCommits} commits, ${totalFiles} files)\n`)
+            .addRaw(`**Compared:** \`${prevTag}\` → \`${tag}\` (${totalCommits} commits, ${totalFiles} files)\n`)
             .addRaw(`**Runner:** ${process.env.RUNNER_NAME ?? 'unknown'}\n\n`)
             .addRaw(finalBody)
             .write();
