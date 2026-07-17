@@ -559,15 +559,43 @@ async function run(): Promise<void> {
       throw e
     }
 
+    // WHY `let` and not `const` for commits and files:
+    //
+    // Both are immediately reassigned two lines below (filter + slice).
+    // `const` would require an awkward intermediate variable. `let` here is
+    // intentional — do NOT change to const without also removing the reassignment.
     let commits = compare.data.commits.map(c => c.commit.message.slice(0, 120))
+
+    // WHY compare.data.files uses optional chaining (?.) — this is NOT defensive:
+    //
+    // The GitHub compareCommitsWithBasehead API omits the `files` key entirely
+    // (rather than returning an empty array) when the diff exceeds 300 files.
+    // This is documented GitHub API behaviour. `?.` here is load-bearing:
+    // without it, `files` would throw a TypeError on large diffs instead of
+    // gracefully falling back to []. Do NOT replace with a non-null assertion.
     let files = compare.data.files?.map(f => `${f.status} ${f.filename}`) ?? []
 
+    // WHY totalCommits/totalFiles are captured BEFORE the filter+slice below:
+    //
+    // These are used for the step summary and the warning messages above the
+    // filter. They must reflect the raw API counts — how many commits/files
+    // actually exist in the diff — not the post-filter counts that get sent
+    // to AFM. Capturing them after the slice would undercount and produce
+    // misleading "N commits, M files" reporting in the step summary.
     const totalCommits = commits.length
     const totalFiles = files.length
 
     if (totalCommits > 80) core.warning(`${totalCommits} commits — prompt capped at 80`)
     if (totalFiles > 150) core.warning(`${totalFiles} files — prompt capped at 150`)
 
+    // WHY filter before slice, and WHY slice(0, 80) is still needed after filter:
+    //
+    // The filter removes WIP/fixup/squash commits — it can only shrink the
+    // array, never grow it. The slice(0, 80) is the hard item cap fed to
+    // truncatePromptToFit in step 5. Without the slice, a release with 200
+    // non-WIP commits would pass 200 items to truncation — correct but slow
+    // (up to log2(200) ≈ 8 halving iterations instead of log2(80) ≈ 7).
+    // The slice is kept as an explicit, readable hard cap. Do NOT remove it.
     commits = commits
       .filter(m => !/^(fixup!|squash!|[Ww][Ii][Pp]([ :]|$))/.test(m))
       .slice(0, 80)
@@ -582,6 +610,9 @@ async function run(): Promise<void> {
     const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
     const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
 
+    // truncatePromptToFit is called ONCE here. It is NOT called again in step 7.
+    // usedCommits/usedFiles are only used for the warning and info lines below —
+    // they are not passed anywhere in the strict-retry path. See step 7 comment.
     const { prompt, commits: usedCommits, files: usedFiles } = truncatePromptToFit(
       safeTag, safePrevTag, commits, files, promptExtra
     )
@@ -632,7 +663,17 @@ async function run(): Promise<void> {
 
     if (!raw) throw new Error('afm-cli returned empty output')
 
-    // 7. Parse output
+    // 7. Parse output — retry with stricter prompt if the format is wrong.
+    //
+    // THERE IS NO SECOND CALL TO truncatePromptToFit HERE.
+    //
+    // The strict retry works by appending a short formatting directive to the
+    // already-fitted `prompt` string — it is a plain string concatenation, not
+    // a re-truncation. `usedCommits` and `usedFiles` (from step 5) are not
+    // passed into this path at all. The retry sends the same context as the
+    // first attempt plus a stronger JSON-only instruction. See the comment
+    // on strictPrompt below for the full rationale on why re-truncation would
+    // be wrong here.
     let result: { title: string; body: string }
     try {
       result = parseAfmOutput(raw, tag)
