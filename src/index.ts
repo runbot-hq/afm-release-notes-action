@@ -169,6 +169,10 @@ function isFatalAfmError(e: unknown): boolean {
  * THROWS on unrecognised output (format D / prose) so the caller can retry
  * with a stricter prompt. Do NOT add a prose fallback that returns silently —
  * a silent fallback makes the retry catch block in run() unreachable dead code.
+ *
+ * Empty title or body after a successful parse emits a warning and throws so
+ * the caller's strict-prompt retry fires with a useful signal rather than
+ * silently falling through to the section-keyed branch.
  */
 function parseAfmOutput(raw: string, currentTag: string): { title: string; body: string } {
   const cleaned = raw
@@ -177,28 +181,41 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
     .replace(/```\s*$/, '')
     .trim()
 
+  let parsed: unknown
   try {
-    const parsed = JSON.parse(cleaned)
-    const obj = typeof parsed === 'string' ? JSON.parse(parsed) : parsed
-    if (typeof obj?.title === 'string' && obj.title.length > 0 &&
-        typeof obj?.body === 'string' && obj.body.length > 0) {
+    parsed = JSON.parse(cleaned)
+  } catch {
+    parsed = null
+  }
+
+  if (parsed !== null) {
+    const obj = typeof parsed === 'string' ? JSON.parse(parsed as string) : parsed as Record<string, unknown>
+
+    // Format A/B: { title, body }
+    if (typeof obj?.title === 'string' && typeof obj?.body === 'string') {
+      if (obj.title.length === 0 || obj.body.length === 0) {
+        core.warning(
+          `AFM returned a {title, body} object but ${obj.title.length === 0 ? 'title' : 'body'} is empty. ` +
+          'This may indicate the model found no diffable content. Triggering strict-prompt retry.'
+        )
+        throw new Error('AFM returned empty title or body in {title, body} object')
+      }
       return { title: String(obj.title), body: String(obj.body) }
     }
-  } catch { /* fall through */ }
 
-  try {
-    const obj = JSON.parse(cleaned)
+    // Format C: section-keyed { Added, Changed, ... }
     const sections = ['Added', 'Changed', 'Fixed', 'Removed', 'Security']
-    const hasSections = sections.some(s => Array.isArray(obj[s]) && obj[s].length > 0)
+    const asRecord = obj as Record<string, unknown>
+    const hasSections = sections.some(s => Array.isArray(asRecord[s]) && (asRecord[s] as unknown[]).length > 0)
     if (hasSections) {
       core.warning('AFM returned section-keyed JSON — converting to {title, body}')
       const body = sections
-        .filter(s => Array.isArray(obj[s]) && obj[s].length > 0)
-        .map(s => `## ${s}\n${(obj[s] as string[]).map((l: string) => `- ${l}`).join('\n')}`)
+        .filter(s => Array.isArray(asRecord[s]) && (asRecord[s] as unknown[]).length > 0)
+        .map(s => `## ${s}\n${(asRecord[s] as string[]).map((l: string) => `- ${l}`).join('\n')}`)
         .join('\n\n')
       return { title: currentTag || 'Release', body }
     }
-  } catch { /* fall through */ }
+  }
 
   throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`)
 }
@@ -330,7 +347,14 @@ async function run(): Promise<void> {
     files = files.slice(0, 150)
 
     // 5. Build prompt
-    const promptExtra = core.getInput('prompt_extra').slice(0, 300)
+    const rawPromptExtra = core.getInput('prompt_extra')
+    if (rawPromptExtra.length > 300) {
+      core.warning(
+        `prompt_extra is ${rawPromptExtra.length} chars — truncated to 300. ` +
+        'Shorten your extra instruction to avoid silent truncation.'
+      )
+    }
+    const promptExtra = rawPromptExtra.slice(0, 300)
     const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
     const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
 

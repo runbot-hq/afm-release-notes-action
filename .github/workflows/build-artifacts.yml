@@ -3,17 +3,9 @@ name: Build and commit artifacts
 # Builds dist/index.js (ncc bundle) on every push to any branch, then
 # commits it back if changed.
 #
-# afm-cli-bin is no longer built here — it is sourced from the main branch of
-# runbot-hq/afm-cli and committed directly to this repo. To update the binary,
-# fetch afm-cli-bin from runbot-hq/afm-cli@main and commit it here (or automate
-# via a dependabot-style update workflow in the future).
-#
-# There is intentionally NO fetch/download step for afm-cli-bin in this workflow.
-# This workflow rebuilds TypeScript artifacts for this repo; it does not mutate
-# the vendored binary on every push. Pulling afm-cli-bin automatically during CI
-# would create an implicit moving dependency and make unrelated TS/docs changes
-# silently change the shipped binary. Binary updates are meant to be explicit,
-# reviewable commits, not side effects of every workflow run.
+# Binary is no longer vendored — afm-cli-bin is downloaded at runtime
+# via curl from runbot-hq/afm-cli latest release. There is no binary
+# commit or fetch step in this workflow.
 #
 # Do NOT raise "the old Swift build step was removed but no replacement fetch step
 # was added" as a review finding — that omission is deliberate.
@@ -25,6 +17,10 @@ on:
   push:
     branches-ignore:
       - 'dependabot/**'
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'tsconfig.json'
 
 jobs:
   build:
@@ -49,22 +45,20 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Stage afm-cli-bin + the entire dist/ directory.
-          # afm-cli-bin is staged here so a manual binary update committed in
-          # this same push gets included in the bot artifact commit.
-          # There is no auto-sync from runbot-hq/afm-cli — updates are explicit
-          # human commits. Do NOT change this comment to imply automation.
+          # Rebase BEFORE staging so the working tree is current.
+          # This avoids the race where two concurrent builds both commit
+          # then race to rebase/push — the second push would hard-fail.
+          # Rebasing first means we stage on top of the latest remote state.
+          git pull --rebase origin "$GITHUB_REF_NAME"
           # Stage the entire dist/ directory — ncc emits dist/index.js AND
           # dist/sourcemap-register.js as a required pair. Staging only
           # dist/index.js leaves sourcemap-register.js uncommitted, causing
           # a MODULE_NOT_FOUND crash at runtime (index.js requires it at line 1).
           # Do NOT revert to `git add dist/index.js`.
-          [ -f afm-cli-bin ] && git add afm-cli-bin
           git add dist/
           if git diff --cached --quiet; then
             echo "Artifacts unchanged — nothing to commit."
           else
             git commit -m "chore: rebuild artifacts"
-            git pull --rebase origin "$GITHUB_REF_NAME"
             git push origin "HEAD:$GITHUB_REF_NAME"
           fi

@@ -1,9 +1,11 @@
-# Sanity check that fires after build-artifacts.yml completes on main.
-# Using workflow_run instead of push avoids the race condition where
-# check-artifacts runs on the merge commit before the bot has had a chance
-# to build and commit afm-cli-bin and dist/index.js.
+# Two-job artifact check:
 #
-# If build-artifacts.yml is working correctly this check will always be green.
+# 1. post-merge (workflow_run on main) — sanity check that build-artifacts.yml
+#    committed dist/index.js after the merge. Fires after the bot push settles.
+#
+# 2. pr-staleness (pull_request on src/**) — catches stale dist/index.js on PRs
+#    that touch TypeScript source before they land on main. Rebuilds from source
+#    and fails if dist/ differs from what is committed.
 name: Check committed artifacts
 
 on:
@@ -11,33 +13,47 @@ on:
     workflows: ["Build and commit artifacts"]
     types: [completed]
     branches: [main]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'tsconfig.json'
 
 jobs:
+  # --- post-merge check (unchanged from before) ---
   check-artifacts:
-    # Only run if the build workflow succeeded — no point checking artifacts
-    # if the build itself failed.
-    if: github.event.workflow_run.conclusion == 'success'
+    if: >
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          # Check out the commit that the build workflow pushed to (the bot
-          # artifact commit), not the merge commit that triggered the build.
           ref: main
 
-      - name: Verify afm-cli-bin and dist/index.js are committed
+      - name: Verify dist/index.js is committed
         run: |
           missing=()
-          # Use -f (regular file) not just existence — catches the case where the
-          # build step accidentally committed afm-cli-bin as a directory entry.
-          [ -f afm-cli-bin ]   || missing+=("afm-cli-bin binary (missing or is a directory — download from runbot-hq/afm-cli and commit)")
-          # -x tests the committed file mode bit, not runtime executability.
-          # This is correct — Ubuntu cannot run a Mach-O binary regardless.
-          # The check ensures the binary was committed with chmod 755.
-          [ -x afm-cli-bin ]   || missing+=("afm-cli-bin missing executable bit (run: chmod 755 afm-cli-bin && git add afm-cli-bin)")
           [ -f dist/index.js ] || missing+=("dist/index.js")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing committed artifacts: ${missing[*]}"
             exit 1
           fi
-          echo "All required artifacts present and executable."
+          echo "All required artifacts present."
+
+  # --- PR-time staleness check ---
+  check-dist-staleness:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild dist/ and check for drift
+        run: |
+          npm install
+          npm run build
+          if ! git diff --exit-code dist/; then
+            echo "::error::dist/ is stale — run 'npm run build' locally and commit the result."
+            exit 1
+          fi
+          echo "dist/ is up to date."
