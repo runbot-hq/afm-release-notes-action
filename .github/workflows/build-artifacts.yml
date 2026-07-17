@@ -45,11 +45,13 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Rebase BEFORE staging so the working tree is current.
-          # This avoids the race where two concurrent builds both commit
-          # then race to rebase/push — the second push would hard-fail.
-          # Rebasing first means we stage on top of the latest remote state.
+          # Stash build output before rebasing so the working tree is clean.
+          # npm run build dirtied dist/ — git refuses to rebase with unstaged
+          # changes. Stash first, rebase on top of the latest remote state,
+          # then pop so the build output is restored before staging.
+          git stash
           git pull --rebase origin "$GITHUB_REF_NAME"
+          git stash pop
           # Stage the entire dist/ directory — ncc emits dist/index.js AND
           # dist/sourcemap-register.js as a required pair. Staging only
           # dist/index.js leaves sourcemap-register.js uncommitted, causing
