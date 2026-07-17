@@ -30217,6 +30217,15 @@ async function run() {
         // 2. Resolve TAG
         let tag = core.getInput('tag').trim();
         if (!tag) {
+            // WHY --sort=-version:refname:
+            //
+            // version:refname applies semver-aware descending sort to the tag name.
+            // For numeric pre-release suffixes (e.g. -beta.10 vs -beta.9) git
+            // correctly uses numeric ordering, not lexicographic — so .10 > .9.
+            // For non-semver tags (e.g. release-2024-07-17) git falls back to
+            // lexicographic sort on the full refname, which may not reflect intent.
+            // This is acceptable for this action: non-semver repos can always pass
+            // `tag` explicitly to bypass auto-resolution.
             tag = git('tag --sort=-version:refname | head -n 1');
             if (!tag)
                 throw new Error('No tags found in repository — cannot auto-resolve TAG.');
@@ -30224,11 +30233,19 @@ async function run() {
         }
         if (tag.includes('/'))
             throw new Error('TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path');
+        // WHY refs/tags/ prefix on rev-parse --verify:
+        //
+        // git rev-parse <name> without a qualifier resolves ambiguously — it
+        // matches branches, tags, and SHAs equally. A bare branch name like
+        // "main" would pass validation silently and the workflow would proceed
+        // with a branch tip as the target, producing a nonsensical diff.
+        // --verify "refs/tags/$NAME" resolves only if a tag by that name exists,
+        // making the intent explicit and the error message unambiguous.
         try {
-            git('rev-parse "$SAFE_TAG"', { SAFE_TAG: tag });
+            git('rev-parse --verify "refs/tags/$SAFE_TAG"', { SAFE_TAG: tag });
         }
         catch {
-            throw new Error(`TAG '${tag}' does not exist in this repository.`);
+            throw new Error(`TAG '${tag}' does not exist as a tag in this repository.`);
         }
         // 3. Resolve PREV_TAG
         //
@@ -30272,6 +30289,15 @@ async function run() {
                 // so substring matching is intentional and safe here — there are no
                 // other channels whose names are substrings of these three strings.
                 //
+                // WHY --sort=-version:refname is correct for pre-release ordering:
+                //
+                // git's version sort treats numeric suffixes numerically, so
+                // -beta.10 sorts above -beta.9 correctly. It does NOT fall back to
+                // lexicographic for the numeric component — this is verified
+                // behaviour in git's versionsort implementation. For non-semver
+                // pre-release schemes (e.g. -beta-20240101) the sort order may
+                // not reflect intent; callers should pass prev_tag explicitly.
+                //
                 // SAFE_CHANNEL is passed via env — never interpolated — to avoid
                 // shell injection. Do NOT broaden this to match all tags — that
                 // would cross channel boundaries (the original bug, issue #2119).
@@ -30303,7 +30329,16 @@ async function run() {
         }
         if (!prevTag) {
             core.warning('No previous tag found — using first commit as baseline');
-            prevTag = git('rev-list --max-parents=0 HEAD');
+            // WHY | head -n 1:
+            //
+            // git rev-list --max-parents=0 HEAD returns ALL root commits — one
+            // per line. Repositories with multiple root commits (orphan branches
+            // merged in, git replace objects) return multiple SHAs. Without
+            // head -n 1, prevTag would be a multi-line string: the SHA-40 regex
+            // exemption below would fail (multi-line ≠ 40 chars), rev-parse would
+            // be called with a multi-line value, and the downstream API basehead
+            // would 404. head -n 1 takes the first (oldest) root commit only.
+            prevTag = git('rev-list --max-parents=0 HEAD | head -n 1');
         }
         if (prevTag.includes('/'))
             throw new Error('prev_tag contains a slash — pass a plain tag name, not a ref path');
@@ -30312,28 +30347,35 @@ async function run() {
         //
         // WHY the SHA exemption exists (looksLikeRawSha):
         //
-        // The first-commit fallback above (git rev-list --max-parents=0 HEAD)
-        // returns a raw 40-character hex commit SHA, not a tag name. That SHA is
-        // guaranteed to exist locally — rev-list only returns commits that are
-        // present in the local object store. Running rev-parse on it would be
-        // redundant and would produce a misleading error message of the form
-        // "tag 'abc123def...' does not exist in this repository" if something
-        // went wrong. The /^[0-9a-f]{40}$/i test is the standard way to detect
-        // a raw full-length SHA — it is not a magic number, it is the fixed
-        // length of a SHA-1 object hash as specified by the Git object model.
+        // The first-commit fallback above returns a raw hex commit SHA, not a
+        // tag name. That SHA is guaranteed to exist locally — rev-list only
+        // returns commits present in the local object store. Running rev-parse
+        // on it would be redundant and would produce a misleading error message
+        // of the form "tag 'abc123...' does not exist" if something went wrong.
         //
-        // For all other values — explicit input OR auto-resolved tag names — we
-        // validate unconditionally. Without this, a tag deleted between the
-        // git-tag listing and the GitHub API call would produce a confusing 404
-        // from compareCommitsWithBasehead rather than a clear error here.
-        const looksLikeRawSha = /^[0-9a-f]{40}$/i.test(prevTag);
+        // WHY {40,64} and not {40}:
+        //
+        // Git 2.29+ supports SHA-256 object format (extensions.objectFormat =
+        // sha256), producing 64-char hex SHAs. rev-list on a SHA-256 repo
+        // returns 64-char hashes. A {40}-only test would fail, skip the
+        // exemption, and trigger the misleading rev-parse error the comment
+        // above explicitly warns about. {40,64} covers both SHA-1 and SHA-256.
+        // No /i flag — rev-list always outputs lowercase hex; /i would imply
+        // uppercase SHAs are expected, which they are not.
+        //
+        // WHY refs/tags/ prefix on rev-parse --verify (same reason as step 2):
+        //
+        // Without it, a branch name passed as explicit prev_tag would pass
+        // validation silently. --verify "refs/tags/$NAME" ensures only a real
+        // tag ref resolves, and makes the error message unambiguous.
+        const looksLikeRawSha = /^[0-9a-f]{40,64}$/.test(prevTag);
         if (!looksLikeRawSha) {
             try {
-                git('rev-parse "$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag });
+                git('rev-parse --verify "refs/tags/$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag });
             }
             catch {
                 const source = prevTagWasExplicit ? 'explicit prev_tag input' : 'auto-resolved prev_tag';
-                throw new Error(`prev_tag '${prevTag}' (${source}) does not exist in this repository.`);
+                throw new Error(`prev_tag '${prevTag}' (${source}) does not exist as a tag in this repository.`);
             }
         }
         core.info(`[afm] Comparing ${prevTag} → ${tag}`);
