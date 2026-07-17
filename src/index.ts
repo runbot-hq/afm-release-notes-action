@@ -220,29 +220,23 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
   throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`)
 }
 
+// WHY MAX_PROMPT_CHARS is declared here (before buildPrompt/truncatePromptToFit):
+//
+// truncatePromptToFit references MAX_PROMPT_CHARS in its body. TypeScript const
+// declarations are subject to the Temporal Dead Zone — referencing a const before
+// its declaration in source order is a runtime ReferenceError if the reference is
+// evaluated at declaration time (e.g. a default parameter or class field). The
+// function body is only evaluated at call time (after module evaluation), so the
+// previous order was safe at runtime. However, declaring the constant after the
+// function that uses it is a readability hazard and a latent footgun if the call
+// site ever moves earlier. Constant declared first, then the functions that use it.
+const MAX_PROMPT_CHARS = 13_500
+
 /**
- * Rebuilds the prompt string from its components, capping the total length
- * to MAX_PROMPT_CHARS to stay within AFM's 4096-token context window.
+ * Assembles the prompt string from its components.
  *
- * WHY 13_500 chars and not 16_384 (4096 * 4):
- *
- * The 4 chars/token estimate is conservative — real token counts for
- * code/commit messages are often 3–3.5 chars/token. 13_500 gives ~720
- * tokens of headroom for the instructions string (passed separately to
- * AFM as a system prompt) and the generated response. The instructions
- * string is ~180 chars (~45 tokens) so actual headroom is ~675 tokens.
- * Do NOT raise this limit without re-measuring real token counts.
- *
- * WHY progressively halve instead of binary-search:
- *
- * The loop runs at most log2(80) ≈ 7 times. Binary search adds code
- * complexity for negligible gain at these list sizes.
- *
- * WHY we keep at least 0 items (empty lists) rather than throwing:
- *
- * A prompt with just the tag names and rules is still valid input for AFM
- * — it will produce a minimal release note rather than failing the job.
- * Failing here would be worse than a thin release note.
+ * Extracted from run() so that truncatePromptToFit() can rebuild it cheaply
+ * on each halving iteration without duplicating the join logic.
  */
 function buildPrompt(
   safeTag: string,
@@ -272,8 +266,30 @@ function buildPrompt(
   ].join('\n')
 }
 
-const MAX_PROMPT_CHARS = 13_500
-
+/**
+ * Rebuilds the prompt string from its components, capping the total length
+ * to MAX_PROMPT_CHARS to stay within AFM's 4096-token context window.
+ *
+ * WHY 13_500 chars and not 16_384 (4096 * 4):
+ *
+ * The 4 chars/token estimate is conservative — real token counts for
+ * code/commit messages are often 3–3.5 chars/token. 13_500 gives ~720
+ * tokens of headroom for the instructions string (passed separately to
+ * AFM as a system prompt) and the generated response. The instructions
+ * string is ~180 chars (~45 tokens) so actual headroom is ~675 tokens.
+ * Do NOT raise this limit without re-measuring real token counts.
+ *
+ * WHY progressively halve instead of binary-search:
+ *
+ * The loop runs at most log2(80) ≈ 7 times. Binary search adds code
+ * complexity for negligible gain at these list sizes.
+ *
+ * WHY we keep at least 0 items (empty lists) rather than throwing:
+ *
+ * A prompt with just the tag names and rules is still valid input for AFM
+ * — it will produce a minimal release note rather than failing the job.
+ * Failing here would be worse than a thin release note.
+ */
 function truncatePromptToFit(
   safeTag: string,
   safePrevTag: string,
@@ -522,6 +538,16 @@ async function run(): Promise<void> {
       .slice(0, 80)
     files = files.slice(0, 150)
 
+    // Capture counts AFTER the WIP/fixup/squash filter AND the .slice(0,80)/slice(0,150)
+    // pre-caps, but BEFORE prompt-level truncation. Named "postFilter" (not "preCapped")
+    // because the filter runs before the slice — a release with 82 commits where 3 are
+    // WIP-filtered would give postFilterCommitCount=79, not 80. The truncation warning
+    // below uses these to show the full pipeline:
+    //   totalCommits (raw API) → postFilterCommitCount (after filter+slice) → usedCommits.length (after prompt cap)
+    // e.g. "commits 312 → 79 → 12" where 312→79 = filter+slice, 79→12 = prompt truncation.
+    const postFilterCommitCount = commits.length
+    const postFilterFileCount = files.length
+
     // 5. Build prompt, then hard-cap to MAX_PROMPT_CHARS (13_500) before
     //    sending to AFM. AFM has a fixed 4096-token context window; exceeding
     //    it throws exceededContextWindowSize. The per-list caps above (80 commits,
@@ -535,10 +561,11 @@ async function run(): Promise<void> {
       safeTag, safePrevTag, commits, files, promptExtra
     )
 
-    if (usedCommits.length < commits.length || usedFiles.length < files.length) {
+    if (usedCommits.length < postFilterCommitCount || usedFiles.length < postFilterFileCount) {
       core.warning(
         `[afm] Prompt truncated to fit AFM context window (${MAX_PROMPT_CHARS} chars): ` +
-        `commits ${commits.length} → ${usedCommits.length}, files ${files.length} → ${usedFiles.length}`
+        `commits ${totalCommits} → ${postFilterCommitCount} → ${usedCommits.length}, ` +
+        `files ${totalFiles} → ${postFilterFileCount} → ${usedFiles.length}`
       )
     }
     core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`)
@@ -576,7 +603,16 @@ async function run(): Promise<void> {
       result = parseAfmOutput(raw, tag)
     } catch (e) {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
-      const strictPrompt = `${prompt}\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}`
+      // WHY strictPrompt is clamped to MAX_PROMPT_CHARS:
+      //
+      // Appending the ~130-char IMPORTANT suffix to prompt would push the total
+      // over MAX_PROMPT_CHARS for any prompt sitting at or near the cap. The
+      // resulting ~13,630 chars (≈3,408 tokens) is still safely under AFM's 4,096
+      // token limit today, but this assumption would silently break if
+      // MAX_PROMPT_CHARS is raised or the suffix grows. Clamping is free and
+      // keeps the guard consistent with the truncatePromptToFit contract.
+      const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
+      const strictPrompt = (prompt + strictSuffix).slice(0, MAX_PROMPT_CHARS)
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {
