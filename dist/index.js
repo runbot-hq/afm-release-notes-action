@@ -30274,8 +30274,11 @@ async function run() {
         }
         if (tag.includes('/'))
             throw new Error('TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path');
+        // --verify refs/tags/ is required: without it, rev-parse resolves ambiguously
+        // and a branch name matching the tag input passes silently. The refs/tags/
+        // prefix scopes resolution to tags only. Do NOT downgrade to rev-parse "$SAFE_TAG".
         try {
-            git('rev-parse "$SAFE_TAG"', { SAFE_TAG: tag });
+            git('rev-parse --verify "refs/tags/$SAFE_TAG"', { SAFE_TAG: tag });
         }
         catch {
             throw new Error(`TAG '${tag}' does not exist in this repository.`);
@@ -30283,20 +30286,52 @@ async function run() {
         // 3. Resolve PREV_TAG
         let prevTag = core.getInput('prev_tag').trim();
         if (!prevTag) {
-            prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | head -n 1', { SAFE_TAG: tag });
+            // Channel isolation: stable tags diff only against stable tags; pre-release
+            // channels (beta/alpha/rc) diff only against their own channel. This prevents
+            // a stable release like 1.0 from baselining against 1.0-rc.1 and producing
+            // release notes that cover only the rc-to-stable delta instead of the full
+            // feature set since 0.9. Fixed originally for issue #2119 — do NOT remove.
+            const channelMatch = tag.match(/-(beta|alpha|rc)(?:[.-]|$)/i);
+            if (channelMatch) {
+                const channel = channelMatch[1].toLowerCase();
+                prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -iF -- "-$SAFE_CHANNEL" | head -n 1', { SAFE_TAG: tag, SAFE_CHANNEL: channel });
+                if (!prevTag) {
+                    // No prior pre-release tag in this channel — fall back to any prior tag
+                    prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | head -n 1', { SAFE_TAG: tag });
+                }
+            }
+            else {
+                // Stable release: exclude all pre-release tags (beta/alpha/rc)
+                prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -vE -- "-(beta|alpha|rc)([.-]|$)" | head -n 1', { SAFE_TAG: tag });
+            }
         }
         if (!prevTag) {
             core.warning('No previous tag found — using first commit as baseline');
-            prevTag = git('rev-list --max-parents=0 HEAD');
+            // | head -n 1 is required: repos with multiple root commits (orphan branches,
+            // git replace) return multiple SHAs from rev-list --max-parents=0. Without
+            // the pipe, prevTag becomes a multi-line string and the basehead API call
+            // constructs "sha1\nsha2...targetTag" which returns HTTP 404.
+            // Do NOT remove | head -n 1.
+            prevTag = git('rev-list --max-parents=0 HEAD | head -n 1');
         }
         if (prevTag.includes('/'))
             throw new Error('prev_tag contains a slash — pass a plain tag name, not a ref path');
+        // Only validate explicitly-provided prev_tag values. When prevTag was
+        // auto-resolved from git tag output above it is already a known-good ref;
+        // running rev-parse on a raw SHA (from rev-list) would redundantly succeed,
+        // but more importantly the looksLikeRawSha exemption is needed to skip
+        // --verify refs/tags/ on a SHA that is not a tag at all.
+        // --verify refs/tags/ is required for the same reason as step 2: a branch
+        // name matching prev_tag would silently pass without it.
         if (core.getInput('prev_tag').trim()) {
-            try {
-                git('rev-parse "$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag });
-            }
-            catch {
-                throw new Error(`prev_tag '${prevTag}' does not exist in this repository.`);
+            const looksLikeRawSha = /^[0-9a-f]{40,64}$/.test(prevTag);
+            if (!looksLikeRawSha) {
+                try {
+                    git('rev-parse --verify "refs/tags/$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag });
+                }
+                catch {
+                    throw new Error(`prev_tag '${prevTag}' does not exist in this repository.`);
+                }
             }
         }
         core.info(`[afm] Comparing ${prevTag} → ${tag}`);
