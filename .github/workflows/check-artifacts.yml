@@ -6,6 +6,10 @@
 # 2. pr-staleness (pull_request on src/**) — catches stale dist/index.js on PRs
 #    that touch TypeScript source before they land on main. Rebuilds from source
 #    and fails if dist/ differs from what is committed.
+#
+#    runs-on: ubuntu-latest intentionally — ncc bundles pure JS with no macOS
+#    dependencies. ubuntu-latest is faster to queue and uses fewer billed minutes
+#    than macos-26 for an equivalent build.
 name: Check committed artifacts
 
 on:
@@ -20,7 +24,7 @@ on:
       - 'tsconfig.json'
 
 jobs:
-  # --- post-merge check (unchanged from before) ---
+  # --- post-merge check ---
   check-artifacts:
     if: >
       github.event_name == 'workflow_run' &&
@@ -44,7 +48,7 @@ jobs:
   # --- PR-time staleness check ---
   check-dist-staleness:
     if: github.event_name == 'pull_request'
-    runs-on: macos-26
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 

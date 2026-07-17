@@ -173,6 +173,10 @@ function isFatalAfmError(e: unknown): boolean {
  * Empty title or body after a successful parse emits a warning and throws so
  * the caller's strict-prompt retry fires with a useful signal rather than
  * silently falling through to the section-keyed branch.
+ *
+ * Format B double-decode (JSON.parse on a string value) is wrapped in its own
+ * try/catch so a quoted plain string from the model produces the descriptive
+ * "did not match any known format" error rather than a raw SyntaxError.
  */
 function parseAfmOutput(raw: string, currentTag: string): { title: string; body: string } {
   const cleaned = raw
@@ -189,13 +193,27 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
   }
 
   if (parsed !== null) {
-    const obj = typeof parsed === 'string' ? JSON.parse(parsed as string) : parsed as Record<string, unknown>
+    // Format B: double-encoded string — decode one more level.
+    // Wrapped in try/catch: if the model returned a quoted plain string
+    // (not valid JSON inside), JSON.parse throws a SyntaxError here.
+    // We catch it and fall through to the format-C / throw path rather
+    // than surfacing a raw SyntaxError to core.setFailed.
+    let obj: Record<string, unknown>
+    if (typeof parsed === 'string') {
+      try {
+        obj = JSON.parse(parsed) as Record<string, unknown>
+      } catch {
+        obj = {}
+      }
+    } else {
+      obj = parsed as Record<string, unknown>
+    }
 
     // Format A/B: { title, body }
     if (typeof obj?.title === 'string' && typeof obj?.body === 'string') {
       if (obj.title.length === 0 || obj.body.length === 0) {
         core.warning(
-          `AFM returned a {title, body} object but ${obj.title.length === 0 ? 'title' : 'body'} is empty. ` +
+          `AFM returned a {title, body} object but ${ obj.title.length === 0 ? 'title' : 'body'} is empty. ` +
           'This may indicate the model found no diffable content. Triggering strict-prompt retry.'
         )
         throw new Error('AFM returned empty title or body in {title, body} object')
@@ -205,13 +223,12 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
 
     // Format C: section-keyed { Added, Changed, ... }
     const sections = ['Added', 'Changed', 'Fixed', 'Removed', 'Security']
-    const asRecord = obj as Record<string, unknown>
-    const hasSections = sections.some(s => Array.isArray(asRecord[s]) && (asRecord[s] as unknown[]).length > 0)
+    const hasSections = sections.some(s => Array.isArray(obj[s]) && (obj[s] as unknown[]).length > 0)
     if (hasSections) {
       core.warning('AFM returned section-keyed JSON — converting to {title, body}')
       const body = sections
-        .filter(s => Array.isArray(asRecord[s]) && (asRecord[s] as unknown[]).length > 0)
-        .map(s => `## ${s}\n${(asRecord[s] as string[]).map((l: string) => `- ${l}`).join('\n')}`)
+        .filter(s => Array.isArray(obj[s]) && (obj[s] as unknown[]).length > 0)
+        .map(s => `## ${s}\n${(obj[s] as string[]).map((l: string) => `- ${l}`).join('\n')}`)
         .join('\n\n')
       return { title: currentTag || 'Release', body }
     }
