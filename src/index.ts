@@ -288,6 +288,16 @@ function truncatePromptToFit(
   if (prompt.length <= MAX_PROMPT_CHARS) return { prompt, commits: c, files: f }
 
   // Progressively halve both lists until the prompt fits.
+  //
+  // TERMINATION — this loop always terminates. Here is why:
+  //
+  // Each iteration halves the length of any list that is still > 1.
+  // When a list hits length 1, Math.max(1, Math.floor(1/2)) = Math.max(1,0) = 1,
+  // so that side pegs at 1 and stops shrinking — it does NOT oscillate or stall.
+  // The other list (if also > 1) continues halving independently.
+  // Once BOTH lists reach length 1 the while-condition (c.length > 1 || f.length > 1)
+  // becomes false and the loop exits. The subsequent pathological-edge-case block
+  // handles the rare situation where even 1 commit + 1 file still exceeds the cap.
   while (prompt.length > MAX_PROMPT_CHARS && (c.length > 1 || f.length > 1)) {
     if (c.length > 1) c = c.slice(0, Math.max(1, Math.floor(c.length / 2)))
     if (f.length > 1) f = f.slice(0, Math.max(1, Math.floor(f.length / 2)))
@@ -585,6 +595,17 @@ async function run(): Promise<void> {
     core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`)
 
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
+
+    // afmOptions is intentionally shared across all afmCli() calls in this run.
+    //
+    // WHY shared and not re-created per call:
+    //
+    // The instructions string (system prompt) does not change between the first
+    // attempt, the cold-start retry (step 6), and the strict-prompt retry (step 7).
+    // Only the `prompt` argument changes between those calls. Re-creating afmOptions
+    // for each call would be misleading — it would imply the instructions differ,
+    // which they do not. Do NOT split this into per-call objects unless the
+    // instructions genuinely need to differ between attempts.
     const afmOptions = { instructions }
 
     // 6. Call afm-cli
@@ -617,6 +638,20 @@ async function run(): Promise<void> {
       result = parseAfmOutput(raw, tag)
     } catch (e) {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
+
+      // strictPrompt appends a stronger formatting directive to `prompt`.
+      //
+      // WHY we append to `prompt` and not re-run truncatePromptToFit:
+      //
+      // `prompt` was already truncated to fit MAX_PROMPT_CHARS in step 5.
+      // The appended directive (~130 chars) is small enough that the combined
+      // string stays within AFM's context window — it is at most one commit or
+      // one file entry worth of characters. Re-running truncation would drop
+      // one additional item from the lists for no meaningful benefit, sending
+      // slightly less context than is available. The current approach is
+      // intentional and bounded: the overshoot is ≤ 130 chars above the soft
+      // cap, well within the ~675-token headroom documented in buildPrompt.
+      // Do NOT refactor this to call truncatePromptToFit again.
       const strictPrompt = `${prompt}\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}`
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
