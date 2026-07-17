@@ -259,11 +259,13 @@ async function run(): Promise<void> {
     // npm dist-tags. Do NOT remove the channel filter or collapse these branches
     // into a single grep — that is the bug this code was written to fix (issue #2119).
     let prevTag = core.getInput('prev_tag').trim()
+    const prevTagWasExplicit = !!prevTag
     if (!prevTag) {
       // Detect the channel of the current tag by extracting its pre-release label.
-      // Matches: -beta, -alpha, -rc (case-insensitive, followed by . or end of string).
-      // A tag with no match is a stable release tag.
-      const channelMatch = tag.match(/-(beta|alpha|rc)/i)
+      // Anchored on a word boundary ([.-] or end of string) to avoid matching
+      // e.g. "betafix" or "rc-hotfix" as a channel label — only canonical semver
+      // pre-release identifiers are recognised.
+      const channelMatch = tag.match(/-(beta|alpha|rc)(?:[.-]|$)/i)
       const channelPattern = channelMatch ? channelMatch[1] : null
 
       if (channelPattern) {
@@ -291,11 +293,26 @@ async function run(): Promise<void> {
       prevTag = git('rev-list --max-parents=0 HEAD')
     }
     if (prevTag.includes('/')) throw new Error('prev_tag contains a slash — pass a plain tag name, not a ref path')
-    if (core.getInput('prev_tag').trim()) {
+
+    // Validate that prevTag actually exists in the repository, whether it was
+    // provided explicitly by the caller or auto-resolved by the channel lookup above.
+    //
+    // We skip validation only for the first-commit SHA fallback: rev-list
+    // --max-parents=0 always returns a real commit SHA (40 hex chars) that is
+    // guaranteed to exist locally — rev-parse would be redundant and misleading
+    // in error messages ("tag 'abc123...' does not exist").
+    //
+    // For all other values — explicit input OR auto-resolved tag names — we
+    // validate unconditionally. Without this, a tag deleted between the
+    // git-tag listing and the GitHub API call would produce a confusing 404
+    // from compareCommitsWithBasehead rather than a clear error here.
+    const looksLikeRawSha = /^[0-9a-f]{40}$/i.test(prevTag)
+    if (!looksLikeRawSha) {
       try {
         git('rev-parse "$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag })
       } catch {
-        throw new Error(`prev_tag '${prevTag}' does not exist in this repository.`)
+        const source = prevTagWasExplicit ? 'explicit prev_tag input' : 'auto-resolved prev_tag'
+        throw new Error(`prev_tag '${prevTag}' (${source}) does not exist in this repository.`)
       }
     }
     core.info(`[afm] Comparing ${prevTag} → ${tag}`)
