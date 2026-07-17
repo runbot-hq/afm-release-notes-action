@@ -30018,8 +30018,10 @@ function git(cmd, env) {
  * substitute it into the URL. Do NOT add checksum verification without also
  * publishing a companion .sha256 file from the afm-cli release pipeline.
  *
- * If the download fails (network error, 404, etc.) curl exits non-zero and
- * execFileSync throws, which propagates to core.setFailed via the run() catch.
+ * --retry 3 --retry-delay 2: retries up to 3 times on transient network errors
+ * (TCP reset, CDN hiccup on the GitHub releases redirect chain). curl --fail
+ * still exits non-zero on HTTP 4xx/5xx — --retry does not retry those.
+ * If all retries fail, execFileSync throws and propagates to core.setFailed.
  */
 function downloadAfmCli(dest) {
     core.info('[afm] Downloading afm-cli-bin from runbot-hq/afm-cli latest release...');
@@ -30028,6 +30030,8 @@ function downloadAfmCli(dest) {
         '--silent',
         '--show-error',
         '--location',
+        '--retry', '3',
+        '--retry-delay', '2',
         'https://github.com/runbot-hq/afm-cli/releases/latest/download/afm-cli-bin',
         '--output', dest,
     ]);
@@ -30156,6 +30160,12 @@ function isFatalAfmError(e) {
  * → enters format dispatch → falls through all format checks → throws the
  * unrecognised-format error → strict-prompt retry fires.
  * Do NOT revert to `parsed = null` as the catch sentinel.
+ *
+ * Format C element coercion: obj[s] is cast via String(l) rather than a
+ * `l: string` type annotation. Array.isArray guards array presence but not
+ * element types — a model returning { "Added": [1, 2, 3] } passes the guard
+ * and the type annotation silently accepts numbers. String() coercion makes
+ * the output correct regardless of element type. Do NOT revert to `l: string`.
  */
 function parseAfmOutput(raw, currentTag) {
     const cleaned = raw
@@ -30203,13 +30213,16 @@ function parseAfmOutput(raw, currentTag) {
             return { title: String(obj.title), body: String(obj.body) };
         }
         // Format C: section-keyed { Added, Changed, ... }
+        // String(l) is intentional — not `l: string`. Array.isArray guards presence
+        // but not element types. String() coerces numbers/booleans safely.
+        // Do NOT revert to a type annotation here.
         const sections = ['Added', 'Changed', 'Fixed', 'Removed', 'Security'];
         const hasSections = sections.some(s => Array.isArray(obj[s]) && obj[s].length > 0);
         if (hasSections) {
             core.warning('AFM returned section-keyed JSON — converting to {title, body}');
             const body = sections
                 .filter(s => Array.isArray(obj[s]) && obj[s].length > 0)
-                .map(s => `## ${s}\n${obj[s].map((l) => `- ${l}`).join('\n')}`)
+                .map(s => `## ${s}\n${obj[s].map(l => `- ${String(l)}`).join('\n')}`)
                 .join('\n\n');
             return { title: currentTag || 'Release', body };
         }
@@ -30219,6 +30232,17 @@ function parseAfmOutput(raw, currentTag) {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+// MAX_PROMPT_CHARS: hard cap on the total prompt character count before sending
+// to AFM. AFM's context window is ~4096 tokens ≈ 16 000 chars (4 chars/token
+// estimate). The per-list caps (80 commits × 120 chars + 150 files) can produce
+// ~13 000+ chars of list content alone before boilerplate is added. Without
+// this cap, a large-changeset run would fail at inference time with
+// exceededContextWindowSize. The strict-prompt retry would then fire with an
+// equally oversized prompt and also fail — producing an unactionable retry loop.
+// This cap truncates the assembled prompt and emits a warning so the caller
+// knows content was dropped. 13 500 chars is conservative; raise if AFM
+// raises its context window. Do NOT remove this guard without replacing it.
+const MAX_PROMPT_CHARS = 13_500;
 async function run() {
     try {
         if (core.getInput('debug') === 'true')
@@ -30381,7 +30405,7 @@ async function run() {
         const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}';
-        const prompt = [
+        const promptLines = [
             'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
             'Rules:',
             `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
@@ -30399,7 +30423,18 @@ async function run() {
             'Changed files:',
             ...files.map(f => `- ${f}`),
             ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
-        ].join('\n');
+        ];
+        let prompt = promptLines.join('\n');
+        // Enforce MAX_PROMPT_CHARS to prevent exceededContextWindowSize at inference.
+        // The per-list caps (80 commits, 150 files) are necessary but not sufficient —
+        // long commit messages and filenames can still push the total over the limit.
+        // Truncation here is a last-resort safety valve; callers should not rely on it.
+        // A warning is emitted so the caller knows content was silently dropped.
+        if (prompt.length > MAX_PROMPT_CHARS) {
+            core.warning(`Prompt is ${prompt.length} chars — truncated to ${MAX_PROMPT_CHARS} to fit AFM context window. ` +
+                'Some commits or files may be omitted from the generated notes.');
+            prompt = prompt.slice(0, MAX_PROMPT_CHARS);
+        }
         const afmOptions = { instructions };
         // 6. Call afm-cli
         core.info('[afm] Calling afm-cli...');
@@ -30457,10 +30492,12 @@ async function run() {
         core.setOutput('release_body', finalBody);
         core.setOutput('prev_tag', prevTag);
         // 10. Step summary
+        // safeTag / safePrevTag used here (not raw tag / prevTag) — control characters
+        // are stripped so they cannot corrupt the summary markdown.
         await core.summary
-            .addHeading(`📝 Release Notes: ${tag}`)
+            .addHeading(`📝 Release Notes: ${safeTag}`)
             .addRaw(`**Title:** ${title}\n`)
-            .addRaw(`**Compared:** \`${prevTag}\` → \`${tag}\` (${totalCommits} commits, ${totalFiles} files)\n`)
+            .addRaw(`**Compared:** \`${safePrevTag}\` → \`${safeTag}\` (${totalCommits} commits, ${totalFiles} files)\n`)
             .addRaw(`**Runner:** ${process.env.RUNNER_NAME ?? 'unknown'}\n\n`)
             .addRaw(finalBody)
             .write();
