@@ -30166,44 +30166,6 @@ function parseAfmOutput(raw, currentTag) {
     // stricter prompt. Do NOT return a default here — see JSDoc above.
     throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`);
 }
-// WHY MAX_PROMPT_CHARS is declared here (before buildPrompt/truncatePromptToFit):
-//
-// truncatePromptToFit references MAX_PROMPT_CHARS in its body. TypeScript const
-// declarations are subject to the Temporal Dead Zone — referencing a const before
-// its declaration in source order is a runtime ReferenceError if the reference is
-// evaluated at declaration time (e.g. a default parameter or class field). The
-// function body is only evaluated at call time (after module evaluation), so the
-// previous order was safe at runtime. However, declaring the constant after the
-// function that uses it is a readability hazard and a latent footgun if the call
-// site ever moves earlier. Constant declared first, then the functions that use it.
-const MAX_PROMPT_CHARS = 13_500;
-/**
- * Assembles the prompt string from its components.
- *
- * Extracted from run() so that truncatePromptToFit() can rebuild it cheaply
- * on each halving iteration without duplicating the join logic.
- */
-function buildPrompt(safeTag, safePrevTag, commits, files, promptExtra) {
-    return [
-        'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
-        'Rules:',
-        `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
-        '- body: Markdown with sections ## Added, ## Changed, ## Fixed, ## Removed, ## Security (omit empty sections).',
-        '- User-facing language, past tense.',
-        '- Skip bot commits (dependabot, renovate, github-actions) and merge commits.',
-        '- Output JSON only — no markdown fences, no extra keys.',
-        '',
-        `Previous tag: ${safePrevTag}`,
-        `Target tag: ${safeTag}`,
-        '',
-        'Commits:',
-        ...commits.map(c => `- ${c}`),
-        '',
-        'Changed files:',
-        ...files.map(f => `- ${f}`),
-        ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
-    ].join('\n');
-}
 /**
  * Rebuilds the prompt string from its components, capping the total length
  * to MAX_PROMPT_CHARS to stay within AFM's 4096-token context window.
@@ -30228,6 +30190,28 @@ function buildPrompt(safeTag, safePrevTag, commits, files, promptExtra) {
  * — it will produce a minimal release note rather than failing the job.
  * Failing here would be worse than a thin release note.
  */
+function buildPrompt(safeTag, safePrevTag, commits, files, promptExtra) {
+    return [
+        'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
+        'Rules:',
+        `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
+        '- body: Markdown with sections ## Added, ## Changed, ## Fixed, ## Removed, ## Security (omit empty sections).',
+        '- User-facing language, past tense.',
+        '- Skip bot commits (dependabot, renovate, github-actions) and merge commits.',
+        '- Output JSON only — no markdown fences, no extra keys.',
+        '',
+        `Previous tag: ${safePrevTag}`,
+        `Target tag: ${safeTag}`,
+        '',
+        'Commits:',
+        ...commits.map(c => `- ${c}`),
+        '',
+        'Changed files:',
+        ...files.map(f => `- ${f}`),
+        ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
+    ].join('\n');
+}
+const MAX_PROMPT_CHARS = 13_500;
 function truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra) {
     let c = [...commits];
     let f = [...files];
@@ -30450,13 +30434,6 @@ async function run() {
             .filter(m => !/^(fixup!|squash!|[Ww][Ii][Pp]([ :]|$))/.test(m))
             .slice(0, 80);
         files = files.slice(0, 150);
-        // Capture counts after pre-capping (max 80/150) but before prompt truncation,
-        // so the truncation warning below can show the full pipeline:
-        //   raw (e.g. 312) → pre-capped (e.g. 80) → truncated (e.g. 12)
-        // Without this, the warning would only show the post-pre-cap value (80 → 12),
-        // which is misleading for large releases where the pre-cap already fired.
-        const preCappedCommitCount = commits.length;
-        const preCappedFileCount = files.length;
         // 5. Build prompt, then hard-cap to MAX_PROMPT_CHARS (13_500) before
         //    sending to AFM. AFM has a fixed 4096-token context window; exceeding
         //    it throws exceededContextWindowSize. The per-list caps above (80 commits,
@@ -30466,10 +30443,9 @@ async function run() {
         const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         const { prompt, commits: usedCommits, files: usedFiles } = truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra);
-        if (usedCommits.length < preCappedCommitCount || usedFiles.length < preCappedFileCount) {
+        if (usedCommits.length < commits.length || usedFiles.length < files.length) {
             core.warning(`[afm] Prompt truncated to fit AFM context window (${MAX_PROMPT_CHARS} chars): ` +
-                `commits ${totalCommits} → ${preCappedCommitCount} → ${usedCommits.length}, ` +
-                `files ${totalFiles} → ${preCappedFileCount} → ${usedFiles.length}`);
+                `commits ${commits.length} → ${usedCommits.length}, files ${files.length} → ${usedFiles.length}`);
         }
         core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`);
         const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}';
