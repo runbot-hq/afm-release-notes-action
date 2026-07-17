@@ -343,18 +343,26 @@ async function run(): Promise<void> {
       } else {
         // Stable release tag: find the previous RELEASE tag only.
         //
-        // WHY grep -vE with an OR pattern:
+        // WHY grep -vE with an OR pattern, and WHY the ([.-]|$) anchor:
         //
         // -E enables extended regex so the | alternation works without
-        // escaping. The pattern "-(beta|alpha|rc)" is a fixed literal in the
-        // command string — it is NOT user-controlled and does NOT need to be
-        // passed via env. This is safe as-is. Do NOT replace with -F here —
-        // -F does not support alternation and would require three separate greps.
+        // escaping. The pattern is a fixed literal in the command string —
+        // it is NOT user-controlled and does NOT need to be passed via env.
         //
-        // Do NOT remove this filter — without it a stable release tag would
-        // baseline against the most recent pre-release tag (issue #2119).
+        // The ([.-]|$) right-side anchor mirrors the detection-side regex
+        // fix (see channelMatch above). Without it, a tag like
+        // 0.1.5-betafix or 1.0-rccandidate would be incorrectly excluded
+        // from the stable pool because the pattern would match "-beta" and
+        // "-rc" as substrings. The anchor requires the channel word to be
+        // followed by a separator (. or -) or end-of-string, so only
+        // canonical pre-release suffixes (-beta.1, -rc-1, bare -rc, etc.)
+        // are excluded. Do NOT remove the anchor or collapse to a simpler
+        // pattern — that reintroduces the asymmetry this was written to fix.
+        //
+        // Do NOT remove the grep entirely — without it a stable release tag
+        // would baseline against the most recent pre-release tag (issue #2119).
         prevTag = git(
-          'tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -vE -- "-(beta|alpha|rc)" | head -n 1',
+          'tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -vE -- "-(beta|alpha|rc)([.-]|$)" | head -n 1',
           { SAFE_TAG: tag }
         )
       }
