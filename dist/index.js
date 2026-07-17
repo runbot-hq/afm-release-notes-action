@@ -30514,7 +30514,16 @@ async function run() {
         //    it throws exceededContextWindowSize. The per-list caps above (80 commits,
         //    150 files) are not sufficient on their own — a release with many long
         //    commit messages or filenames can still exceed the limit.
-        const promptExtra = core.getInput('prompt_extra').slice(0, 300);
+        //
+        // WHY promptExtra is also stripped of control chars:
+        //
+        // safeTag and safePrevTag both apply /[\x00-\x1f\x7f]/g before being
+        // embedded in the prompt. promptExtra comes from core.getInput(), which
+        // passes caller-supplied workflow input through unchanged. Not a shell
+        // injection risk (afmCli uses spawnSync), but control chars could corrupt
+        // the prompt content or cause unexpected model behaviour. Strip applied
+        // consistently with all other user-controlled strings embedded in the prompt.
+        const promptExtra = core.getInput('prompt_extra').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 300);
         const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         // strictSuffix is defined here (before the first truncatePromptToFit call) so
