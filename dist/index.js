@@ -30365,13 +30365,22 @@ async function run() {
         }
         if (prevTag.includes('/'))
             throw new Error('prev_tag contains a slash — pass a plain tag name, not a ref path');
-        // Only validate explicitly-provided prev_tag values. When prevTag was
-        // auto-resolved from git tag output above it is already a known-good ref;
-        // running rev-parse on a raw SHA (from rev-list) would redundantly succeed,
-        // but more importantly the looksLikeRawSha exemption is needed to skip
-        // --verify refs/tags/ on a SHA that is not a tag at all.
-        // --verify refs/tags/ is required for the same reason as step 2: a branch
-        // name matching prev_tag would silently pass without it.
+        // Validation scope: only explicitly-provided prev_tag values are validated
+        // with rev-parse --verify refs/tags/.
+        //
+        // Auto-resolved prevTag (from git tag pipelines above) is already a known-good
+        // tag name — git tag only emits tags, so no branch-name confusion is possible
+        // on those paths. Validating them would be redundant.
+        //
+        // The first-commit fallback (rev-list --max-parents=0 above) returns a raw SHA,
+        // not a tag name. That path is also auto-resolved, so it skips this block
+        // entirely — correctly, since --verify refs/tags/ would reject a raw SHA.
+        // The looksLikeRawSha guard below is scoped to explicit caller input only:
+        // a caller could supply a raw SHA as prev_tag (valid and intentional), which
+        // must also skip --verify refs/tags/ for the same reason.
+        //
+        // --verify refs/tags/ is required for explicit input for the same reason as
+        // step 2: a branch name matching prev_tag would silently pass without it.
         if (core.getInput('prev_tag').trim()) {
             const looksLikeRawSha = /^[0-9a-f]{40,64}$/.test(prevTag);
             if (!looksLikeRawSha) {
@@ -30458,10 +30467,15 @@ async function run() {
         // AFM is structurally whole. The fallback `|| sliced` handles the degenerate
         // case where the entire prompt has no newlines (should not happen in practice).
         // Do NOT revert to a raw slice without the lastIndexOf boundary.
+        //
+        // originalLength is captured before truncation so the warning can report
+        // the original size without re-joining promptLines (which would allocate
+        // a second full copy of the string).
         if (prompt.length > MAX_PROMPT_CHARS) {
+            const originalLength = prompt.length;
             const sliced = prompt.slice(0, MAX_PROMPT_CHARS);
             prompt = sliced.slice(0, sliced.lastIndexOf('\n') + 1).trimEnd() || sliced;
-            core.warning(`Prompt is ${promptLines.join('\n').length} chars — truncated to ${prompt.length} chars at a line boundary to fit AFM context window. ` +
+            core.warning(`Prompt is ${originalLength} chars — truncated to ${prompt.length} chars at a line boundary to fit AFM context window. ` +
                 'Some commits or files may be omitted from the generated notes.');
         }
         const afmOptions = { instructions };
