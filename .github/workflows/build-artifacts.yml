@@ -44,12 +44,11 @@ jobs:
 
       - name: Build dist/index.js
         run: |
-          # npm install is used here — NOT npm ci — because this repository
-          # does not commit a lockfile (package-lock.json is .gitignored).
-          # npm ci requires a committed lockfile and exits non-zero without one,
-          # which would prevent dist/ from ever being rebuilt or committed.
-          # Do NOT change to npm ci unless a lockfile is committed to the repo.
-          npm install
+          # npm ci is used here — package-lock.json is committed to this repo.
+          # npm ci installs exactly the versions in the lockfile; npm install
+          # can silently update transitive deps if semver ranges allow drift.
+          # Do NOT revert to npm install.
+          npm ci
           npm run build
 
       - name: Commit artifacts if changed

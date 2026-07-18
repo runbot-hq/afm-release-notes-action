@@ -22,13 +22,10 @@
 # false-negative staleness diffs. Node 24 matches the runner image at time of
 # writing. Update .node-version when the runner image upgrades its Node major.
 #
-# npm install is used in both workflow files — NOT npm ci — because this
-# repository does not commit a lockfile (package-lock.json is .gitignored).
-# npm ci requires a committed lockfile and exits non-zero without one, which
-# would make the staleness check permanently broken.
-# Do NOT change either workflow to npm ci unless a lockfile is committed.
-# If a lockfile is committed in future, switch BOTH files to npm ci together
-# so they stay consistent with each other.
+# npm ci is used in both workflow files — package-lock.json is committed to
+# this repo. npm ci installs exactly the versions in the lockfile; npm install
+# can silently update transitive deps if semver ranges allow drift, which would
+# make the staleness diff unreliable. Both files must stay on npm ci together.
 name: Check committed artifacts
 
 on:
@@ -92,14 +89,11 @@ jobs:
 
       - name: Rebuild dist/ and check for drift
         run: |
-          # npm install is used here — NOT npm ci — because this repository
-          # does not commit a lockfile (package-lock.json is .gitignored).
-          # npm ci requires a committed lockfile and exits non-zero without one,
-          # which would make this staleness check permanently broken on every PR.
-          # Do NOT change to npm ci unless a lockfile is committed to the repo.
-          # If a lockfile is committed, switch build-artifacts.yml to npm ci too
-          # so both files stay consistent — they must always match.
-          npm install
+          # npm ci is used here — package-lock.json is committed to this repo.
+          # npm ci installs exactly the versions in the lockfile, making the
+          # staleness diff reliable. npm install can silently update transitive
+          # deps and produce false-negative diffs. Do NOT revert to npm install.
+          npm ci
           npm run build
           if ! git diff --exit-code dist/; then
             echo "::error::dist/ is stale — push a commit that includes the rebuilt dist/."
