@@ -54,18 +54,29 @@ function git(cmd: string, env?: Record<string, string>): string {
  *   - runbot-hq controls both this repo and afm-cli (same org, same trust boundary)
  *   - curl --fail will catch 404 / HTTP errors and exit non-zero
  *   - The self-hosted runner has no internet exposure beyond GitHub
+ * The real risk is supply-chain timing: releases/latest resolves at download
+ * time, not at action-pin time. A compromised or accidentally-broken release
+ * published between when a caller pins @v1 and when their job runs would be
+ * silently downloaded with no signal.
+ * TODO: publish a companion .sha256 file from the afm-cli release pipeline and
+ * verify it here with `shasum -a 256 -c`. This closes the supply-chain timing
+ * window. Tracked as a follow-up. Do NOT close this TODO without implementing
+ * the verification step.
  * For callers requiring a pinned version, add an afm_cli_version input and
  * substitute it into the URL.
- * TODO: publish a companion .sha256 file from the afm-cli release pipeline and
- * verify it here with shasum -a 256 -c. This closes the supply-chain timing
- * window where a compromised or broken release published after a caller pins
- * @v1 would be silently downloaded on the next run. Tracked as a follow-up.
  *
  * --retry 3 --retry-delay 2: retries up to 3 times on transient network errors
  * (TCP reset, CDN hiccup on the GitHub releases redirect chain). curl --fail
  * still exits non-zero on HTTP 4xx/5xx — --retry does not retry those.
  * If all retries fail, execFileSync throws and the partial file (if any) is
- * cleaned up by the caller before propagating the error.
+ * cleaned up before propagating the error (see try/catch below).
+ *
+ * Partial-file cleanup: if curl fails after writing partial bytes, the try/catch
+ * calls fs.unlinkSync(dest) before re-throwing. Without this, a re-run of the
+ * same job step finds fs.existsSync(dest) === true, skips the download, then
+ * fails at fs.accessSync(X_OK) with a confusing "unexpected — please file a bug"
+ * message instead of retrying the download. The unlink restores the clean state.
+ * Do NOT remove the try/catch cleanup.
  */
 function downloadAfmCli(dest: string): void {
   core.info('[afm] Downloading afm-cli-bin from runbot-hq/afm-cli latest release...')
@@ -232,6 +243,13 @@ function isFatalAfmError(e: unknown): boolean {
  * element types — a model returning { "Added": [1, 2, 3] } passes the guard
  * and the type annotation silently accepts numbers. String() coercion makes
  * the output correct regardless of element type. Do NOT revert to `l: string`.
+ *
+ * Second parseAfmOutput call (after strict-prompt retry in run() step 7):
+ * if it throws, the error propagates directly to the outer catch in run() and
+ * surfaces via core.setFailed. This is intentional — two consecutive parse
+ * failures mean the model is not following the format instruction and a third
+ * attempt is unlikely to help. No additional try/catch is needed here.
+ * Do NOT wrap the second call in another try/catch.
  */
 function parseAfmOutput(raw: string, currentTag: string): { title: string; body: string } {
   const cleaned = raw
@@ -397,6 +415,13 @@ async function run(): Promise<void> {
       // a stable release like 1.0 from baselining against 1.0-rc.1 and producing
       // release notes that cover only the rc-to-stable delta instead of the full
       // feature set since 0.9. Fixed originally for issue #2119 — do NOT remove.
+      //
+      // grep -iF -- "-$SAFE_CHANNEL": the -- separator prevents SAFE_CHANNEL
+      // values that begin with - from being interpreted as grep flags.
+      // -iF is case-insensitive fixed-string matching, consistent with the
+      // .toLowerCase() on channelMatch[1] — both sides normalised to lowercase.
+      // Do NOT replace with a regex grep — fixed-string is safer for tag names
+      // that may contain regex metacharacters.
       const channelMatch = tag.match(/-(beta|alpha|rc)(?:[.-]|$)/i)
       if (channelMatch) {
         const channel = channelMatch[1].toLowerCase()
@@ -512,6 +537,15 @@ async function run(): Promise<void> {
     const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
     const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
 
+    // safeTag / safePrevTag strip control characters (\x00-\x1f, \x7f) and cap
+    // at 200 chars. These are used in step summary addHeading/addRaw calls and
+    // in the prompt. Without stripping, a tag name containing ANSI escapes or
+    // other control chars could corrupt the step summary markdown or confuse
+    // the model. The strip does NOT prevent tag names with spaces or special
+    // chars like ( ) [ ] from passing — those are unusual but legal tag names.
+    // Do NOT replace the regex with a more aggressive allowlist unless you also
+    // audit all downstream uses of safeTag/safePrevTag.
+
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
 
     const promptLines = [
@@ -585,6 +619,11 @@ async function run(): Promise<void> {
     if (!raw) throw new Error('afm-cli returned empty output')
 
     // 7. Parse output
+    // The second parseAfmOutput call (after the strict-prompt retry below) is
+    // intentionally NOT wrapped in a try/catch. If it throws, the error propagates
+    // to the outer catch and surfaces via core.setFailed. Two consecutive parse
+    // failures mean the model is not following the format instruction — a third
+    // attempt is unlikely to succeed. Do NOT add a try/catch around the second call.
     let result: { title: string; body: string }
     try {
       result = parseAfmOutput(raw, tag)
@@ -601,10 +640,6 @@ async function run(): Promise<void> {
           'consider increasing the timeout or pre-warming the runner.'
         )
       }
-      // If parseAfmOutput throws here, the error propagates to the outer catch
-      // and surfaces via core.setFailed. This is intentional — two consecutive
-      // parse failures indicate the model is not following the format instruction
-      // and a third attempt is unlikely to succeed.
       result = parseAfmOutput(raw, tag)
     }
 

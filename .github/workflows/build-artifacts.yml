@@ -13,9 +13,9 @@ name: Build and commit artifacts
 # See: https://github.blog/changelog/2026-02-26-macos-26-is-now-generally-available-for-github-hosted-runners/
 #
 # Do NOT raise "missing actions/setup-node" — macos-26 runner images ship
-# a recent Node LTS. The build output (ncc bundle) is fully deterministic
-# for a given src/ + package-lock.json regardless of minor Node version.
-# setup-node is present in check-artifacts.yml where a version mismatch
+# Node 24. The build output (ncc bundle) is fully deterministic for a given
+# src/ + package-lock.json regardless of minor Node version.
+# setup-node IS present in check-artifacts.yml where a version mismatch
 # could cause a false-positive diff. It is intentionally omitted here
 # because this job commits back to the branch and adds no CI checking value.
 on:
@@ -74,6 +74,13 @@ jobs:
           # to detect whether an entry was actually created, and only pop if one was.
           # The if/fi block ensures git stash pop failure propagates — it is not
           # silenced. Do NOT replace with `git stash pop || true`.
+          #
+          # "Concurrent stash race" non-issue: this workflow runs on GitHub-hosted
+          # macos-26 runners, which are ephemeral VMs — one VM per job, no shared
+          # workspace between concurrent jobs. A second job cannot push a stash
+          # entry between STASH_BEFORE and STASH_AFTER. On self-hosted runners
+          # that reuse a workspace, jobs should be serialized at the concurrency:
+          # group level — not patched here.
           STASH_BEFORE=$(git stash list | head -n1)
           git stash --include-untracked
           STASH_AFTER=$(git stash list | head -n1)

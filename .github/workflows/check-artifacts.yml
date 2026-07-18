@@ -14,6 +14,13 @@
 #    dependencies. ubuntu-latest is faster to queue and uses fewer billed minutes
 #    than macos-26 for an equivalent build.
 #    Do NOT raise "should run on macos-26" — there is no macOS dependency here.
+#
+# .node-version pins to Node 24 (matching macos-26 runner images, which ship
+# Node 24.x). lts/* is intentionally NOT used — lts/* is a floating reference
+# that resolves at setup-node evaluation time and may diverge from the version
+# on the self-hosted build runner over time, causing false-positive or
+# false-negative staleness diffs. Node 24 matches the runner image at time of
+# writing. Update .node-version when the runner image upgrades its Node major.
 name: Check committed artifacts
 
 on:
