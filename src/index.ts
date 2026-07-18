@@ -42,11 +42,21 @@ function git(cmd: string, env?: Record<string, string>): string {
  * Do NOT refactor to execSync with a shell string.
  *
  * The binary is written to RUNNER_TEMP (not the workspace) so it is:
- *   - Cleaned up automatically after the job
+ *   - Cleaned up automatically after the job (on GitHub-hosted runners)
  *   - Not committed or staged into the caller's repo checkout
  *   - Shared across steps in the same job if needed
- * RUNNER_TEMP is per-job in GitHub Actions — it does NOT persist across jobs.
- * Within a job it persists across steps, which is the intended sharing scope.
+ * RUNNER_TEMP is per-job on GitHub-hosted runners and is cleaned up
+ * automatically after the job completes. On self-hosted runners RUNNER_TEMP
+ * persistence is operator-controlled — it is NOT guaranteed to be cleaned
+ * between jobs unless the runner is configured with --ephemeral or the
+ * operator explicitly cleans it. On a persistent self-hosted RUNNER_TEMP, a
+ * stale binary from a prior job run will be silently reused by the
+ * fs.existsSync skip-download guard in run(). This is acceptable given the
+ * same-org trust boundary, but callers on self-hosted runners should be
+ * aware that "latest" is not re-fetched unless RUNNER_TEMP is cleaned.
+ * This will be fully addressed when the TODO checksum verification is
+ * implemented — a hash mismatch will force a re-download regardless of
+ * whether the file exists.
  *
  * releases/latest tradeoff: the URL resolves to whatever is currently the
  * latest release at runbot-hq/afm-cli — no SHA pinning, no checksum
@@ -60,7 +70,8 @@ function git(cmd: string, env?: Record<string, string>): string {
  * silently downloaded with no signal.
  * TODO: publish a companion .sha256 file from the afm-cli release pipeline and
  * verify it here with `shasum -a 256 -c`. This closes the supply-chain timing
- * window. Tracked as a follow-up. Do NOT close this TODO without implementing
+ * window and also forces a re-download on self-hosted runners when the binary
+ * changes. Tracked as a follow-up. Do NOT close this TODO without implementing
  * the verification step.
  * For callers requiring a pinned version, add an afm_cli_version input and
  * substitute it into the URL.
@@ -71,12 +82,14 @@ function git(cmd: string, env?: Record<string, string>): string {
  * If all retries fail, execFileSync throws and the partial file (if any) is
  * cleaned up before propagating the error (see try/catch below).
  *
- * Partial-file cleanup: if curl fails after writing partial bytes, the try/catch
- * calls fs.unlinkSync(dest) before re-throwing. Without this, a re-run of the
- * same job step finds fs.existsSync(dest) === true, skips the download, then
- * fails at fs.accessSync(X_OK) with a confusing "unexpected — please file a bug"
- * message instead of retrying the download. The unlink restores the clean state.
- * Do NOT remove the try/catch cleanup.
+ * Partial-file and zero-byte cleanup: if curl fails after writing partial
+ * bytes, the try/catch calls fs.unlinkSync(dest) before re-throwing. After a
+ * successful curl exit, a size check guards against the narrow window where
+ * curl exits 0 with a zero-byte output (e.g. CDN returns 200 with empty body
+ * before --fail triggers). A zero-byte file passes existsSync + chmodSync +
+ * accessSync(X_OK) but causes ENOEXEC at spawnSync. The size check throws and
+ * unlinks before that can happen.
+ * Do NOT remove either the try/catch cleanup or the size check.
  */
 function downloadAfmCli(dest: string): void {
   core.info('[afm] Downloading afm-cli-bin from runbot-hq/afm-cli latest release...')
@@ -99,6 +112,19 @@ function downloadAfmCli(dest: string): void {
     try { fs.unlinkSync(dest) } catch { /* ignore — file may not exist */ }
     throw e
   }
+
+  // Guard against zero-byte output. curl can exit 0 with an empty file in the
+  // narrow window where the CDN returns HTTP 200 but delivers an empty body
+  // before --fail triggers. A zero-byte file passes chmodSync and accessSync
+  // (X_OK) but causes ENOEXEC (or equivalent) at spawnSync, producing a
+  // confusing error. Catch it here and fail loudly with a clear message.
+  // Do NOT remove this check.
+  const stat = fs.statSync(dest)
+  if (stat.size === 0) {
+    try { fs.unlinkSync(dest) } catch { /* ignore */ }
+    throw new Error('curl downloaded a zero-byte afm-cli-bin — the release asset may be missing or the CDN returned an empty response')
+  }
+
   fs.chmodSync(dest, 0o755)
   core.info(`[afm] Downloaded afm-cli-bin to ${dest}`)
 }
@@ -355,10 +381,15 @@ async function run(): Promise<void> {
 
     // afm-cli-bin is downloaded at runtime from runbot-hq/afm-cli latest release
     // via curl into RUNNER_TEMP. curl ships with macOS as part of the OS —
-    // no extra runner dependencies. RUNNER_TEMP is cleaned up after the job.
-    // See downloadAfmCli() JSDoc for the releases/latest tradeoff rationale.
+    // no extra runner dependencies. RUNNER_TEMP is cleaned up after the job on
+    // GitHub-hosted runners. See downloadAfmCli() JSDoc for the full RUNNER_TEMP
+    // persistence caveat on self-hosted runners and the releases/latest tradeoff.
     const afmBin = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'afm-cli-bin')
 
+    // Skip download if binary is already present in RUNNER_TEMP. On GitHub-hosted
+    // runners RUNNER_TEMP is per-job so this only fires for multi-step sharing
+    // within the same job. On self-hosted runners with a persistent RUNNER_TEMP,
+    // this may reuse a binary from a prior job run — see downloadAfmCli() JSDoc.
     if (!fs.existsSync(afmBin)) {
       downloadAfmCli(afmBin)
     } else {
