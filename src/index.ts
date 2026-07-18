@@ -227,9 +227,17 @@ function isFatalAfmError(e: unknown): boolean {
   //     "error: inference failed"  — session.respond() throw, may recover on retry
   //
   // SOURCE 2 — OS / MDM errors surfaced via spawnSync result.error or raw stderr.
-  //   'not authorized' — macOS MDM/entitlement denial
-  //   'eacces'         — POSIX EACCES from the OS
-  //   'mdm policy'     — MDM policy strings
+  //   'not authorized'   — macOS MDM/entitlement denial
+  //   'permission denied' — POSIX EACCES, matched via Node.js error message rather
+  //                         than err.code so it catches both Error objects and raw
+  //                         stderr strings from spawnSync. 'eacces' was used previously
+  //                         but is too broad — it can appear in file paths or commit
+  //                         messages propagated into error strings, causing a false-fatal
+  //                         classification that suppresses a potentially recoverable retry.
+  //                         'permission denied' is the canonical OS-level message for
+  //                         EACCES on macOS and is far less likely to appear accidentally
+  //                         in non-permission-related error text.
+  //   'mdm policy'       — MDM policy strings
   const msg = String(e).toLowerCase()
   return (
     msg.includes('error: apple intelligence unavailable') ||
@@ -237,7 +245,7 @@ function isFatalAfmError(e: unknown): boolean {
     msg.includes('error: afm-cli requires macos') ||
     msg.includes('error: foundationmodels framework not available') ||
     msg.includes('not authorized') ||
-    msg.includes('eacces') ||
+    msg.includes('permission denied') ||
     msg.includes('mdm policy')
   )
 }
@@ -355,35 +363,124 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
   throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`)
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-// MAX_PROMPT_CHARS: hard cap on the total prompt character count before sending
-// to AFM. AFM's context window is ~4096 tokens ≈ 16 000 chars (4 chars/token
-// estimate). The per-list caps (80 commits × 120 chars + 150 files) can produce
-// ~13 000+ chars of list content alone before boilerplate is added. Without
-// this cap, a large-changeset run would fail at inference time with
-// exceededContextWindowSize. The strict-prompt retry would then fire with an
-// equally oversized prompt and also fail — producing an unactionable retry loop.
+// WHY MAX_PROMPT_CHARS is declared here (before buildPrompt/truncatePromptToFit):
 //
-// Truncation snaps to the last newline boundary — never mid-line. This preserves
-// structural coherence: the Rules: block and JSON format instruction are always
-// complete because they appear at the top of the prompt, well before the list
-// content that is the likely truncation zone. A raw slice(0, N) risks cutting
-// inside a commit message or, worse, inside the Rules: block if tags/prompt_extra
-// are unusually long. Snapping to \n ensures every line sent to AFM is whole.
-// Do NOT revert to a raw slice without the lastIndexOf boundary.
-//
-// 13 500 chars is conservative; raise if AFM raises its context window.
-// Do NOT remove this guard without replacing it.
-//
-// The strict-prompt retry in step 7 appends ~130 chars of suffix to `prompt`.
-// `prompt` is already ≤ MAX_PROMPT_CHARS at that point, so strictPrompt is
-// re-capped before the retry call. The cap is applied to strictPrompt as well
-// to prevent the retry from exceeding the context window by the suffix length.
-// See step 7 for the re-application.
+// truncatePromptToFit references MAX_PROMPT_CHARS in its body. TypeScript const
+// declarations are subject to the Temporal Dead Zone — referencing a const before
+// its declaration in source order is a runtime ReferenceError if the reference is
+// evaluated at declaration time (e.g. a default parameter or class field). The
+// function body is only evaluated at call time (after module evaluation), so the
+// previous order was safe at runtime. However, declaring the constant after the
+// function that uses it is a readability hazard and a latent footgun if the call
+// site ever moves earlier. Constant declared first, then the functions that use it.
 const MAX_PROMPT_CHARS = 13_500
+
+/**
+ * Assembles the prompt string from its components.
+ *
+ * Called by truncatePromptToFit on every halving iteration — keep it cheap.
+ *
+ * safeTag/safePrevTag must already have control chars stripped (\x00-\x1f\x7f)
+ * before being passed here — they are embedded directly into the template.
+ */
+function buildPrompt(
+  safeTag: string,
+  safePrevTag: string,
+  commits: string[],
+  files: string[],
+  promptExtra: string
+): string {
+  return [
+    'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
+    'Rules:',
+    `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
+    '- body: Markdown with sections ## Added, ## Changed, ## Fixed, ## Removed, ## Security (omit empty sections).',
+    '- User-facing language, past tense.',
+    '- Skip bot commits (dependabot, renovate, github-actions) and merge commits.',
+    '- Output JSON only — no markdown fences, no extra keys.',
+    '',
+    `Previous tag: ${safePrevTag}`,
+    `Target tag: ${safeTag}`,
+    '',
+    'Commits:',
+    ...commits.map(c => `- ${c}`),
+    '',
+    'Changed files:',
+    ...files.map(f => `- ${f}`),
+    ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
+  ].join('\n')
+}
+
+/**
+ * Rebuilds the prompt string from its components, capping the total length
+ * to charBudget (defaults to MAX_PROMPT_CHARS) to stay within AFM's 4096-token
+ * context window.
+ *
+ * WHY charBudget is a parameter and not always MAX_PROMPT_CHARS:
+ * ANSWER: The strict-retry path appends a ~130-char suffix to the prompt.
+ * To guarantee the suffix is never truncated, the caller passes
+ * MAX_PROMPT_CHARS - strictSuffix.length as the budget. The default
+ * (MAX_PROMPT_CHARS) is used for the normal first-attempt call.
+ *
+ * WHY 13_500 and not 16_384 (4096 tokens × 4 chars/token)?
+ * ANSWER: The 4 chars/token estimate is conservative — real token counts for
+ * code/commit messages run 3–3.5 chars/token. 13_500 gives ~720 tokens of
+ * headroom for the instructions string (~45 tokens) and the model response
+ * (~675 tokens usable). Do NOT raise this without re-measuring real token counts.
+ *
+ * WHY progressively halve instead of binary-search?
+ * ANSWER: The loop runs at most log2(80) ≈ 7 times. Binary search adds
+ * complexity for negligible gain at these sizes.
+ *
+ * WHY we keep at least 0 items (empty lists) rather than throwing?
+ * ANSWER: A prompt with just the tag names and rules is still valid input for AFM
+ * — it will produce a minimal release note rather than failing the job.
+ * Failing here would be worse than a thin release note.
+ */
+function truncatePromptToFit(
+  safeTag: string,
+  safePrevTag: string,
+  commits: string[],
+  files: string[],
+  promptExtra: string,
+  charBudget: number = MAX_PROMPT_CHARS
+): { prompt: string; commits: string[]; files: string[] } {
+  let c = [...commits]
+  let f = [...files]
+
+  let prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
+  if (prompt.length <= charBudget) return { prompt, commits: c, files: f }
+
+  // Halve both lists progressively until the assembled prompt fits charBudget.
+  //
+  // DOES THIS LOOP TERMINATE?
+  // ANSWER: Yes, always. Math.max(1, Math.floor(n/2)) pegs at 1 once n=1,
+  // so each side stops shrinking independently at 1. Once BOTH lists reach
+  // length 1, (c.length > 1 || f.length > 1) is false and the loop exits.
+  // The pathological-edge block below handles the rare 1+1 > charBudget case.
+  while (prompt.length > charBudget && (c.length > 1 || f.length > 1)) {
+    if (c.length > 1) c = c.slice(0, Math.max(1, Math.floor(c.length / 2)))
+    if (f.length > 1) f = f.slice(0, Math.max(1, Math.floor(f.length / 2)))
+    prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
+  }
+
+  // Pathological edge: even 1 commit + 1 file exceeds charBudget (extremely
+  // long filenames or commit messages). Drop both lists entirely.
+  //
+  // KNOWN RESIDUAL GAP: after dropping, the prompt still contains boilerplate
+  // + tags + promptExtra ≈ 1,100 chars worst-case. If charBudget were ever set
+  // below ~1,100 the returned prompt would silently exceed it. In practice the
+  // minimum caller budget is MAX_PROMPT_CHARS - strictSuffix.length ≈ 13,368 —
+  // far above 1,100 — so this gap is unreachable. Do NOT add a throw: a thin
+  // release note is better than a hard job failure.
+  if (prompt.length > charBudget) {
+    c = []
+    f = []
+    prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
+  }
+
+  return { prompt, commits: c, files: f }
+}
 
 async function run(): Promise<void> {
   try {
@@ -573,79 +670,75 @@ async function run(): Promise<void> {
       .slice(0, 80)
     files = files.slice(0, 150)
 
-    // 5. Build prompt
-    const rawPromptExtra = core.getInput('prompt_extra')
-    if (rawPromptExtra.length > 300) {
-      core.warning(
-        `prompt_extra is ${rawPromptExtra.length} chars — truncated to 300. ` +
-        'Shorten your extra instruction to avoid silent truncation.'
-      )
-    }
-    const promptExtra = rawPromptExtra.slice(0, 300)
+    // Capture counts AFTER the WIP/fixup/squash filter AND the .slice(0,80)/slice(0,150)
+    // pre-caps, but BEFORE prompt-level truncation. Named "postFilter" (not "preCapped")
+    // because the filter runs before the slice — a release with 82 commits where 3 are
+    // WIP-filtered would give postFilterCommitCount=79, not 80. The truncation warning
+    // below uses these to show the full pipeline:
+    //   totalCommits (raw API) → postFilterCommitCount (after filter+slice) → usedCommits.length (after prompt cap)
+    // e.g. "commits 312 → 79 → 12" where 312→79 = filter+slice, 79→12 = prompt truncation.
+    const postFilterCommitCount = commits.length
+    const postFilterFileCount = files.length
+
+    // 5. Assemble and cap prompt
+    //
+    // The per-list caps above (80 commits, 150 files) are not sufficient alone —
+    // a release with many long commit messages can still exceed AFM's 4096-token
+    // context window. truncatePromptToFit measures the assembled string and halves
+    // lists until it fits MAX_PROMPT_CHARS (13_500).
+    //
+    // WHY promptExtra is also stripped of control chars:
+    // ANSWER: safeTag and safePrevTag both apply /[\x00-\x1f\x7f]/g before being
+    // embedded in the prompt. promptExtra comes from core.getInput(), which
+    // passes caller-supplied workflow input through unchanged. Not a shell
+    // injection risk (afmCli uses spawnSync), but control chars could corrupt
+    // the prompt content or cause unexpected model behaviour. Strip applied
+    // consistently with all other user-controlled strings embedded in the prompt.
+    const promptExtra = core.getInput('prompt_extra').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 300)
     const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
     const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
 
-    // safeTag / safePrevTag strip control characters (\x00-\x1f, \x7f) and cap
-    // at 200 chars. These are used in step summary addHeading/addRaw calls and
-    // in the prompt. Without stripping, a tag name containing ANSI escapes or
-    // other control chars could corrupt the step summary markdown or confuse
-    // the model. The strip does NOT prevent tag names with spaces or special
-    // chars like ( ) [ ] from passing — those are unusual but legal tag names.
-    // Do NOT replace the regex with a more aggressive allowlist unless you also
-    // audit all downstream uses of safeTag/safePrevTag.
-
-    const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
-
-    const promptLines = [
-      'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
-      'Rules:',
-      `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
-      '- body: Markdown with sections ## Added, ## Changed, ## Fixed, ## Removed, ## Security (omit empty sections).',
-      '- User-facing language, past tense.',
-      '- Skip bot commits (dependabot, renovate, github-actions) and merge commits.',
-      '- Output JSON only — no markdown fences, no extra keys.',
-      '',
-      `Previous tag: ${safePrevTag}`,
-      `Target tag: ${safeTag}`,
-      '',
-      'Commits:',
-      ...commits.map(c => `- ${c}`),
-      '',
-      'Changed files:',
-      ...files.map(f => `- ${f}`),
-      ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
-    ]
-
-    let prompt = promptLines.join('\n')
-
-    // Enforce MAX_PROMPT_CHARS to prevent exceededContextWindowSize at inference.
-    // Snap to the last newline boundary — never slice mid-line. A raw
-    // slice(0, MAX_PROMPT_CHARS) risks cutting inside a commit message or,
-    // in the worst case, inside the Rules: block if safeTag/safePrevTag are
-    // long (up to 200 chars each). Snapping to \n ensures every line sent to
-    // AFM is structurally whole. The fallback `|| sliced` handles the degenerate
-    // case where the entire prompt has no newlines (should not happen in practice).
-    // Do NOT revert to a raw slice without the lastIndexOf boundary.
+    // strictSuffix is defined here (before the first truncatePromptToFit call) so
+    // its .length can be subtracted from the budget when building the strict-retry
+    // prompt. Defined once to ensure the budget calculation and the actual append
+    // always reference the same string — do NOT duplicate or edit this string
+    // without updating the charBudget call in step 7.
     //
-    // originalLength is captured before truncation so the warning can report
-    // the original size without re-joining promptLines (which would allocate
-    // a second full copy of the string).
-    if (prompt.length > MAX_PROMPT_CHARS) {
-      const originalLength = prompt.length
-      const sliced = prompt.slice(0, MAX_PROMPT_CHARS)
-      prompt = sliced.slice(0, sliced.lastIndexOf('\n') + 1).trimEnd() || sliced
-      core.warning(
-        `Prompt is ${originalLength} chars — truncated to ${prompt.length} chars at a line boundary to fit AFM context window. ` +
-        'Some commits or files may be omitted from the generated notes.'
-      )
+    // IMPORTANT: strictSuffix must remain pure ASCII.
+    // String.prototype.length counts UTF-16 code units. For ASCII this equals
+    // the char count AFM sees, keeping the charBudget math exact. Adding emoji
+    // or non-ASCII here would silently miscalculate headroom. (~130 chars)
+    const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
+    // WHY this guard exists:
+    // String.prototype.length counts UTF-16 code units, not bytes or tokens.
+    // For pure ASCII the count equals what AFM sees, so the charBudget
+    // subtraction (MAX_PROMPT_CHARS - strictSuffix.length) is exact.
+    // A non-ASCII edit (emoji, arrow, curly quote) would silently make
+    // .length smaller than the actual encoded size, underestimating headroom.
+    // This throws at action startup — long before any AFM call — so the
+    // miscalculation is caught in CI rather than corrupting a live release.
+    if (!/^[\x00-\x7f]*$/.test(strictSuffix)) {
+      throw new Error('Internal error: strictSuffix contains non-ASCII characters — charBudget calculation would be incorrect. Keep strictSuffix pure ASCII.')
     }
 
-    // Log prompt stats for every run (not only truncating runs) so release note
-    // quality issues can be debugged without re-running with debug: true.
-    // Do NOT remove this line — it is the only signal for how much material
-    // was fed to the model on a given run.
-    core.info(`[afm] Prompt: ${prompt.length} chars, ${commits.length} commits, ${files.length} files`)
+    // usedCommits/usedFiles: post-truncation lists, used ONLY for the warning
+    // and core.info lines immediately below.
+    // They are NOT referenced again after this block — not in step 6, not in
+    // step 7. Step 7 operates on `prompt` (a string), not on these arrays.
+    const { prompt, commits: usedCommits, files: usedFiles } = truncatePromptToFit(
+      safeTag, safePrevTag, commits, files, promptExtra
+    )
 
+    if (usedCommits.length < postFilterCommitCount || usedFiles.length < postFilterFileCount) {
+      core.warning(
+        `[afm] Prompt truncated to fit AFM context window (${MAX_PROMPT_CHARS} chars): ` +
+        `commits ${totalCommits} → ${postFilterCommitCount} → ${usedCommits.length}, ` +
+        `files ${totalFiles} → ${postFilterFileCount} → ${usedFiles.length}`
+      )
+    }
+    core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`)
+
+    const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
     const afmOptions = { instructions }
 
     // 6. Call afm-cli
@@ -672,29 +765,53 @@ async function run(): Promise<void> {
 
     if (!raw) throw new Error('afm-cli returned empty output')
 
-    // 7. Parse output
-    // The second parseAfmOutput call (after the strict-prompt retry below) is
-    // intentionally NOT wrapped in a try/catch. If it throws, the error propagates
-    // to the outer catch and surfaces via core.setFailed. Two consecutive parse
-    // failures mean the model is not following the format instruction — a third
-    // attempt is unlikely to succeed. Do NOT add a try/catch around the second call.
+    // 7. Parse output — strict-prompt retry if the format is wrong.
+    //
+    // ╔══════════════════════════════════════════════════════════════════════╗
+    // ║  WHAT STEP 7 DOES AND DOES NOT DO — READ BEFORE RAISING A FINDING  ║
+    // ╠══════════════════════════════════════════════════════════════════════╣
+    // ║                                                                      ║
+    // ║  DOES:     call truncatePromptToFit with a reduced charBudget        ║
+    // ║            (MAX_PROMPT_CHARS - strictSuffix.length) so the suffix   ║
+    // ║            is guaranteed to fit, then append strictSuffix            ║
+    // ║  DOES NOT: get a 15s pause+retry loop (see WHY below)               ║
+    // ║                                                                      ║
+    // ║  WHY re-truncate instead of slicing after append?                   ║
+    // ║  Slicing (prompt + suffix) to MAX_PROMPT_CHARS amputates the suffix ║
+    // ║  whenever prompt is already at the cap — the very instruction meant  ║
+    // ║  to fix malformed output gets silently dropped. Re-truncating with   ║
+    // ║  a reduced budget guarantees the suffix is always present in full.   ║
+    // ║                                                                      ║
+    // ║  IS PASSING usedCommits/usedFiles (already-capped from step 5) OK?  ║
+    // ║  Yes. They are already at or below what fits the full budget. The    ║
+    // ║  ~130-char reduction rarely drops even one item; when it does, the   ║
+    // ║  halving loop removes it correctly. Not a bug.                       ║
+    // ║                                                                      ║
+    // ║  WHY no 15s retry loop?                                             ║
+    // ║  Step 7 only runs after step 6 returned output (malformed, but      ║
+    // ║  returned). The model is warm — cold-start ETIMEDOUT is not the     ║
+    // ║  failure mode. A warm model that returned malformed output will      ║
+    // ║  not recover from a 15s pause on the same prompt.                   ║
+    // ╚══════════════════════════════════════════════════════════════════════╝
     let result: { title: string; body: string }
     try {
       result = parseAfmOutput(raw, tag)
     } catch (e) {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
-
-      // strictPrompt appends ~130 chars of suffix to `prompt`. `prompt` is
-      // already ≤ MAX_PROMPT_CHARS at this point (capped in step 5), but the
-      // suffix pushes strictPrompt slightly over. Re-apply the same newline-snap
-      // cap so the retry does not exceed the context window.
-      // Do NOT remove the re-cap — the guard exists precisely to prevent
-      // exceededContextWindowSize and the retry must honour it too.
-      const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
-      const strictRaw = `${prompt}${strictSuffix}`
-      const strictSliced = strictRaw.slice(0, MAX_PROMPT_CHARS)
-      const strictPrompt = strictSliced.slice(0, strictSliced.lastIndexOf('\n') + 1).trimEnd() || strictSliced
-
+      // WHY we re-truncate with a reduced budget instead of slicing after append:
+      // ANSWER: Slicing (prompt + strictSuffix) to MAX_PROMPT_CHARS would always
+      // amputate the suffix for any prompt near the cap — the very instruction
+      // meant to fix malformed output gets silently dropped. Instead, re-run
+      // truncatePromptToFit with charBudget = MAX_PROMPT_CHARS - strictSuffix.length,
+      // so the returned prompt is guaranteed to leave room for the full suffix.
+      // strictSuffix is then appended unconditionally. The resulting prompt is at
+      // most MAX_PROMPT_CHARS chars total — identical to the first-attempt budget.
+      const { prompt: strictBase } = truncatePromptToFit(
+        safeTag, safePrevTag, usedCommits, usedFiles, promptExtra,
+        MAX_PROMPT_CHARS - strictSuffix.length
+      )
+      const strictPrompt = strictBase + strictSuffix
+      core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars (budget: ${MAX_PROMPT_CHARS - strictSuffix.length} + ${strictSuffix.length} suffix)`)
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {
