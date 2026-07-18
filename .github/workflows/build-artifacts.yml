@@ -60,17 +60,22 @@ jobs:
           # original race where two concurrent builds both commit locally then
           # race to rebase/push, hard-failing the second push.
           #
+          # --include-untracked: stashes untracked files alongside tracked changes.
+          # Without this, git stash only stashes tracked modifications. If npm install
+          # left any untracked files in the workspace (e.g. a fresh node_modules entry
+          # not covered by .gitignore), git pull --rebase would refuse to proceed if
+          # the rebase would overwrite them. --include-untracked closes this gap.
+          # node_modules/ is covered by .gitignore so this is low-probability in
+          # practice, but the flag is cheap and makes the stash a complete safety net.
+          #
           # Stash guard: git stash exits 0 even when there is nothing to stash
           # but creates no stash entry. git stash pop on an empty stash stack
           # exits 1 and kills the step. We compare the stash list before/after
           # to detect whether an entry was actually created, and only pop if one was.
-          # The || true below ONLY silences the no-stash case (STASH_BEFORE == STASH_AFTER).
-          # A real git stash pop failure (e.g. merge conflict on restore) propagates
-          # as a non-zero exit from this step, failing the job before git add runs.
-          # Do NOT replace the conditional with `git stash pop || true` — that
-          # silently swallows a real pop failure and allows a corrupt dist/ to be committed.
+          # The if/fi block ensures git stash pop failure propagates — it is not
+          # silenced. Do NOT replace with `git stash pop || true`.
           STASH_BEFORE=$(git stash list | head -n1)
-          git stash
+          git stash --include-untracked
           STASH_AFTER=$(git stash list | head -n1)
           git pull --rebase origin "$GITHUB_REF_NAME"
           if [ "$STASH_BEFORE" != "$STASH_AFTER" ]; then
