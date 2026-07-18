@@ -30181,16 +30181,24 @@ function isFatalAfmError(e) {
     //     "error: inference failed"  — session.respond() throw, may recover on retry
     //
     // SOURCE 2 — OS / MDM errors surfaced via spawnSync result.error or raw stderr.
-    //   'not authorized' — macOS MDM/entitlement denial
-    //   'eacces'         — POSIX EACCES from the OS
-    //   'mdm policy'     — MDM policy strings
+    //   'not authorized'   — macOS MDM/entitlement denial
+    //   'permission denied' — POSIX EACCES, matched via Node.js error message rather
+    //                         than err.code so it catches both Error objects and raw
+    //                         stderr strings from spawnSync. 'eacces' was used previously
+    //                         but is too broad — it can appear in file paths or commit
+    //                         messages propagated into error strings, causing a false-fatal
+    //                         classification that suppresses a potentially recoverable retry.
+    //                         'permission denied' is the canonical OS-level message for
+    //                         EACCES on macOS and is far less likely to appear accidentally
+    //                         in non-permission-related error text.
+    //   'mdm policy'       — MDM policy strings
     const msg = String(e).toLowerCase();
     return (msg.includes('error: apple intelligence unavailable') ||
         msg.includes('error: unknown model availability state') ||
         msg.includes('error: afm-cli requires macos') ||
         msg.includes('error: foundationmodels framework not available') ||
         msg.includes('not authorized') ||
-        msg.includes('eacces') ||
+        msg.includes('permission denied') ||
         msg.includes('mdm policy'));
 }
 /**
