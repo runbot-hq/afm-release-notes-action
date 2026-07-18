@@ -29993,6 +29993,17 @@ function git(cmd, env) {
         env: { ...process.env, ...env },
     }).trim();
 }
+// PARSE_FAILED is declared at module scope, not inside parseAfmOutput.
+// Symbol() creates a unique object on every call — if it were declared inside
+// the function, each invocation would have a distinct symbol and the
+// `parsed !== PARSE_FAILED` guard would still work within that single call
+// (both sides reference the same local binding). However a module-level const
+// is the conventional pattern for a stable sentinel: it is immune to any future
+// refactor that caches or shares `parsed` across calls (e.g. a memoisation pass
+// or a test helper that pre-assigns the sentinel), where a per-call symbol would
+// silently fail the equality check.
+// Do NOT move PARSE_FAILED back inside parseAfmOutput.
+const PARSE_FAILED = Symbol('PARSE_FAILED');
 /**
  * Downloads afm-cli-bin from runbot-hq/afm-cli latest release into RUNNER_TEMP
  * using curl (universally available on macOS — no extra runner dependencies).
@@ -30002,11 +30013,21 @@ function git(cmd, env) {
  * Do NOT refactor to execSync with a shell string.
  *
  * The binary is written to RUNNER_TEMP (not the workspace) so it is:
- *   - Cleaned up automatically after the job
+ *   - Cleaned up automatically after the job (on GitHub-hosted runners)
  *   - Not committed or staged into the caller's repo checkout
  *   - Shared across steps in the same job if needed
- * RUNNER_TEMP is per-job in GitHub Actions — it does NOT persist across jobs.
- * Within a job it persists across steps, which is the intended sharing scope.
+ * RUNNER_TEMP is per-job on GitHub-hosted runners and is cleaned up
+ * automatically after the job completes. On self-hosted runners RUNNER_TEMP
+ * persistence is operator-controlled — it is NOT guaranteed to be cleaned
+ * between jobs unless the runner is configured with --ephemeral or the
+ * operator explicitly cleans it. On a persistent self-hosted RUNNER_TEMP, a
+ * stale binary from a prior job run will be silently reused by the
+ * fs.existsSync skip-download guard in run(). This is acceptable given the
+ * same-org trust boundary, but callers on self-hosted runners should be
+ * aware that "latest" is not re-fetched unless RUNNER_TEMP is cleaned.
+ * This will be fully addressed when the TODO checksum verification is
+ * implemented — a hash mismatch will force a re-download regardless of
+ * whether the file exists.
  *
  * releases/latest tradeoff: the URL resolves to whatever is currently the
  * latest release at runbot-hq/afm-cli — no SHA pinning, no checksum
@@ -30020,10 +30041,16 @@ function git(cmd, env) {
  * silently downloaded with no signal.
  * TODO: publish a companion .sha256 file from the afm-cli release pipeline and
  * verify it here with `shasum -a 256 -c`. This closes the supply-chain timing
- * window. Tracked as a follow-up. Do NOT close this TODO without implementing
+ * window and also forces a re-download on self-hosted runners when the binary
+ * changes. Tracked as a follow-up. Do NOT close this TODO without implementing
  * the verification step.
- * For callers requiring a pinned version, add an afm_cli_version input and
- * substitute it into the URL.
+ * Version pinning: an afm_cli_version input is the right long-term fix for
+ * callers that need reproducibility (substitute the version into the URL in
+ * place of "latest"). This is intentionally not implemented in this PR —
+ * the same-org trust boundary and --fail error handling are sufficient for
+ * current usage. It is tracked as a follow-up alongside the checksum TODO.
+ * Do NOT add afm_cli_version as a blocker finding — it is a known gap,
+ * accepted, and explicitly deferred.
  *
  * --retry 3 --retry-delay 2: retries up to 3 times on transient network errors
  * (TCP reset, CDN hiccup on the GitHub releases redirect chain). curl --fail
@@ -30031,12 +30058,14 @@ function git(cmd, env) {
  * If all retries fail, execFileSync throws and the partial file (if any) is
  * cleaned up before propagating the error (see try/catch below).
  *
- * Partial-file cleanup: if curl fails after writing partial bytes, the try/catch
- * calls fs.unlinkSync(dest) before re-throwing. Without this, a re-run of the
- * same job step finds fs.existsSync(dest) === true, skips the download, then
- * fails at fs.accessSync(X_OK) with a confusing "unexpected — please file a bug"
- * message instead of retrying the download. The unlink restores the clean state.
- * Do NOT remove the try/catch cleanup.
+ * Partial-file and zero-byte cleanup: if curl fails after writing partial
+ * bytes, the try/catch calls fs.unlinkSync(dest) before re-throwing. After a
+ * successful curl exit, a size check guards against the narrow window where
+ * curl exits 0 with a zero-byte output (e.g. CDN returns 200 with empty body
+ * before --fail triggers). A zero-byte file passes existsSync + chmodSync +
+ * accessSync(X_OK) but causes ENOEXEC at spawnSync. The size check throws and
+ * unlinks before that can happen.
+ * Do NOT remove either the try/catch cleanup or the size check.
  */
 function downloadAfmCli(dest) {
     core.info('[afm] Downloading afm-cli-bin from runbot-hq/afm-cli latest release...');
@@ -30062,6 +30091,20 @@ function downloadAfmCli(dest) {
         }
         catch { /* ignore — file may not exist */ }
         throw e;
+    }
+    // Guard against zero-byte output. curl can exit 0 with an empty file in the
+    // narrow window where the CDN returns HTTP 200 but delivers an empty body
+    // before --fail triggers. A zero-byte file passes chmodSync and accessSync
+    // (X_OK) but causes ENOEXEC (or equivalent) at spawnSync, producing a
+    // confusing error. Catch it here and fail loudly with a clear message.
+    // Do NOT remove this check.
+    const stat = fs.statSync(dest);
+    if (stat.size === 0) {
+        try {
+            fs.unlinkSync(dest);
+        }
+        catch { /* ignore */ }
+        throw new Error('curl downloaded a zero-byte afm-cli-bin — the release asset may be missing or the CDN returned an empty response');
     }
     fs.chmodSync(dest, 0o755);
     core.info(`[afm] Downloaded afm-cli-bin to ${dest}`);
@@ -30179,15 +30222,11 @@ function isFatalAfmError(e) {
  * trailing whitespace after the fence causes the replace to silently no-op,
  * leaving the fence in the string and causing JSON.parse to fail.
  *
- * Sentinel: PARSE_FAILED is a dedicated Symbol used as the initial value of
- * `parsed`. This distinguishes a JSON.parse failure (catch leaves parsed as
- * PARSE_FAILED) from a successful parse that returned the JS value null
- * (JSON.parse("null") === null, which is valid JSON). Using null as a sentinel
- * conflates these two cases. With the Symbol: a catch leaves parsed ===
- * PARSE_FAILED → skip format dispatch. JSON.parse("null") sets parsed = null
- * → enters format dispatch → falls through all format checks → throws the
- * unrecognised-format error → strict-prompt retry fires.
- * Do NOT revert to `parsed = null` as the catch sentinel.
+ * Sentinel: PARSE_FAILED is declared at module scope (above this function).
+ * Symbol() creates a new unique object on every call — a per-call declaration
+ * would work within a single invocation but is fragile across refactors.
+ * See the module-level comment above the PARSE_FAILED declaration for the full
+ * rationale. Do NOT move PARSE_FAILED back inside this function.
  *
  * Format C element coercion: obj[s] is cast via String(l) rather than a
  * `l: string` type annotation. Array.isArray guards array presence but not
@@ -30208,10 +30247,8 @@ function parseAfmOutput(raw, currentTag) {
         .replace(/^```\s*/m, '')
         .replace(/```\s*$/m, '') // /m required — $ must anchor to end-of-line, not end-of-string
         .trim();
-    // PARSE_FAILED is a dedicated sentinel so JSON.parse("null") (valid JSON,
-    // returns JS null) is not conflated with a parse failure.
-    // Do NOT revert to `parsed = null` — see JSDoc above.
-    const PARSE_FAILED = Symbol('PARSE_FAILED');
+    // PARSE_FAILED is module-scoped — see declaration above and JSDoc above.
+    // Do NOT re-declare PARSE_FAILED inside this function.
     let parsed = PARSE_FAILED;
     try {
         parsed = JSON.parse(cleaned);
@@ -30285,6 +30322,12 @@ function parseAfmOutput(raw, currentTag) {
 //
 // 13 500 chars is conservative; raise if AFM raises its context window.
 // Do NOT remove this guard without replacing it.
+//
+// The strict-prompt retry in step 7 appends ~130 chars of suffix to `prompt`.
+// `prompt` is already ≤ MAX_PROMPT_CHARS at that point, so strictPrompt is
+// re-capped before the retry call. The cap is applied to strictPrompt as well
+// to prevent the retry from exceeding the context window by the suffix length.
+// See step 7 for the re-application.
 const MAX_PROMPT_CHARS = 13_500;
 async function run() {
     try {
@@ -30299,9 +30342,14 @@ async function run() {
             throw new Error(`GITHUB_REPOSITORY is not set or has unexpected format (got: "${repo}")`);
         // afm-cli-bin is downloaded at runtime from runbot-hq/afm-cli latest release
         // via curl into RUNNER_TEMP. curl ships with macOS as part of the OS —
-        // no extra runner dependencies. RUNNER_TEMP is cleaned up after the job.
-        // See downloadAfmCli() JSDoc for the releases/latest tradeoff rationale.
+        // no extra runner dependencies. RUNNER_TEMP is cleaned up after the job on
+        // GitHub-hosted runners. See downloadAfmCli() JSDoc for the full RUNNER_TEMP
+        // persistence caveat on self-hosted runners and the releases/latest tradeoff.
         const afmBin = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'afm-cli-bin');
+        // Skip download if binary is already present in RUNNER_TEMP. On GitHub-hosted
+        // runners RUNNER_TEMP is per-job so this only fires for multi-step sharing
+        // within the same job. On self-hosted runners with a persistent RUNNER_TEMP,
+        // this may reuse a binary from a prior job run — see downloadAfmCli() JSDoc.
         if (!fs.existsSync(afmBin)) {
             downloadAfmCli(afmBin);
         }
@@ -30511,6 +30559,11 @@ async function run() {
             core.warning(`Prompt is ${originalLength} chars — truncated to ${prompt.length} chars at a line boundary to fit AFM context window. ` +
                 'Some commits or files may be omitted from the generated notes.');
         }
+        // Log prompt stats for every run (not only truncating runs) so release note
+        // quality issues can be debugged without re-running with debug: true.
+        // Do NOT remove this line — it is the only signal for how much material
+        // was fed to the model on a given run.
+        core.info(`[afm] Prompt: ${prompt.length} chars, ${commits.length} commits, ${files.length} files`);
         const afmOptions = { instructions };
         // 6. Call afm-cli
         core.info('[afm] Calling afm-cli...');
@@ -30548,7 +30601,16 @@ async function run() {
         }
         catch (e) {
             core.warning(`Output malformed — retrying with stricter prompt: ${e}`);
-            const strictPrompt = `${prompt}\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}`;
+            // strictPrompt appends ~130 chars of suffix to `prompt`. `prompt` is
+            // already ≤ MAX_PROMPT_CHARS at this point (capped in step 5), but the
+            // suffix pushes strictPrompt slightly over. Re-apply the same newline-snap
+            // cap so the retry does not exceed the context window.
+            // Do NOT remove the re-cap — the guard exists precisely to prevent
+            // exceededContextWindowSize and the retry must honour it too.
+            const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}';
+            const strictRaw = `${prompt}${strictSuffix}`;
+            const strictSliced = strictRaw.slice(0, MAX_PROMPT_CHARS);
+            const strictPrompt = strictSliced.slice(0, strictSliced.lastIndexOf('\n') + 1).trimEnd() || strictSliced;
             try {
                 raw = afmCli(afmBin, strictPrompt, afmOptions);
             }
