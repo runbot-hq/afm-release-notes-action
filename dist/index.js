@@ -30621,7 +30621,13 @@ async function run() {
             // intentional and bounded: the overshoot is ≤ 130 chars above the soft
             // cap, well within the ~675-token headroom documented in buildPrompt.
             // Do NOT refactor this to call truncatePromptToFit again.
-            const strictPrompt = `${prompt}\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}`;
+            //
+            // IMPORTANT: strictSuffix must remain pure ASCII. String.prototype.length
+            // counts UTF-16 code units — for ASCII this equals the char count AFM
+            // sees, making the charBudget subtraction in truncatePromptToFit exact.
+            // Adding emoji or non-ASCII here would silently miscalculate the headroom.
+            const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}';
+            const strictPrompt = `${prompt}${strictSuffix}`;
             // Log the strict prompt length so any overshoot above MAX_PROMPT_CHARS
             // is visible in the Actions log without needing a debugger.
             core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars (budget: ${MAX_PROMPT_CHARS} + ~130 char suffix)`);
