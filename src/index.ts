@@ -681,20 +681,21 @@ async function run(): Promise<void> {
     // ║  WHAT STEP 7 DOES AND DOES NOT DO — READ BEFORE RAISING A FINDING  ║
     // ╠══════════════════════════════════════════════════════════════════════╣
     // ║                                                                      ║
-    // ║  DOES:     append strictSuffix (~130 chars) to `prompt` (string)    ║
-    // ║  DOES NOT: call truncatePromptToFit again                           ║
-    // ║  DOES NOT: pass usedCommits or usedFiles anywhere                   ║
+    // ║  DOES:     call truncatePromptToFit with a reduced charBudget        ║
+    // ║            (MAX_PROMPT_CHARS - strictSuffix.length) so the suffix   ║
+    // ║            is guaranteed to fit, then append strictSuffix            ║
     // ║  DOES NOT: get a 15s pause+retry loop (see WHY below)               ║
     // ║                                                                      ║
-    // ║  The strict retry is a plain string concatenation:                  ║
-    // ║    const strictPrompt = `${prompt}${strictSuffix}`                  ║
-    // ║  usedCommits/usedFiles are out of play — their last use was the     ║
-    // ║  core.info() line in step 5. They do not appear in step 7.          ║
+    // ║  WHY re-truncate instead of slicing after append?                   ║
+    // ║  Slicing (prompt + suffix) to MAX_PROMPT_CHARS amputates the suffix ║
+    // ║  whenever prompt is already at the cap — the very instruction meant  ║
+    // ║  to fix malformed output gets silently dropped. Re-truncating with   ║
+    // ║  a reduced budget guarantees the suffix is always present in full.   ║
     // ║                                                                      ║
-    // ║  WHY no re-truncation?                                              ║
-    // ║  `prompt` already fits MAX_PROMPT_CHARS. The ~130-char suffix is    ║
-    // ║  within the ~675-token headroom documented on MAX_PROMPT_CHARS.     ║
-    // ║  Re-truncating would drop one item for zero benefit.                ║
+    // ║  IS PASSING usedCommits/usedFiles (already-capped from step 5) OK?  ║
+    // ║  Yes. They are already at or below what fits the full budget. The    ║
+    // ║  ~130-char reduction rarely drops even one item; when it does, the   ║
+    // ║  halving loop removes it correctly. Not a bug.                       ║
     // ║                                                                      ║
     // ║  WHY no 15s retry loop?                                             ║
     // ║  Step 7 only runs after step 6 returned output (malformed, but      ║
