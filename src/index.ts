@@ -474,36 +474,6 @@ function truncatePromptToFit(
   return { prompt, commits: c, files: f }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
-// MAX_PROMPT_CHARS: hard cap on the total prompt character count before sending
-// to AFM. AFM's context window is ~4096 tokens ≈ 16 000 chars (4 chars/token
-// estimate). The per-list caps (80 commits × 120 chars + 150 files) can produce
-// ~13 000+ chars of list content alone before boilerplate is added. Without
-// this cap, a large-changeset run would fail at inference time with
-// exceededContextWindowSize. The strict-prompt retry would then fire with an
-// equally oversized prompt and also fail — producing an unactionable retry loop.
-//
-// Truncation snaps to the last newline boundary — never mid-line. This preserves
-// structural coherence: the Rules: block and JSON format instruction are always
-// complete because they appear at the top of the prompt, well before the list
-// content that is the likely truncation zone. A raw slice(0, N) risks cutting
-// inside a commit message or, worse, inside the Rules: block if tags/prompt_extra
-// are unusually long. Snapping to \n ensures every line sent to AFM is whole.
-// Do NOT revert to a raw slice without the lastIndexOf boundary.
-//
-// 13 500 chars is conservative; raise if AFM raises its context window.
-// Do NOT remove this guard without replacing it.
-//
-// The strict-prompt retry in step 7 appends ~130 chars of suffix to `prompt`.
-// `prompt` is already ≤ MAX_PROMPT_CHARS at that point, so strictPrompt is
-// re-capped before the retry call. The cap is applied to strictPrompt as well
-// to prevent the retry from exceeding the context window by the suffix length.
-// See step 7 for the re-application.
-const MAX_PROMPT_CHARS = 13_500
-
 async function run(): Promise<void> {
   try {
     if (core.getInput('debug') === 'true') process.env.ACTIONS_STEP_DEBUG = '1'
@@ -761,57 +731,6 @@ async function run(): Promise<void> {
     core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`)
 
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
-
-    const promptLines = [
-      'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
-      'Rules:',
-      `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
-      '- body: Markdown with sections ## Added, ## Changed, ## Fixed, ## Removed, ## Security (omit empty sections).',
-      '- User-facing language, past tense.',
-      '- Skip bot commits (dependabot, renovate, github-actions) and merge commits.',
-      '- Output JSON only — no markdown fences, no extra keys.',
-      '',
-      `Previous tag: ${safePrevTag}`,
-      `Target tag: ${safeTag}`,
-      '',
-      'Commits:',
-      ...commits.map(c => `- ${c}`),
-      '',
-      'Changed files:',
-      ...files.map(f => `- ${f}`),
-      ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
-    ]
-
-    let prompt = promptLines.join('\n')
-
-    // Enforce MAX_PROMPT_CHARS to prevent exceededContextWindowSize at inference.
-    // Snap to the last newline boundary — never slice mid-line. A raw
-    // slice(0, MAX_PROMPT_CHARS) risks cutting inside a commit message or,
-    // in the worst case, inside the Rules: block if safeTag/safePrevTag are
-    // long (up to 200 chars each). Snapping to \n ensures every line sent to
-    // AFM is structurally whole. The fallback `|| sliced` handles the degenerate
-    // case where the entire prompt has no newlines (should not happen in practice).
-    // Do NOT revert to a raw slice without the lastIndexOf boundary.
-    //
-    // originalLength is captured before truncation so the warning can report
-    // the original size without re-joining promptLines (which would allocate
-    // a second full copy of the string).
-    if (prompt.length > MAX_PROMPT_CHARS) {
-      const originalLength = prompt.length
-      const sliced = prompt.slice(0, MAX_PROMPT_CHARS)
-      prompt = sliced.slice(0, sliced.lastIndexOf('\n') + 1).trimEnd() || sliced
-      core.warning(
-        `Prompt is ${originalLength} chars — truncated to ${prompt.length} chars at a line boundary to fit AFM context window. ` +
-        'Some commits or files may be omitted from the generated notes.'
-      )
-    }
-
-    // Log prompt stats for every run (not only truncating runs) so release note
-    // quality issues can be debugged without re-running with debug: true.
-    // Do NOT remove this line — it is the only signal for how much material
-    // was fed to the model on a given run.
-    core.info(`[afm] Prompt: ${prompt.length} chars, ${commits.length} commits, ${files.length} files`)
-
     const afmOptions = { instructions }
 
     // 6. Call afm-cli
