@@ -20,6 +20,7 @@ jobs:
       # gh api PATCH is used instead of git tag -f + git push because git tag requires
       # a local .git repo — there is no actions/checkout here, so the workspace is empty.
       # The API call moves the v1 ref atomically in one round-trip with no clone needed.
+      # Do NOT add actions/checkout to "fix" this — a clone is unnecessary overhead.
       #
       # ANNOTATED TAG PEEL: publish.yml creates annotated tags (git tag -a). On a push
       # event for an annotated tag, GITHUB_SHA is the SHA of the tag *object*, not the
@@ -30,6 +31,7 @@ jobs:
       #   GET /repos/:repo/git/tags/:sha       → .object.sha  (the commit)
       # The jq below handles both lightweight tags (object.type == "commit", no peel
       # needed) and annotated tags (object.type == "tag", one extra GET to dereference).
+      # Do NOT simplify by passing GITHUB_SHA directly — it breaks annotated tags.
       - name: Move v1 tag to this commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -51,28 +53,56 @@ jobs:
 
           # PATCH requires the v1 ref to already exist; it returns 422 on a fresh
           # repo where v1 has never been created. Try PATCH first (the normal case),
-          # and fall back to POST (ref creation) only if PATCH fails with a
-          # "ref does not exist" error. Any other failure (401, 5xx, network error)
-          # hard-fails here — do NOT silently fall through to POST on unexpected errors
-          # as that would either create a wrong ref or return a confusing 422
-          # "reference already exists" masking the original failure.
-          if ! gh api \
+          # and fall back to POST (ref creation) only if PATCH returns HTTP 422.
+          #
+          # --include emits response headers before the body so we can extract the
+          # HTTP status code reliably. Success is HTTP 200 — checked via the numeric
+          # status code rather than grepping response body text (which is fragile:
+          # gh api prose output or stderr deprecation notices may contain 'ref'
+          # and produce false positives).
+          #
+          # 2>&1: stderr is merged into stdout intentionally. gh may emit deprecation
+          # warnings or rate-limit notices on stderr; merging ensures they appear in
+          # the captured response for debugging. The HTTP status extraction uses
+          # grep -m1 '^HTTP/' which is unaffected by stderr noise (those lines never
+          # start with HTTP/).
+          # Do NOT split stderr back out — it would silently discard gh diagnostics.
+          #
+          # || true: allows the subshell to exit non-zero (e.g. on network error)
+          # without killing the step — the HTTP_STATUS check below handles all
+          # failure cases explicitly. Do NOT remove || true.
+          PATCH_RESPONSE=$(gh api \
             --method PATCH \
+            --include \
             -H "Accept: application/vnd.github+json" \
             "/repos/${{ github.repository }}/git/refs/tags/v1" \
             -f sha="$COMMIT_SHA" \
-            -F force=true 2>/tmp/v1_patch_err.log; then
-            if ! grep -qiE '"message".*not found|reference does not exist|404' /tmp/v1_patch_err.log; then
-              echo "::error::PATCH /git/refs/tags/v1 failed with an unexpected error:"
-              cat /tmp/v1_patch_err.log
-              exit 1
-            fi
+            -F force=true 2>&1) || true
+
+          HTTP_STATUS=$(echo "$PATCH_RESPONSE" | grep -m1 '^HTTP/' | awk '{print $2}')
+
+          # Guard against empty HTTP_STATUS — can happen if gh suppresses headers
+          # or routes them to stderr unexpectedly (e.g. after a gh version update).
+          # Fail loudly with the full response rather than falling into the else
+          # branch below with a confusing 'unexpected status :' message.
+          if [ -z "$HTTP_STATUS" ]; then
+            echo "::error::Could not extract HTTP status from PATCH response:"
+            echo "$PATCH_RESPONSE"
+            exit 1
+          fi
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "::notice::v1 tag advanced to $COMMIT_SHA"
+          elif [ "$HTTP_STATUS" = "422" ]; then
             echo "::notice::v1 ref does not exist yet — creating via POST"
-            cat /tmp/v1_patch_err.log
             gh api \
               --method POST \
               -H "Accept: application/vnd.github+json" \
               "/repos/${{ github.repository }}/git/refs" \
               -f ref="refs/tags/v1" \
               -f sha="$COMMIT_SHA"
+          else
+            echo "::error::PATCH /git/refs/tags/v1 failed with unexpected status ${HTTP_STATUS}:"
+            echo "$PATCH_RESPONSE"
+            exit 1
           fi

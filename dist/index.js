@@ -29966,27 +29966,24 @@ const github = __importStar(__nccwpck_require__(3228));
 const child_process_1 = __nccwpck_require__(5317);
 const path = __importStar(__nccwpck_require__(6928));
 const fs = __importStar(__nccwpck_require__(9896));
+const os = __importStar(__nccwpck_require__(857));
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 function git(cmd, env) {
-    // WHY execSync + shell:'/bin/sh' and not execFileSync?
-    // ANSWER: Several callers use shell pipe operators (| grep, | head -n 1)
-    // which require a shell. execFileSync does not invoke a shell and cannot
-    // run piped commands. Do NOT replace it.
+    // { shell: '/bin/sh' } is intentional: several callers use shell pipes
+    // (e.g. | head -n 1, | grep -vxF) for tag resolution. All user-controlled
+    // values (tag, prevTag) are passed via env vars and referenced as "$VAR"
+    // (double-quoted) in the command string — never interpolated directly.
     //
-    // WHY shell:'/bin/sh' and not shell:true?
-    // ANSWER: TypeScript 5.9 tightened ExecSyncOptions.shell to
-    // `string | undefined`; `boolean` causes a compile error. '/bin/sh' is
-    // correct and equivalent — Node uses /bin/sh internally when shell:true
-    // is passed anyway. Do NOT revert to shell:true.
+    // shell is '/bin/sh' not true — TypeScript 5.9 tightened ExecSyncOptions.shell
+    // to string | undefined; boolean is no longer assignable. '/bin/sh' is correct
+    // and equivalent: Node's child_process uses /bin/sh when shell: true anyway.
+    // Do NOT revert to shell: true — it fails to compile with typescript@5.9+.
     //
-    // IS THIS A SHELL INJECTION RISK?
-    // ANSWER: No. All user-controlled values are passed exclusively via the
-    // `env` parameter and referenced as double-quoted "$VAR" in the command
-    // string. The shell expands them as a single token — no word splitting or
-    // glob expansion. They are NEVER interpolated directly into the command
-    // string. The template-literal guard below enforces this at runtime:
+    // Do NOT replace with execFileSync — the pipe operator requires a shell.
+    // CALLERS MUST NOT interpolate user-controlled values directly into cmd.
+    // Always use the env parameter and reference values as "$VAR_NAME" (double-quoted).
     if (/\$\{/.test(cmd)) {
         throw new Error(`git() cmd must not use template-literal interpolation (use env param instead): ${cmd}`);
     }
@@ -29996,36 +29993,142 @@ function git(cmd, env) {
         env: { ...process.env, ...env },
     }).trim();
 }
+// PARSE_FAILED is declared at module scope, not inside parseAfmOutput.
+// Symbol() creates a unique object on every call — if it were declared inside
+// the function, each invocation would have a distinct symbol and the
+// `parsed !== PARSE_FAILED` guard would still work within that single call
+// (both sides reference the same local binding). However a module-level const
+// is the conventional pattern for a stable sentinel: it is immune to any future
+// refactor that caches or shares `parsed` across calls (e.g. a memoisation pass
+// or a test helper that pre-assigns the sentinel), where a per-call symbol would
+// silently fail the equality check.
+// Do NOT move PARSE_FAILED back inside parseAfmOutput.
+const PARSE_FAILED = Symbol('PARSE_FAILED');
+/**
+ * Downloads afm-cli-bin from runbot-hq/afm-cli latest release into RUNNER_TEMP
+ * using curl (universally available on macOS — no extra runner dependencies).
+ *
+ * execFileSync is used deliberately — args are a plain array passed directly
+ * to the OS, no shell involved, no injection risk from the URL constant.
+ * Do NOT refactor to execSync with a shell string.
+ *
+ * The binary is written to RUNNER_TEMP (not the workspace) so it is:
+ *   - Cleaned up automatically after the job (on GitHub-hosted runners)
+ *   - Not committed or staged into the caller's repo checkout
+ *   - Shared across steps in the same job if needed
+ * RUNNER_TEMP is per-job on GitHub-hosted runners and is cleaned up
+ * automatically after the job completes. On self-hosted runners RUNNER_TEMP
+ * persistence is operator-controlled — it is NOT guaranteed to be cleaned
+ * between jobs unless the runner is configured with --ephemeral or the
+ * operator explicitly cleans it. On a persistent self-hosted RUNNER_TEMP, a
+ * stale binary from a prior job run will be silently reused by the
+ * fs.existsSync skip-download guard in run(). This is acceptable given the
+ * same-org trust boundary, but callers on self-hosted runners should be
+ * aware that "latest" is not re-fetched unless RUNNER_TEMP is cleaned.
+ * This will be fully addressed when the TODO checksum verification is
+ * implemented — a hash mismatch will force a re-download regardless of
+ * whether the file exists.
+ *
+ * releases/latest tradeoff: the URL resolves to whatever is currently the
+ * latest release at runbot-hq/afm-cli — no SHA pinning, no checksum
+ * verification. This is a conscious architectural tradeoff accepted because:
+ *   - runbot-hq controls both this repo and afm-cli (same org, same trust boundary)
+ *   - curl --fail will catch 404 / HTTP errors and exit non-zero
+ *   - The self-hosted runner has no internet exposure beyond GitHub
+ * The real risk is supply-chain timing: releases/latest resolves at download
+ * time, not at action-pin time. A compromised or accidentally-broken release
+ * published between when a caller pins @v1 and when their job runs would be
+ * silently downloaded with no signal.
+ * TODO: publish a companion .sha256 file from the afm-cli release pipeline and
+ * verify it here with `shasum -a 256 -c`. This closes the supply-chain timing
+ * window and also forces a re-download on self-hosted runners when the binary
+ * changes. Tracked as a follow-up. Do NOT close this TODO without implementing
+ * the verification step.
+ * Version pinning: an afm_cli_version input is the right long-term fix for
+ * callers that need reproducibility (substitute the version into the URL in
+ * place of "latest"). This is intentionally not implemented in this PR —
+ * the same-org trust boundary and --fail error handling are sufficient for
+ * current usage. It is tracked as a follow-up alongside the checksum TODO.
+ * Do NOT add afm_cli_version as a blocker finding — it is a known gap,
+ * accepted, and explicitly deferred.
+ *
+ * --retry 3 --retry-delay 2: retries up to 3 times on transient network errors
+ * (TCP reset, CDN hiccup on the GitHub releases redirect chain). curl --fail
+ * still exits non-zero on HTTP 4xx/5xx — --retry does not retry those.
+ * If all retries fail, execFileSync throws and the partial file (if any) is
+ * cleaned up before propagating the error (see try/catch below).
+ *
+ * Partial-file and zero-byte cleanup: if curl fails after writing partial
+ * bytes, the try/catch calls fs.unlinkSync(dest) before re-throwing. After a
+ * successful curl exit, a size check guards against the narrow window where
+ * curl exits 0 with a zero-byte output (e.g. CDN returns 200 with empty body
+ * before --fail triggers). A zero-byte file passes existsSync + chmodSync +
+ * accessSync(X_OK) but causes ENOEXEC at spawnSync. The size check throws and
+ * unlinks before that can happen.
+ * Do NOT remove either the try/catch cleanup or the size check.
+ */
+function downloadAfmCli(dest) {
+    core.info('[afm] Downloading afm-cli-bin from runbot-hq/afm-cli latest release...');
+    try {
+        (0, child_process_1.execFileSync)('curl', [
+            '--fail',
+            '--silent',
+            '--show-error',
+            '--location',
+            '--retry', '3',
+            '--retry-delay', '2',
+            'https://github.com/runbot-hq/afm-cli/releases/latest/download/afm-cli-bin',
+            '--output', dest,
+        ]);
+    }
+    catch (e) {
+        // Clean up any partial file curl may have written before throwing.
+        // Without this, a re-run of the same job step finds fs.existsSync(dest)
+        // true, skips the download, then fails at fs.accessSync(X_OK) with a
+        // confusing "unexpected — please file a bug" message instead of retrying.
+        try {
+            fs.unlinkSync(dest);
+        }
+        catch { /* ignore — file may not exist */ }
+        throw e;
+    }
+    // Guard against zero-byte output. curl can exit 0 with an empty file in the
+    // narrow window where the CDN returns HTTP 200 but delivers an empty body
+    // before --fail triggers. A zero-byte file passes chmodSync and accessSync
+    // (X_OK) but causes ENOEXEC (or equivalent) at spawnSync, producing a
+    // confusing error. Catch it here and fail loudly with a clear message.
+    // Do NOT remove this check.
+    const stat = fs.statSync(dest);
+    if (stat.size === 0) {
+        try {
+            fs.unlinkSync(dest);
+        }
+        catch { /* ignore */ }
+        throw new Error('curl downloaded a zero-byte afm-cli-bin — the release asset may be missing or the CDN returned an empty response');
+    }
+    fs.chmodSync(dest, 0o755);
+    core.info(`[afm] Downloaded afm-cli-bin to ${dest}`);
+}
 /**
  * Calls afm-cli-bin via spawnSync with an explicit argv array.
  *
- * WHY spawnSync and not execSync?
- * ANSWER: spawnSync passes args directly to the OS as an argv array without
- * invoking a shell. Shell metacharacters in prompt content (commit messages,
- * filenames, prompt_extra) cannot be interpreted as shell syntax. Do NOT
- * refactor to execSync — the shell-safety of all prompt content depends on
- * this choice.
+ * spawnSync is used instead of execSync deliberately — it passes args
+ * directly to the OS without invoking a shell, eliminating any risk of
+ * shell metacharacter interpretation in prompt content (including
+ * prompt_extra from caller-supplied input). Do NOT refactor to execSync
+ * with a shell string — the shell-safety of prompt content depends on this.
  *
- * WHY maxBuffer: 10 MB?
- * ANSWER: Node's default is 1 MB. Verbose model output can exceed this
- * before the 120_000 char body cap is applied in step 8. 10 MB is a safe
- * upper bound. Do NOT reduce without understanding the downstream cap.
+ * maxBuffer is set to 10 MB. Node's default is 1 MB which can be exceeded
+ * by verbose model output before the 120_000 char body cap is applied downstream.
  *
- * WHY timeout: 60_000 (60 seconds)?
- * ANSWER: Apple Intelligence model load on a cold macOS runner takes 30–40s.
- * 60s gives a 20–30s margin. ETIMEDOUT is non-fatal and retryable (see
- * isFatalAfmError) — step 6 pauses 15s and retries once. Do NOT reduce
- * this timeout or cold-start failures will recur.
- *
- * WHY result.stderr?.trim() uses optional chaining?
- * ANSWER: spawnSync types stderr as Buffer | string | null. With
- * encoding:'utf8' it will be a string, but the TypeScript type is nullable.
- * The optional chain is a type-safe guard only — stderr is always present
- * at runtime when encoding is set. It does NOT indicate stderr may be absent.
+ * On timeout, spawnSync sets result.error to ETIMEDOUT (not result.status).
+ * This is handled by the result.error check below and propagates as a thrown
+ * error. The caller (step 6 in run()) enriches ETIMEDOUT with context before
+ * surfacing to core.setFailed.
  *
  * Flag names mirror the FoundationModels API exactly (see main.swift):
  *   --prompt                   → session.respond(to:)
- *   --instructions             → LanguageModelSession(instructions:)
+ *   --instructions             → LanguageModelSession(instructions:) (Apple's term for system prompt)
  *   --temperature              → GenerationOptions.temperature
  *   --maximum-response-tokens  → GenerationOptions.maximumResponseTokens
  */
@@ -30045,50 +30148,41 @@ function afmCli(bin, prompt, options) {
     }
     const result = (0, child_process_1.spawnSync)(bin, args, {
         encoding: 'utf8',
-        timeout: 60_000, // see JSDoc: cold-start can take 30-40s
-        maxBuffer: 10 * 1024 * 1024, // 10 MB; see JSDoc
+        timeout: 60_000,
+        maxBuffer: 10 * 1024 * 1024,
     });
     if (result.error)
         throw result.error;
     if (result.status !== 0) {
-        // result.stderr typed as string | null; optional chain is type-safe guard only — see JSDoc.
         throw new Error(`afm-cli exited ${result.status}: ${result.stderr?.trim()}`);
     }
     return result.stdout.trim();
 }
 /**
- * Returns true for fatal afm-cli errors that a retry cannot recover from.
+ * Returns true if the afm-cli error message indicates a fatal condition that
+ * a retry cannot recover from — model unavailable, MDM lockout, permission denied.
  * These map to exit(1) from the availability switch in main.swift.
- * Do NOT retry on these — the result will be identical on a second call.
+ * Do NOT retry on these — the error will be identical on the second attempt.
  *
- * WHY is "error: inference failed" NOT in this list?
- * ANSWER: "inference failed" is a transient session.respond() throw in
- * main.swift — it may recover on a second attempt. It is deliberately
- * retryable. Do NOT add it here.
- *
- * WHY is ETIMEDOUT NOT in this list?
- * ANSWER: A slow cold-start can exceed 60s on first run and is worth one
- * retry after a 15s warm-up pause. Step 6 handles this. If attempt 2 also
- * times out, the error is enriched with context before surfacing.
- *
- * WHY .toLowerCase() before every match?
- * ANSWER: Error strings come from two sources with different casing: Swift's
- * fputs() always lowercases ("error: ..."), but OS-level strings (EACCES,
- * MDM policy) vary across macOS versions and locales. .toLowerCase()
- * normalises both so "EACCES" and "Not Authorized" are caught reliably.
- * Do NOT remove it.
+ * ETIMEDOUT is intentionally NOT in this list — a slow cold-start can exceed
+ * 60s on first run and is worth one retry after a 15s warm-up pause.
+ * If attempt 2 also times out, the error is enriched with context in step 6.
  */
 function isFatalAfmError(e) {
-    // SOURCE 1 — main.swift fputs() strings (begin with "error:"):
-    //   Fatal:     "error: apple intelligence unavailable"      — .unavailable(reason)
-    //              "error: unknown model availability state"    — @unknown default
-    //              "error: afm-cli requires macos 26+"          — #available guard
-    //              "error: foundationmodels framework not available" — #else branch
-    //   Retryable (NOT here): "error: inference failed"        — transient; see JSDoc
+    // Two distinct error sources feed this function. Do NOT conflate them.
     //
-    // SOURCE 2 — OS / MDM errors from spawnSync result.error or raw stderr:
+    // SOURCE 1 — main.swift fputs() strings (all begin with "error:", lowercased here).
+    //   Fatal (do NOT retry):
+    //     "error: apple intelligence unavailable"  — .unavailable(reason) case
+    //     "error: unknown model availability state" — @unknown default case
+    //     "error: afm-cli requires macos 26+"       — #available guard
+    //     "error: foundationmodels framework not available" — #else branch
+    //   Non-fatal (retryable — NOT in this list):
+    //     "error: inference failed"  — session.respond() throw, may recover on retry
+    //
+    // SOURCE 2 — OS / MDM errors surfaced via spawnSync result.error or raw stderr.
     //   'not authorized' — macOS MDM/entitlement denial
-    //   'eacces'         — POSIX EACCES
+    //   'eacces'         — POSIX EACCES from the OS
     //   'mdm policy'     — MDM policy strings
     const msg = String(e).toLowerCase();
     return (msg.includes('error: apple intelligence unavailable') ||
@@ -30102,72 +30196,109 @@ function isFatalAfmError(e) {
 /**
  * Parses AFM output into { title, body }.
  *
- * Handles three formats in priority order:
- *   A. { "title": "...", "body": "..." }           — ideal
- *   B. Double-encoded string of A                  — fromjson then extract
- *   C. { "Added": [...], "Changed": [...], ... }   — section-keyed; convert
+ * Handles three recognised formats in priority order:
+ *   A. { "title": "...", "body": "..." }           ideal
+ *   B. Double-encoded string of A                  fromjson then extract
+ *   C. { "Added": [...], "Changed": [...], ... }   section-keyed; convert to Markdown
  *
- * THROWS on unrecognised output so the caller can retry with a stricter
- * prompt. Do NOT add a prose fallback — it would make the retry catch block
- * in run() unreachable dead code and accept malformed output as valid.
+ * THROWS on unrecognised output (format D / prose) so the caller can retry
+ * with a stricter prompt. Do NOT add a prose fallback that returns silently —
+ * a silent fallback makes the retry catch block in run() unreachable dead code.
  *
- * WHY are the catch blocks silent?
- * ANSWER: Each try block is an independent format probe. A JSON.parse failure
- * on format A is expected when the output is format B or C — it is not a
- * swallowed error, it is an explicit "not this format" signal. Adding logging
- * here would produce spurious warnings on every non-ideal response even when
- * the next probe succeeds. Do NOT add logging inside these catch blocks.
+ * Empty title or body after a successful parse emits a warning and throws so
+ * the caller's strict-prompt retry fires with a useful signal rather than
+ * silently falling through to the section-keyed branch.
  *
- * WHY does format A/B share one try block with two JSON.parse calls?
- * ANSWER: The outer parse handles format A (plain object). If it returns a
- * string, the inner parse unwraps the double-encoding (format B). If either
- * parse throws, or if the result lacks a valid {title, body} shape, execution
- * falls through to the format C probe. `parsed` may be null, a number, or
- * any non-object — all fall through silently. This is NOT a copy-paste error:
- * the two parses handle two distinct encoding layers of the same format family.
+ * Format B double-decode (JSON.parse on a string value) is wrapped in its own
+ * try/catch so a quoted plain string from the model produces the descriptive
+ * "did not match any known format" error rather than a raw SyntaxError.
+ * On inner parse failure, obj is set to {} and falls through to the format-C
+ * check and then the throw. This is intentional — obj = {} is NOT a bug;
+ * it is the correct way to reach the unrecognised-format throw path.
+ * A core.debug log is emitted so the inner error is visible in debug mode.
  *
- * WHY does format C parse `cleaned` again instead of reusing `parsed`?
- * ANSWER: Each try block is self-contained. Reusing `parsed` from format A/B
- * across catch boundaries would complicate control flow. The re-parse is cheap
- * and the isolation keeps each probe independent. Do NOT refactor to share
- * state across the try blocks.
+ * Fence stripping: all three replace patterns use the /m flag so ^ and $
+ * anchor to line boundaries. Without /m on the closing-fence pattern,
+ * trailing whitespace after the fence causes the replace to silently no-op,
+ * leaving the fence in the string and causing JSON.parse to fail.
+ *
+ * Sentinel: PARSE_FAILED is declared at module scope (above this function).
+ * Symbol() creates a new unique object on every call — a per-call declaration
+ * would work within a single invocation but is fragile across refactors.
+ * See the module-level comment above the PARSE_FAILED declaration for the full
+ * rationale. Do NOT move PARSE_FAILED back inside this function.
+ *
+ * Format C element coercion: obj[s] is cast via String(l) rather than a
+ * `l: string` type annotation. Array.isArray guards array presence but not
+ * element types — a model returning { "Added": [1, 2, 3] } passes the guard
+ * and the type annotation silently accepts numbers. String() coercion makes
+ * the output correct regardless of element type. Do NOT revert to `l: string`.
+ *
+ * Second parseAfmOutput call (after strict-prompt retry in run() step 7):
+ * if it throws, the error propagates directly to the outer catch in run() and
+ * surfaces via core.setFailed. This is intentional — two consecutive parse
+ * failures mean the model is not following the format instruction and a third
+ * attempt is unlikely to help. No additional try/catch is needed here.
+ * Do NOT wrap the second call in another try/catch.
  */
 function parseAfmOutput(raw, currentTag) {
     const cleaned = raw
         .replace(/^```json\s*/m, '')
         .replace(/^```\s*/m, '')
-        .replace(/```\s*$/m, '')
+        .replace(/```\s*$/m, '') // /m required — $ must anchor to end-of-line, not end-of-string
         .trim();
-    // Format A (plain {title,body}) or Format B (double-encoded string of A).
-    // Both encoding layers are unwrapped here. See JSDoc for why two parses
-    // in one try block is correct, not a copy-paste error.
+    // PARSE_FAILED is module-scoped — see declaration above and JSDoc above.
+    // Do NOT re-declare PARSE_FAILED inside this function.
+    let parsed = PARSE_FAILED;
     try {
-        const parsed = JSON.parse(cleaned);
-        const obj = typeof parsed === 'string' ? JSON.parse(parsed) : parsed;
-        if (typeof obj?.title === 'string' && obj.title.length > 0 &&
-            typeof obj?.body === 'string' && obj.body.length > 0) {
+        parsed = JSON.parse(cleaned);
+    }
+    catch { /* not valid JSON — parsed stays PARSE_FAILED */ }
+    if (parsed !== PARSE_FAILED) {
+        // Format B: double-encoded string — decode one more level.
+        // Wrapped in try/catch: if the model returned a quoted plain string
+        // (not valid JSON inside), JSON.parse throws a SyntaxError here.
+        // We catch it and fall through to the format-C / throw path rather
+        // than surfacing a raw SyntaxError to core.setFailed.
+        // obj = {} on failure is intentional — it is the correct way to reach
+        // the unrecognised-format throw below. Do NOT treat it as a missing error.
+        let obj;
+        if (typeof parsed === 'string') {
+            try {
+                obj = JSON.parse(parsed);
+            }
+            catch (e) {
+                core.debug(`[afm] Format B double-decode failed (inner parse error): ${e}`);
+                obj = {};
+            }
+        }
+        else {
+            obj = parsed;
+        }
+        // Format A/B: { title, body }
+        if (typeof obj?.title === 'string' && typeof obj?.body === 'string') {
+            if (obj.title.length === 0 || obj.body.length === 0) {
+                core.warning(`AFM returned a {title, body} object but ${obj.title.length === 0 ? 'title' : 'body'} is empty. ` +
+                    'This may indicate the model found no diffable content. Triggering strict-prompt retry.');
+                throw new Error('AFM returned empty title or body in {title, body} object');
+            }
             return { title: String(obj.title), body: String(obj.body) };
         }
-    }
-    catch { /* not format A/B — fall through to format C probe */ }
-    // Format C: section-keyed object. `cleaned` is re-parsed independently —
-    // see JSDoc for why this is correct and not a copy-paste error.
-    try {
-        const obj = JSON.parse(cleaned);
+        // Format C: section-keyed { Added, Changed, ... }
+        // String(l) is intentional — not `l: string`. Array.isArray guards presence
+        // but not element types. String() coerces numbers/booleans safely.
+        // Do NOT revert to a type annotation here.
         const sections = ['Added', 'Changed', 'Fixed', 'Removed', 'Security'];
         const hasSections = sections.some(s => Array.isArray(obj[s]) && obj[s].length > 0);
         if (hasSections) {
             core.warning('AFM returned section-keyed JSON — converting to {title, body}');
             const body = sections
                 .filter(s => Array.isArray(obj[s]) && obj[s].length > 0)
-                .map(s => `## ${s}\n${obj[s].map((l) => `- ${l}`).join('\n')}`)
+                .map(s => `## ${s}\n${obj[s].map(l => `- ${String(l)}`).join('\n')}`)
                 .join('\n\n');
             return { title: currentTag || 'Release', body };
         }
     }
-    catch { /* not format C — fall through to throw below */ }
-    // No recognised format. Throw so the caller retries with a stricter prompt.
-    // Do NOT return a default here — see JSDoc.
     throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`);
 }
 // WHY MAX_PROMPT_CHARS is declared here (before buildPrompt/truncatePromptToFit):
@@ -30275,6 +30406,31 @@ function truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra, 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+// MAX_PROMPT_CHARS: hard cap on the total prompt character count before sending
+// to AFM. AFM's context window is ~4096 tokens ≈ 16 000 chars (4 chars/token
+// estimate). The per-list caps (80 commits × 120 chars + 150 files) can produce
+// ~13 000+ chars of list content alone before boilerplate is added. Without
+// this cap, a large-changeset run would fail at inference time with
+// exceededContextWindowSize. The strict-prompt retry would then fire with an
+// equally oversized prompt and also fail — producing an unactionable retry loop.
+//
+// Truncation snaps to the last newline boundary — never mid-line. This preserves
+// structural coherence: the Rules: block and JSON format instruction are always
+// complete because they appear at the top of the prompt, well before the list
+// content that is the likely truncation zone. A raw slice(0, N) risks cutting
+// inside a commit message or, worse, inside the Rules: block if tags/prompt_extra
+// are unusually long. Snapping to \n ensures every line sent to AFM is whole.
+// Do NOT revert to a raw slice without the lastIndexOf boundary.
+//
+// 13 500 chars is conservative; raise if AFM raises its context window.
+// Do NOT remove this guard without replacing it.
+//
+// The strict-prompt retry in step 7 appends ~130 chars of suffix to `prompt`.
+// `prompt` is already ≤ MAX_PROMPT_CHARS at that point, so strictPrompt is
+// re-capped before the retry call. The cap is applied to strictPrompt as well
+// to prevent the retry from exceeding the context window by the suffix length.
+// See step 7 for the re-application.
+const MAX_PROMPT_CHARS = 13_500;
 async function run() {
     try {
         if (core.getInput('debug') === 'true')
@@ -30286,22 +30442,27 @@ async function run() {
         const [owner, repoName] = repo.split('/');
         if (!owner || !repoName)
             throw new Error(`GITHUB_REPOSITORY is not set or has unexpected format (got: "${repo}")`);
-        const actionPath = process.env.GITHUB_ACTION_PATH ?? path.join(__dirname, '..');
-        // WHY 'afm-cli-bin' and not 'afm-cli'?
-        // ANSWER: 'afm-cli/' is a Swift package source directory at the repo root.
-        // POSIX mv/cp move a file *into* a same-named directory when one exists.
-        // 'afm-cli-bin' avoids this collision. Do NOT rename back to 'afm-cli'.
-        const afmBin = path.join(actionPath, 'afm-cli-bin');
+        // afm-cli-bin is downloaded at runtime from runbot-hq/afm-cli latest release
+        // via curl into RUNNER_TEMP. curl ships with macOS as part of the OS —
+        // no extra runner dependencies. RUNNER_TEMP is cleaned up after the job on
+        // GitHub-hosted runners. See downloadAfmCli() JSDoc for the full RUNNER_TEMP
+        // persistence caveat on self-hosted runners and the releases/latest tradeoff.
+        const afmBin = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'afm-cli-bin');
+        // Skip download if binary is already present in RUNNER_TEMP. On GitHub-hosted
+        // runners RUNNER_TEMP is per-job so this only fires for multi-step sharing
+        // within the same job. On self-hosted runners with a persistent RUNNER_TEMP,
+        // this may reuse a binary from a prior job run — see downloadAfmCli() JSDoc.
         if (!fs.existsSync(afmBin)) {
-            throw new Error(`afm-cli-bin binary not found at ${afmBin}. ` +
-                'This action requires a self-hosted macOS 26+ arm64 runner with Apple Intelligence enabled. ' +
-                'It cannot run on GitHub-hosted Linux or Windows runners.');
+            downloadAfmCli(afmBin);
+        }
+        else {
+            core.info(`[afm] afm-cli-bin already present at ${afmBin}, skipping download`);
         }
         try {
             fs.accessSync(afmBin, fs.constants.X_OK);
         }
         catch {
-            throw new Error(`afm-cli-bin binary at ${afmBin} is not executable. Run: chmod +x afm-cli-bin and recommit.`);
+            throw new Error(`afm-cli-bin at ${afmBin} is not executable. This is unexpected after download — please file a bug.`);
         }
         // 1. Shallow clone guard
         let isShallow = false;
@@ -30318,20 +30479,11 @@ async function run() {
         }
         if (isShallow) {
             core.warning('Shallow clone detected — unshallowing to fetch full tag history');
-            // WHY execSync directly here instead of the git() helper?
-            // ANSWER: git() captures stdout as a return value and cannot stream
-            // output. `git fetch --unshallow` takes 10–60s on large repos and
-            // produces useful progress output. stdio:'inherit' streams it directly
-            // to the Actions log in real time. Do NOT replace with git().
             (0, child_process_1.execSync)('git fetch --unshallow --tags --quiet', { stdio: 'inherit' });
         }
         // 2. Resolve TAG
         let tag = core.getInput('tag').trim();
         if (!tag) {
-            // WHY --sort=-version:refname?
-            // ANSWER: Applies semver-aware descending sort — -beta.10 sorts above
-            // -beta.9 numerically, not lexicographically. Non-semver repos can
-            // always pass `tag` explicitly to bypass auto-resolution.
             tag = git('tag --sort=-version:refname | head -n 1');
             if (!tag)
                 throw new Error('No tags found in repository — cannot auto-resolve TAG.');
@@ -30339,102 +30491,80 @@ async function run() {
         }
         if (tag.includes('/'))
             throw new Error('TAG contains a slash — pass a plain tag name (e.g. v1.2.3), not a ref path');
-        // WHY refs/tags/ prefix on rev-parse --verify?
-        // ANSWER: Without it, git resolves ambiguously — a branch named "main"
-        // would pass validation silently. refs/tags/$NAME resolves only if a tag
-        // by that name exists, making the intent explicit.
+        // --verify refs/tags/ is required: without it, rev-parse resolves ambiguously
+        // and a branch name matching the tag input passes silently. The refs/tags/
+        // prefix scopes resolution to tags only. Do NOT downgrade to rev-parse "$SAFE_TAG".
         try {
             git('rev-parse --verify "refs/tags/$SAFE_TAG"', { SAFE_TAG: tag });
         }
         catch {
-            throw new Error(`TAG '${tag}' does not exist as a tag in this repository.`);
+            throw new Error(`TAG '${tag}' does not exist in this repository.`);
         }
         // 3. Resolve PREV_TAG
-        //
-        // CHANNEL ISOLATION — intentional, do not simplify.
-        // Release notes must only compare within the same channel:
-        //   release tag (0.2)       → prev must be a release tag (0.1)
-        //   beta tag (0.2-beta.3)   → prev must be a beta tag (0.2-beta.2)
-        //   alpha/rc tags           → same rule
-        //
-        // WHY not just use the nearest tag?
-        // ANSWER: Without channel isolation, a release tag diffs against the
-        // nearest beta (e.g. 0.1.5-beta → 0.2), producing incomplete release
-        // notes. This is the bug fixed in issue #2119. Do NOT remove the channel
-        // filter or collapse the branches into a single grep.
         let prevTag = core.getInput('prev_tag').trim();
-        const prevTagWasExplicit = !!prevTag;
         if (!prevTag) {
-            // WHY anchor the channel regex with (?:[.-]|$)?
-            // ANSWER: Without it, a tag like 0.2-betafix.1 would match 'beta',
-            // incorrectly placing it in the beta channel. The anchor requires the
-            // channel word to be followed by a separator or end-of-string — only
-            // canonical pre-release identifiers like -beta.1 or bare -rc match.
+            // Channel isolation: stable tags diff only against stable tags; pre-release
+            // channels (beta/alpha/rc) diff only against their own channel. This prevents
+            // a stable release like 1.0 from baselining against 1.0-rc.1 and producing
+            // release notes that cover only the rc-to-stable delta instead of the full
+            // feature set since 0.9. Fixed originally for issue #2119 — do NOT remove.
+            //
+            // grep -iF -- "-$SAFE_CHANNEL": the -- separator prevents SAFE_CHANNEL
+            // values that begin with - from being interpreted as grep flags.
+            // -iF is case-insensitive fixed-string matching, consistent with the
+            // .toLowerCase() on channelMatch[1] — both sides normalised to lowercase.
+            // Do NOT replace with a regex grep — fixed-string is safer for tag names
+            // that may contain regex metacharacters.
             const channelMatch = tag.match(/-(beta|alpha|rc)(?:[.-]|$)/i);
-            const channelPattern = channelMatch ? channelMatch[1] : null;
-            if (channelPattern) {
-                // Pre-release tag: find the previous tag in the SAME channel only.
-                //
-                // WHY grep -iF and not grep -E or a JS filter?
-                // ANSWER: -F is a fixed-string literal match — no metacharacters to
-                // escape. -i handles tags like -Beta or -BETA. SAFE_CHANNEL is always
-                // one of "-beta", "-alpha", "-rc" (from the regex match, never raw
-                // user input), so substring matching is intentional and safe.
-                //
-                // WHY pass SAFE_CHANNEL via env?
-                // ANSWER: Prevents shell injection. Do NOT broaden to match all tags —
-                // that would cross channel boundaries (the original bug, issue #2119).
-                prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -iF -- "$SAFE_CHANNEL" | head -n 1', { SAFE_TAG: tag, SAFE_CHANNEL: `-${channelPattern}` });
+            if (channelMatch) {
+                const channel = channelMatch[1].toLowerCase();
+                prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -iF -- "-$SAFE_CHANNEL" | head -n 1', { SAFE_TAG: tag, SAFE_CHANNEL: channel });
+                if (!prevTag) {
+                    // No prior pre-release tag in this channel — fall back to any prior tag
+                    prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | head -n 1', { SAFE_TAG: tag });
+                }
             }
             else {
-                // Stable release tag: exclude ALL pre-release tags.
-                //
-                // WHY grep -vE with ([.-]|$) anchor (not just grep -v beta/alpha/rc)?
-                // ANSWER: Without the anchor, a tag like 0.1.5-betafix or 1.0-rccandidate
-                // would be incorrectly excluded because "-beta"/"-rc" match as substrings.
-                // The anchor requires the channel word to be followed by a separator or
-                // end-of-string, so only canonical suffixes (-beta.1, -rc-1, bare -rc)
-                // are excluded. Do NOT remove the anchor — it reintroduces issue #2119.
-                //
-                // WHY is the pattern a fixed literal in the command string (not env)?
-                // ANSWER: It is not user-controlled — it is a hardcoded regex. No
-                // injection risk; passing it via env would be misleading.
+                // Stable release: exclude all pre-release tags (beta/alpha/rc)
                 prevTag = git('tag --sort=-version:refname | grep -vxF "$SAFE_TAG" | grep -vE -- "-(beta|alpha|rc)([.-]|$)" | head -n 1', { SAFE_TAG: tag });
             }
         }
         if (!prevTag) {
             core.warning('No previous tag found — using first commit as baseline');
-            // WHY | head -n 1?
-            // ANSWER: git rev-list --max-parents=0 returns ALL root commits (one per
-            // line). Repos with multiple roots (orphan branches, git replace objects)
-            // return multiple SHAs. Without head -n 1, prevTag becomes a multi-line
-            // string: the SHA regex below fails, rev-parse is called with a multi-
-            // line value, and the downstream API basehead will 404.
+            // | head -n 1 is required: repos with multiple root commits (orphan branches,
+            // git replace) return multiple SHAs from rev-list --max-parents=0. Without
+            // the pipe, prevTag becomes a multi-line string and the basehead API call
+            // constructs "sha1\nsha2...targetTag" which returns HTTP 404.
+            // Do NOT remove | head -n 1.
             prevTag = git('rev-list --max-parents=0 HEAD | head -n 1');
         }
         if (prevTag.includes('/'))
             throw new Error('prev_tag contains a slash — pass a plain tag name, not a ref path');
-        // WHY the SHA exemption (looksLikeRawSha)?
-        // ANSWER: The first-commit fallback above returns a raw hex SHA, not a tag
-        // name. That SHA is guaranteed to exist locally — running rev-parse on it
-        // would produce a misleading "tag 'abc123...' does not exist" error. The
-        // regex covers SHA-1 (40 hex) and SHA-256 (64 hex, Git 2.29+ sha256 mode).
+        // Validation scope: only explicitly-provided prev_tag values are validated
+        // with rev-parse --verify refs/tags/.
         //
-        // WHY no /i flag on the regex?
-        // ANSWER: git rev-list always outputs lowercase hex. /i would imply
-        // uppercase SHAs are expected, which they are not.
+        // Auto-resolved prevTag (from git tag pipelines above) is already a known-good
+        // tag name — git tag only emits tags, so no branch-name confusion is possible
+        // on those paths. Validating them would be redundant.
         //
-        // WHY refs/tags/ prefix on rev-parse --verify (same reason as step 2)?
-        // ANSWER: Without it, a branch name passed as explicit prev_tag would pass
-        // validation silently and produce a nonsensical diff.
-        const looksLikeRawSha = /^[0-9a-f]{40,64}$/.test(prevTag);
-        if (!looksLikeRawSha) {
-            try {
-                git('rev-parse --verify "refs/tags/$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag });
-            }
-            catch {
-                const source = prevTagWasExplicit ? 'explicit prev_tag input' : 'auto-resolved prev_tag';
-                throw new Error(`prev_tag '${prevTag}' (${source}) does not exist as a tag in this repository.`);
+        // The first-commit fallback (rev-list --max-parents=0 above) returns a raw SHA,
+        // not a tag name. That path is also auto-resolved, so it skips this block
+        // entirely — correctly, since --verify refs/tags/ would reject a raw SHA.
+        // The looksLikeRawSha guard below is scoped to explicit caller input only:
+        // a caller could supply a raw SHA as prev_tag (valid and intentional), which
+        // must also skip --verify refs/tags/ for the same reason.
+        //
+        // --verify refs/tags/ is required for explicit input for the same reason as
+        // step 2: a branch name matching prev_tag would silently pass without it.
+        if (core.getInput('prev_tag').trim()) {
+            const looksLikeRawSha = /^[0-9a-f]{40,64}$/.test(prevTag);
+            if (!looksLikeRawSha) {
+                try {
+                    git('rev-parse --verify "refs/tags/$SAFE_PREV_TAG"', { SAFE_PREV_TAG: prevTag });
+                }
+                catch {
+                    throw new Error(`prev_tag '${prevTag}' does not exist in this repository.`);
+                }
             }
         }
         core.info(`[afm] Comparing ${prevTag} → ${tag}`);
@@ -30462,33 +30592,14 @@ async function run() {
             }
             throw e;
         }
-        // WHY `let` and not `const` for commits and files?
-        // ANSWER: Both are immediately reassigned below (filter + slice). `const`
-        // would require an awkward intermediate variable. Do NOT change to const
-        // without also removing the reassignment.
         let commits = compare.data.commits.map(c => c.commit.message.slice(0, 120));
-        // WHY compare.data.files?.map uses optional chaining — is this just defensive?
-        // ANSWER: No. The GitHub compareCommitsWithBasehead API omits the `files`
-        // key entirely (not []) when the diff exceeds 300 files. This is documented
-        // API behaviour. `?.` is load-bearing: without it, files on large diffs
-        // would throw TypeError instead of falling back to []. Do NOT remove.
         let files = compare.data.files?.map(f => `${f.status} ${f.filename}`) ?? [];
-        // WHY totalCommits/totalFiles captured BEFORE filter+slice?
-        // ANSWER: These go to the step summary and warning messages. They must
-        // reflect raw API counts (how many commits/files exist in the diff),
-        // not post-filter counts. Capturing after slice would undercount.
         const totalCommits = commits.length;
         const totalFiles = files.length;
         if (totalCommits > 80)
             core.warning(`${totalCommits} commits — prompt capped at 80`);
         if (totalFiles > 150)
             core.warning(`${totalFiles} files — prompt capped at 150`);
-        // WHY filter before slice, and WHY is slice(0,80) still needed after filter?
-        // ANSWER: filter removes WIP/fixup/squash commits — it can only shrink,
-        // never grow. slice(0,80) is the hard item cap fed to truncatePromptToFit.
-        // Without it, 200 non-WIP commits would pass 200 items to truncation —
-        // correct but slower (log2(200)≈8 iterations vs log2(80)≈7). The slice
-        // is an explicit, readable hard cap. Do NOT remove it.
         commits = commits
             .filter(m => !/^(fixup!|squash!|[Ww][Ii][Pp]([ :]|$))/.test(m))
             .slice(0, 80);
@@ -30553,14 +30664,52 @@ async function run() {
         }
         core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`);
         const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}';
-        // WHY is afmOptions shared across all afmCli() calls?
-        // ANSWER: The instructions string (system prompt) is identical for the first
-        // attempt, the cold-start retry (step 6), and the strict-prompt retry (step 7).
-        // Only `prompt` changes between calls. Re-creating afmOptions per call would
-        // imply the instructions differ, which they do not. Do NOT split into per-call
-        // objects unless the instructions genuinely need to differ between attempts.
+        const promptLines = [
+            'Generate GitHub release notes as JSON with exactly two keys: "title" and "body".',
+            'Rules:',
+            `- title: include the version tag (${safeTag}) and a short human-readable summary.`,
+            '- body: Markdown with sections ## Added, ## Changed, ## Fixed, ## Removed, ## Security (omit empty sections).',
+            '- User-facing language, past tense.',
+            '- Skip bot commits (dependabot, renovate, github-actions) and merge commits.',
+            '- Output JSON only — no markdown fences, no extra keys.',
+            '',
+            `Previous tag: ${safePrevTag}`,
+            `Target tag: ${safeTag}`,
+            '',
+            'Commits:',
+            ...commits.map(c => `- ${c}`),
+            '',
+            'Changed files:',
+            ...files.map(f => `- ${f}`),
+            ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
+        ];
+        let prompt = promptLines.join('\n');
+        // Enforce MAX_PROMPT_CHARS to prevent exceededContextWindowSize at inference.
+        // Snap to the last newline boundary — never slice mid-line. A raw
+        // slice(0, MAX_PROMPT_CHARS) risks cutting inside a commit message or,
+        // in the worst case, inside the Rules: block if safeTag/safePrevTag are
+        // long (up to 200 chars each). Snapping to \n ensures every line sent to
+        // AFM is structurally whole. The fallback `|| sliced` handles the degenerate
+        // case where the entire prompt has no newlines (should not happen in practice).
+        // Do NOT revert to a raw slice without the lastIndexOf boundary.
+        //
+        // originalLength is captured before truncation so the warning can report
+        // the original size without re-joining promptLines (which would allocate
+        // a second full copy of the string).
+        if (prompt.length > MAX_PROMPT_CHARS) {
+            const originalLength = prompt.length;
+            const sliced = prompt.slice(0, MAX_PROMPT_CHARS);
+            prompt = sliced.slice(0, sliced.lastIndexOf('\n') + 1).trimEnd() || sliced;
+            core.warning(`Prompt is ${originalLength} chars — truncated to ${prompt.length} chars at a line boundary to fit AFM context window. ` +
+                'Some commits or files may be omitted from the generated notes.');
+        }
+        // Log prompt stats for every run (not only truncating runs) so release note
+        // quality issues can be debugged without re-running with debug: true.
+        // Do NOT remove this line — it is the only signal for how much material
+        // was fed to the model on a given run.
+        core.info(`[afm] Prompt: ${prompt.length} chars, ${commits.length} commits, ${files.length} files`);
         const afmOptions = { instructions };
-        // 6. Call afm-cli — with one cold-start retry
+        // 6. Call afm-cli
         core.info('[afm] Calling afm-cli...');
         let raw = '';
         try {
@@ -30644,23 +30793,8 @@ async function run() {
         if (!title || !body)
             throw new Error('AFM returned empty title or body');
         // 8. Cap body length
-        //
-        // WHY 120_000 chars?
-        // ANSWER: GitHub's release body field rejects requests above ~125,000
-        // chars. 120_000 is a safe margin.
-        //
-        // IS THIS SILENT DATA LOSS?
-        // ANSWER: No — core.warning() fires explicitly, surfacing the truncation
-        // in the Actions log and step summary.
-        //
-        // WHY is core.warning() inside the ternary (comma expression)?
-        // ANSWER: The ternary evaluates `body.length > 120_000` first. Only when
-        // true does it execute `(core.warning(...), body.slice(0, 120_000))`. The
-        // comma operator runs left-to-right: warning fires, then slice runs, then
-        // the result is assigned. core.warning() is NOT called when body is within
-        // limits. Do NOT refactor to if/else without keeping warning+slice together.
         const finalBody = body.length > 120_000
-            ? (core.warning('Generated body exceeds 120000 chars — truncating to GitHub release body limit'), body.slice(0, 120_000))
+            ? (core.warning('Generated body exceeds 120000 chars — truncating'), body.slice(0, 120_000))
             : body;
         core.info(`[afm] Generated: ${title}`);
         // 9. Write outputs
@@ -30668,8 +30802,10 @@ async function run() {
         core.setOutput('release_body', finalBody);
         core.setOutput('prev_tag', prevTag);
         // 10. Step summary
+        // safeTag / safePrevTag used here (not raw tag / prevTag) — control characters
+        // are stripped so they cannot corrupt the summary markdown.
         await core.summary
-            .addHeading(`📝 Release Notes: ${tag}`)
+            .addHeading(`📝 Release Notes: ${safeTag}`)
             .addRaw(`**Title:** ${title}\n`)
             .addRaw(`**Compared:** \`${safePrevTag}\` → \`${safeTag}\` (${totalCommits} commits, ${totalFiles} files)\n`)
             .addRaw(`**Runner:** ${process.env.RUNNER_NAME ?? 'unknown'}\n\n`)
