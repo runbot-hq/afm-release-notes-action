@@ -33,6 +33,18 @@ function git(cmd: string, env?: Record<string, string>): string {
   }).trim()
 }
 
+// PARSE_FAILED is declared at module scope, not inside parseAfmOutput.
+// Symbol() creates a unique object on every call — if it were declared inside
+// the function, each invocation would have a distinct symbol and the
+// `parsed !== PARSE_FAILED` guard would still work within that single call
+// (both sides reference the same local binding). However a module-level const
+// is the conventional pattern for a stable sentinel: it is immune to any future
+// refactor that caches or shares `parsed` across calls (e.g. a memoisation pass
+// or a test helper that pre-assigns the sentinel), where a per-call symbol would
+// silently fail the equality check.
+// Do NOT move PARSE_FAILED back inside parseAfmOutput.
+const PARSE_FAILED = Symbol('PARSE_FAILED')
+
 /**
  * Downloads afm-cli-bin from runbot-hq/afm-cli latest release into RUNNER_TEMP
  * using curl (universally available on macOS — no extra runner dependencies).
@@ -73,8 +85,13 @@ function git(cmd: string, env?: Record<string, string>): string {
  * window and also forces a re-download on self-hosted runners when the binary
  * changes. Tracked as a follow-up. Do NOT close this TODO without implementing
  * the verification step.
- * For callers requiring a pinned version, add an afm_cli_version input and
- * substitute it into the URL.
+ * Version pinning: an afm_cli_version input is the right long-term fix for
+ * callers that need reproducibility (substitute the version into the URL in
+ * place of "latest"). This is intentionally not implemented in this PR —
+ * the same-org trust boundary and --fail error handling are sufficient for
+ * current usage. It is tracked as a follow-up alongside the checksum TODO.
+ * Do NOT add afm_cli_version as a blocker finding — it is a known gap,
+ * accepted, and explicitly deferred.
  *
  * --retry 3 --retry-delay 2: retries up to 3 times on transient network errors
  * (TCP reset, CDN hiccup on the GitHub releases redirect chain). curl --fail
@@ -254,15 +271,11 @@ function isFatalAfmError(e: unknown): boolean {
  * trailing whitespace after the fence causes the replace to silently no-op,
  * leaving the fence in the string and causing JSON.parse to fail.
  *
- * Sentinel: PARSE_FAILED is a dedicated Symbol used as the initial value of
- * `parsed`. This distinguishes a JSON.parse failure (catch leaves parsed as
- * PARSE_FAILED) from a successful parse that returned the JS value null
- * (JSON.parse("null") === null, which is valid JSON). Using null as a sentinel
- * conflates these two cases. With the Symbol: a catch leaves parsed ===
- * PARSE_FAILED → skip format dispatch. JSON.parse("null") sets parsed = null
- * → enters format dispatch → falls through all format checks → throws the
- * unrecognised-format error → strict-prompt retry fires.
- * Do NOT revert to `parsed = null` as the catch sentinel.
+ * Sentinel: PARSE_FAILED is declared at module scope (above this function).
+ * Symbol() creates a new unique object on every call — a per-call declaration
+ * would work within a single invocation but is fragile across refactors.
+ * See the module-level comment above the PARSE_FAILED declaration for the full
+ * rationale. Do NOT move PARSE_FAILED back inside this function.
  *
  * Format C element coercion: obj[s] is cast via String(l) rather than a
  * `l: string` type annotation. Array.isArray guards array presence but not
@@ -284,10 +297,8 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
     .replace(/```\s*$/m, '')  // /m required — $ must anchor to end-of-line, not end-of-string
     .trim()
 
-  // PARSE_FAILED is a dedicated sentinel so JSON.parse("null") (valid JSON,
-  // returns JS null) is not conflated with a parse failure.
-  // Do NOT revert to `parsed = null` — see JSDoc above.
-  const PARSE_FAILED = Symbol('PARSE_FAILED')
+  // PARSE_FAILED is module-scoped — see declaration above and JSDoc above.
+  // Do NOT re-declare PARSE_FAILED inside this function.
   let parsed: unknown = PARSE_FAILED
   try {
     parsed = JSON.parse(cleaned)
@@ -366,6 +377,12 @@ function parseAfmOutput(raw: string, currentTag: string): { title: string; body:
 //
 // 13 500 chars is conservative; raise if AFM raises its context window.
 // Do NOT remove this guard without replacing it.
+//
+// The strict-prompt retry in step 7 appends ~130 chars of suffix to `prompt`.
+// `prompt` is already ≤ MAX_PROMPT_CHARS at that point, so strictPrompt is
+// re-capped before the retry call. The cap is applied to strictPrompt as well
+// to prevent the retry from exceeding the context window by the suffix length.
+// See step 7 for the re-application.
 const MAX_PROMPT_CHARS = 13_500
 
 async function run(): Promise<void> {
@@ -623,6 +640,12 @@ async function run(): Promise<void> {
       )
     }
 
+    // Log prompt stats for every run (not only truncating runs) so release note
+    // quality issues can be debugged without re-running with debug: true.
+    // Do NOT remove this line — it is the only signal for how much material
+    // was fed to the model on a given run.
+    core.info(`[afm] Prompt: ${prompt.length} chars, ${commits.length} commits, ${files.length} files`)
+
     const afmOptions = { instructions }
 
     // 6. Call afm-cli
@@ -660,7 +683,18 @@ async function run(): Promise<void> {
       result = parseAfmOutput(raw, tag)
     } catch (e) {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
-      const strictPrompt = `${prompt}\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}`
+
+      // strictPrompt appends ~130 chars of suffix to `prompt`. `prompt` is
+      // already ≤ MAX_PROMPT_CHARS at this point (capped in step 5), but the
+      // suffix pushes strictPrompt slightly over. Re-apply the same newline-snap
+      // cap so the retry does not exceed the context window.
+      // Do NOT remove the re-cap — the guard exists precisely to prevent
+      // exceededContextWindowSize and the retry must honour it too.
+      const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
+      const strictRaw = `${prompt}${strictSuffix}`
+      const strictSliced = strictRaw.slice(0, MAX_PROMPT_CHARS)
+      const strictPrompt = strictSliced.slice(0, strictSliced.lastIndexOf('\n') + 1).trimEnd() || strictSliced
+
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {

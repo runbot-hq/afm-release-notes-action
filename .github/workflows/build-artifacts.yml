@@ -86,6 +86,15 @@ jobs:
           # entry between STASH_BEFORE and STASH_AFTER. On self-hosted runners
           # that reuse a workspace, jobs should be serialized at the concurrency:
           # group level — not patched here.
+          #
+          # Post-pop push failure: if git push fails after stash pop (e.g. a third
+          # concurrent build beat this one to the rebase window), the step exits
+          # non-zero and the job fails with an actionable error. The stash entry
+          # was already popped so the build output is in the workspace; the next
+          # triggered run will recommit it. This is acceptable — the failure is
+          # visible, not silent. A concurrency: group on the workflow would
+          # serialize builds and eliminate the race entirely; not added here as
+          # the current cadence makes concurrent source pushes rare in practice.
           STASH_BEFORE=$(git stash list | head -n1)
           git stash --include-untracked
           STASH_AFTER=$(git stash list | head -n1)
