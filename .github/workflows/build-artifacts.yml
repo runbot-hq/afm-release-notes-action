@@ -44,15 +44,12 @@ jobs:
 
       - name: Build dist/index.js
         run: |
-          # npm ci is used here (not npm install) so the committed dist/ is
-          # always built from exactly the deps in package-lock.json. npm install
-          # can silently mutate the lockfile on the runner, meaning a dep with a
-          # loose semver range that gets a patch bump would produce a dist/ built
-          # from different transitive deps than what package-lock.json prescribes.
-          # check-artifacts.yml also uses npm ci — both must agree or the
-          # staleness check produces false positives.
-          # Do NOT revert to npm install.
-          npm ci
+          # npm install is used here — NOT npm ci — because this repository
+          # does not commit a lockfile (package-lock.json is .gitignored).
+          # npm ci requires a committed lockfile and exits non-zero without one,
+          # which would prevent dist/ from ever being rebuilt or committed.
+          # Do NOT change to npm ci unless a lockfile is committed to the repo.
+          npm install
           npm run build
 
       - name: Commit artifacts if changed
@@ -69,7 +66,7 @@ jobs:
           # race to rebase/push, hard-failing the second push.
           #
           # --include-untracked: stashes untracked files alongside tracked changes.
-          # Without this, git stash only stashes tracked modifications. If npm ci
+          # Without this, git stash only stashes tracked modifications. If npm install
           # left any untracked files in the workspace (e.g. a fresh node_modules entry
           # not covered by .gitignore), git pull --rebase would refuse to proceed if
           # the rebase would overwrite them. --include-untracked closes this gap.
