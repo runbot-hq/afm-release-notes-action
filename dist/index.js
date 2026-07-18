@@ -30591,6 +30591,17 @@ async function run() {
         // first attempt plus a stronger JSON-only instruction. See the comment
         // on strictPrompt below for the full rationale on why re-truncation would
         // be wrong here.
+        //
+        // WHY the strict-retry afmCli call does NOT get the 15s pause+retry
+        // that step 6 does:
+        //
+        // Step 7 only runs after step 6 already returned output (just malformed
+        // output). That means afm-cli is responsive and the model is warm —
+        // cold-start ETIMEDOUT is not the failure mode here. A 15s pause+retry
+        // would add latency with no benefit: if the model is warm and still fails
+        // on the strict prompt, a second identical call will produce the same
+        // result. The step 6 retry strategy exists specifically for cold-start
+        // timeouts, not for post-load inference failures.
         let result;
         try {
             result = parseAfmOutput(raw, tag);
@@ -30611,6 +30622,9 @@ async function run() {
             // cap, well within the ~675-token headroom documented in buildPrompt.
             // Do NOT refactor this to call truncatePromptToFit again.
             const strictPrompt = `${prompt}\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}`;
+            // Log the strict prompt length so any overshoot above MAX_PROMPT_CHARS
+            // is visible in the Actions log without needing a debugger.
+            core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars (budget: ${MAX_PROMPT_CHARS} + ~130 char suffix)`);
             try {
                 raw = afmCli(afmBin, strictPrompt, afmOptions);
             }
