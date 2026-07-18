@@ -30085,6 +30085,14 @@ function afmCli(bin, prompt, options) {
  * ETIMEDOUT is intentionally NOT in this list — a slow cold-start can exceed
  * 60s on first run and is worth one retry after a 15s warm-up pause.
  * If attempt 2 also times out, the error is enriched with context in step 6.
+ *
+ * WHY .toLowerCase() before every match:
+ *
+ * Error strings come from two sources with potentially different casing:
+ * Swift's fputs() always lowercases ("error: ..."), but OS-level error
+ * strings (EACCES, MDM policy messages) vary across macOS versions and
+ * locales. .toLowerCase() normalises both before matching so a string
+ * like "EACCES" or "Not Authorized" is caught reliably. Do NOT remove it.
  */
 function isFatalAfmError(e) {
     // Two distinct error sources feed this function. Do NOT conflate them.
@@ -30132,6 +30140,27 @@ function isFatalAfmError(e) {
  * signals. If no format matches, the function throws at the bottom.
  * Do NOT add logging inside these catch blocks — every non-ideal response
  * would produce spurious warnings even when the next probe succeeds.
+ *
+ * WHY format A/B shares one try block with two JSON.parse calls:
+ *
+ * The outer JSON.parse handles format A (plain object) and format B
+ * (double-encoded: a JSON string whose value is another JSON object).
+ * If the outer parse returns a string, the inner parse unwraps it — this
+ * is the double-decode path. If either parse throws, or if the result is
+ * not a valid {title, body} object, execution falls through to the format C
+ * probe below. `parsed` can be null (valid JSON), an object, a number,
+ * etc. — all non-conforming values fall through silently via the catch.
+ * This is not a copy-paste error — the two parses handle two distinct
+ * encoding layers of the same format family.
+ *
+ * WHY format C parses `cleaned` again instead of reusing `parsed`:
+ *
+ * Each try block is a self-contained probe. Reusing `parsed` from the
+ * format A/B block would require it to be in scope across catch boundaries,
+ * which would complicate the control flow and make the probe structure
+ * less readable. The double parse is cheap (cleaned is already a string)
+ * and the isolation keeps each probe independent. Do NOT refactor to share
+ * state across the try blocks.
  */
 function parseAfmOutput(raw, currentTag) {
     const cleaned = raw
@@ -30301,6 +30330,14 @@ async function run() {
         }
         if (isShallow) {
             core.warning('Shallow clone detected — unshallowing to fetch full tag history');
+            // WHY execSync directly here and not the git() helper:
+            //
+            // git() captures stdout as a return value (encoding:'utf8') and cannot
+            // stream output to the runner log. `git fetch --unshallow` can take
+            // 10-60s on large repos and produces progress output that is useful
+            // for debugging stuck runs. stdio:'inherit' passes that output directly
+            // to the Actions log in real time. Do NOT replace with git() — the
+            // live progress output would be lost.
             (0, child_process_1.execSync)('git fetch --unshallow --tags --quiet', { stdio: 'inherit' });
         }
         // 2. Resolve TAG
@@ -30528,6 +30565,18 @@ async function run() {
         //    150 files) are not sufficient on their own — a release with many long
         //    commit messages or filenames can still exceed the limit.
         const promptExtra = core.getInput('prompt_extra').slice(0, 300);
+        // WHY promptExtra does NOT get the \x00-\x1f\x7f control-char strip
+        // that safeTag/safePrevTag receive below:
+        //
+        // safeTag/safePrevTag are embedded into the prompt template string via
+        // template literals, so control characters could corrupt the prompt
+        // structure. promptExtra is appended as a labelled block at the end of
+        // the prompt — control chars in it are cosmetically undesirable but
+        // structurally harmless. More importantly, promptExtra is passed to
+        // afmCli() via spawnSync argv (not a shell), so no shell expansion or
+        // injection is possible regardless of content. The 300-char slice is
+        // the only guard needed. The strip is intentionally absent — do NOT
+        // add it for cosmetic consistency without understanding this distinction.
         const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         // truncatePromptToFit is called ONCE here in step 5. It is NOT called
@@ -30655,6 +30704,16 @@ async function run() {
         // surfaces the truncation in the Actions step log and the step summary.
         // The model is also instructed to omit empty sections, so output this large
         // only occurs with extremely large changesets that would be unreadable anyway.
+        //
+        // WHY core.warning() is inside the ternary condition (comma expression):
+        //
+        // The ternary evaluates `body.length > 120_000` first. Only when true does
+        // it execute the right-hand side: `(core.warning(...), body.slice(0, 120_000))`.
+        // The comma operator evaluates left-to-right — warning fires, then slice
+        // runs, then the slice result is assigned to finalBody. core.warning() is
+        // NOT called when body is within limits. This is intentional style to keep
+        // the cap and its notification co-located on one line. Do NOT refactor to
+        // an if/else block unless you also keep the warning and slice together.
         const finalBody = body.length > 120_000
             ? (core.warning('Generated body exceeds 120000 chars — truncating to GitHub release body limit'), body.slice(0, 120_000))
             : body;
