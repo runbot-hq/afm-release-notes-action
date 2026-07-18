@@ -41,10 +41,15 @@ jobs:
         with:
           ref: main
 
-      - name: Verify dist/index.js is committed
+      - name: Verify dist/ artifacts are committed
         run: |
+          # ncc emits dist/index.js AND dist/sourcemap-register.js as a required
+          # pair. index.js requires sourcemap-register.js at line 1 — if either
+          # file is missing the action crashes at runtime with MODULE_NOT_FOUND.
+          # Both files must be checked here. Do NOT reduce this to index.js only.
           missing=()
-          [ -f dist/index.js ] || missing+=("dist/index.js")
+          [ -f dist/index.js ]              || missing+=("dist/index.js")
+          [ -f dist/sourcemap-register.js ] || missing+=("dist/sourcemap-register.js")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing committed artifacts: ${missing[*]}"
             exit 1

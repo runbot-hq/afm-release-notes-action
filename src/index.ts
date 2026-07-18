@@ -55,26 +55,39 @@ function git(cmd: string, env?: Record<string, string>): string {
  *   - curl --fail will catch 404 / HTTP errors and exit non-zero
  *   - The self-hosted runner has no internet exposure beyond GitHub
  * For callers requiring a pinned version, add an afm_cli_version input and
- * substitute it into the URL. Do NOT add checksum verification without also
- * publishing a companion .sha256 file from the afm-cli release pipeline.
+ * substitute it into the URL.
+ * TODO: publish a companion .sha256 file from the afm-cli release pipeline and
+ * verify it here with shasum -a 256 -c. This closes the supply-chain timing
+ * window where a compromised or broken release published after a caller pins
+ * @v1 would be silently downloaded on the next run. Tracked as a follow-up.
  *
  * --retry 3 --retry-delay 2: retries up to 3 times on transient network errors
  * (TCP reset, CDN hiccup on the GitHub releases redirect chain). curl --fail
  * still exits non-zero on HTTP 4xx/5xx — --retry does not retry those.
- * If all retries fail, execFileSync throws and propagates to core.setFailed.
+ * If all retries fail, execFileSync throws and the partial file (if any) is
+ * cleaned up by the caller before propagating the error.
  */
 function downloadAfmCli(dest: string): void {
   core.info('[afm] Downloading afm-cli-bin from runbot-hq/afm-cli latest release...')
-  execFileSync('curl', [
-    '--fail',
-    '--silent',
-    '--show-error',
-    '--location',
-    '--retry', '3',
-    '--retry-delay', '2',
-    'https://github.com/runbot-hq/afm-cli/releases/latest/download/afm-cli-bin',
-    '--output', dest,
-  ])
+  try {
+    execFileSync('curl', [
+      '--fail',
+      '--silent',
+      '--show-error',
+      '--location',
+      '--retry', '3',
+      '--retry-delay', '2',
+      'https://github.com/runbot-hq/afm-cli/releases/latest/download/afm-cli-bin',
+      '--output', dest,
+    ])
+  } catch (e) {
+    // Clean up any partial file curl may have written before throwing.
+    // Without this, a re-run of the same job step finds fs.existsSync(dest)
+    // true, skips the download, then fails at fs.accessSync(X_OK) with a
+    // confusing "unexpected — please file a bug" message instead of retrying.
+    try { fs.unlinkSync(dest) } catch { /* ignore — file may not exist */ }
+    throw e
+  }
   fs.chmodSync(dest, 0o755)
   core.info(`[afm] Downloaded afm-cli-bin to ${dest}`)
 }
@@ -573,6 +586,10 @@ async function run(): Promise<void> {
           'consider increasing the timeout or pre-warming the runner.'
         )
       }
+      // If parseAfmOutput throws here, the error propagates to the outer catch
+      // and surfaces via core.setFailed. This is intentional — two consecutive
+      // parse failures indicate the model is not following the format instruction
+      // and a third attempt is unlikely to succeed.
       result = parseAfmOutput(raw, tag)
     }
 
