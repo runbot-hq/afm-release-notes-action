@@ -30530,6 +30530,17 @@ async function run() {
         // the char count AFM sees, keeping the charBudget math exact. Adding emoji
         // or non-ASCII here would silently miscalculate headroom. (~130 chars)
         const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}';
+        // WHY this guard exists:
+        // String.prototype.length counts UTF-16 code units, not bytes or tokens.
+        // For pure ASCII the count equals what AFM sees, so the charBudget
+        // subtraction (MAX_PROMPT_CHARS - strictSuffix.length) is exact.
+        // A non-ASCII edit (emoji, arrow, curly quote) would silently make
+        // .length smaller than the actual encoded size, underestimating headroom.
+        // This throws at action startup — long before any AFM call — so the
+        // miscalculation is caught in CI rather than corrupting a live release.
+        if (!/^[\x00-\x7f]*$/.test(strictSuffix)) {
+            throw new Error('Internal error: strictSuffix contains non-ASCII characters — charBudget calculation would be incorrect. Keep strictSuffix pure ASCII.');
+        }
         // usedCommits/usedFiles: post-truncation lists, used ONLY for the warning
         // and core.info lines immediately below.
         // They are NOT referenced again after this block — not in step 6, not in
