@@ -22,11 +22,11 @@
 # false-negative staleness diffs. Node 24 matches the runner image at time of
 # writing. Update .node-version when the runner image upgrades its Node major.
 #
-# npm install is used here — NOT npm ci — because this repository does not
-# commit a lockfile (package-lock.json is .gitignored). npm ci requires a
-# committed lockfile and exits non-zero without one, breaking the staleness
-# check before npm run build can run.
-# Do NOT change to npm ci unless a lockfile is committed to the repo.
+# npm ci is used here — NOT npm install — because this is a staleness check.
+# npm install silently resolves different transitive dep versions if the
+# lockfile is out of date, which would build against different deps than what
+# is committed and produce false-negative or false-positive diffs.
+# npm ci installs exactly what is in package-lock.json. Do NOT revert to npm install.
 name: Check committed artifacts
 
 on:
@@ -90,12 +90,12 @@ jobs:
 
       - name: Rebuild dist/ and check for drift
         run: |
-          # npm install is used here — NOT npm ci — because this repository
-          # does not commit a lockfile (package-lock.json is .gitignored).
-          # npm ci requires a committed lockfile and exits non-zero without one,
-          # which would prevent the staleness diff from ever running.
-          # Do NOT change to npm ci unless a lockfile is committed to the repo.
-          npm install
+          # npm ci is used here — NOT npm install — this is a staleness check.
+          # npm install silently updates package-lock.json and resolves against
+          # different transitive dep versions, producing false diffs.
+          # npm ci installs exactly what is in the committed package-lock.json.
+          # Do NOT revert to npm install.
+          npm ci
           npm run build
           if ! git diff --exit-code dist/; then
             echo "::error::dist/ is stale — push a commit that includes the rebuilt dist/."
