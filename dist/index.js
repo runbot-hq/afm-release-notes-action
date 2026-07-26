@@ -30026,6 +30026,13 @@ const PARSE_FAILED = Symbol('PARSE_FAILED');
  * Auth token is passed to the GitHub API call (releases/latest) but NOT to
  * httpsDownload — browser_download_url for public releases redirects to an
  * unauthenticated CDN URL; sending a Bearer token there causes HTTP 400.
+ *
+ * Atomicity: the binary is downloaded to a per-process temp path
+ * (binPath + '.tmp.' + process.pid) and renamed into place only after
+ * sha256 verification (when a digest is present). rename(2) is atomic on
+ * APFS/HFS+ — concurrent parallel jobs on the same runner cannot interleave
+ * byte writes into the shared binPath. The temp file is cleaned up in a
+ * finally block regardless of success or failure.
  */
 async function ensureBinary(token) {
     const cacheDir = path.join(os.homedir(), '.cache', 'runbot-hq');
@@ -30071,38 +30078,55 @@ async function ensureBinary(token) {
         core.info(`[afm] No cached binary — downloading for the first time`);
     }
     fs.mkdirSync(cacheDir, { recursive: true });
-    core.info(`[afm] Downloading ${asset.browser_download_url} ...`);
-    const downloadStart = Date.now();
-    await httpsDownload(asset.browser_download_url, binPath);
-    const downloadMs = Date.now() - downloadStart;
-    const binSize = fs.statSync(binPath).size;
-    core.info(`[afm] Download complete in ${downloadMs}ms (${binSize} bytes)`);
-    // Guard against zero-byte downloads. A CDN can return HTTP 200 with an
-    // empty body in the narrow window before --fail would trigger. A zero-byte
-    // file passes chmodSync and accessSync(X_OK) but causes ENOEXEC at
-    // spawnSync, producing a confusing error. Catch it here and fail loudly.
-    // The digest sidecar is not written on this path so the next run will
-    // re-download cleanly. Do NOT remove this check.
-    if (binSize === 0) {
-        fs.unlinkSync(binPath);
-        throw new Error('Downloaded afm-cli-bin is zero bytes — CDN may have returned an empty 200 response. Retry the workflow.');
-    }
-    if (remoteDigest && remoteDigest.startsWith('sha256:')) {
-        const expectedHex = remoteDigest.slice('sha256:'.length);
-        core.info(`[afm] Verifying sha256...`);
-        const actualHex = sha256File(binPath);
-        if (actualHex !== expectedHex) {
-            fs.unlinkSync(binPath);
-            throw new Error(`afm-cli-bin digest mismatch — expected sha256:${expectedHex}, got sha256:${actualHex}. ` +
-                'The downloaded binary may be corrupted. Retry the workflow.');
+    // Download to a per-process temp path, then atomically rename into binPath.
+    // This prevents concurrent parallel jobs on the same runner from interleaving
+    // byte writes — two jobs can both download simultaneously but rename(2) is
+    // atomic on APFS/HFS+, so the last writer wins with a complete binary.
+    // The temp file is cleaned up in the finally block regardless of outcome.
+    const tmpPath = `${binPath}.tmp.${process.pid}`;
+    try {
+        core.info(`[afm] Downloading ${asset.browser_download_url} ...`);
+        const downloadStart = Date.now();
+        await httpsDownload(asset.browser_download_url, tmpPath);
+        const downloadMs = Date.now() - downloadStart;
+        const binSize = fs.statSync(tmpPath).size;
+        core.info(`[afm] Download complete in ${downloadMs}ms (${binSize} bytes)`);
+        // Guard against zero-byte downloads. A CDN can return HTTP 200 with an
+        // empty body in the narrow window before --fail would trigger. A zero-byte
+        // file passes chmodSync and accessSync(X_OK) but causes ENOEXEC at
+        // spawnSync, producing a confusing error. Catch it here and fail loudly.
+        // The digest sidecar is not written on this path so the next run will
+        // re-download cleanly. Do NOT remove this check.
+        if (binSize === 0) {
+            throw new Error('Downloaded afm-cli-bin is zero bytes — CDN may have returned an empty 200 response. Retry the workflow.');
         }
-        core.info(`[afm] Digest verified ✔ sha256:${actualHex}`);
+        if (remoteDigest && remoteDigest.startsWith('sha256:')) {
+            const expectedHex = remoteDigest.slice('sha256:'.length);
+            core.info(`[afm] Verifying sha256...`);
+            const actualHex = sha256File(tmpPath);
+            if (actualHex !== expectedHex) {
+                throw new Error(`afm-cli-bin digest mismatch — expected sha256:${expectedHex}, got sha256:${actualHex}. ` +
+                    'The downloaded binary may be corrupted. Retry the workflow.');
+            }
+            core.info(`[afm] Digest verified ✔ sha256:${actualHex}`);
+        }
+        else {
+            core.info(`[afm] No sha256 digest to verify — skipping integrity check`);
+        }
+        fs.chmodSync(tmpPath, 0o755);
+        // Atomic rename: replaces binPath in a single syscall on APFS/HFS+.
+        // Any concurrent job that already renamed its own tmp wins or loses cleanly —
+        // both outcomes leave a valid, complete binary at binPath.
+        fs.renameSync(tmpPath, binPath);
+        fs.writeFileSync(digestPath, cacheKey, 'utf8');
     }
-    else {
-        core.info(`[afm] No sha256 digest to verify — skipping integrity check`);
+    finally {
+        // Clean up the temp file if it still exists (download failed, verify threw, etc.).
+        try {
+            fs.unlinkSync(tmpPath);
+        }
+        catch { /* already renamed or never created */ }
     }
-    fs.chmodSync(binPath, 0o755);
-    fs.writeFileSync(digestPath, cacheKey, 'utf8');
     core.info(`[afm] Binary ready at ${binPath}`);
     return binPath;
 }
@@ -30118,6 +30142,10 @@ function httpsGetJson(url, token, redirectsLeft = 5) {
             if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 if (redirectsLeft <= 0)
                     return reject(new Error(`Too many redirects fetching ${url}`));
+                // res.resume() drains and releases the socket back to the connection pool.
+                // Without this, the unconsumed readable stream holds the socket open until
+                // the server closes it or the connection times out. Do NOT remove.
+                res.resume();
                 resolve(httpsGetJson(res.headers.location, token, redirectsLeft - 1));
                 return;
             }
@@ -30150,6 +30178,10 @@ function httpsDownload(url, destPath, redirectsLeft = 5) {
             if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
                 if (redirectsLeft <= 0)
                     return reject(new Error(`Too many redirects downloading ${url}`));
+                // res.resume() drains and releases the socket back to the connection pool.
+                // Without this, the unconsumed readable stream holds the socket open until
+                // the server closes it or the connection times out. Do NOT remove.
+                res.resume();
                 resolve(httpsDownload(res.headers.location, destPath, redirectsLeft - 1));
                 return;
             }
@@ -30500,7 +30532,10 @@ async function run() {
             fs.accessSync(afmBin, fs.constants.X_OK);
         }
         catch {
-            throw new Error(`afm-cli-bin at ${afmBin} is not executable. This is unexpected — please file a bug.`);
+            throw new Error(`afm-cli-bin at ${afmBin} is not executable. ` +
+                'This can happen if a filesystem remount, backup restore, or another tool stripped the executable bit. ' +
+                'Delete the cached binary to force a re-download: ' +
+                `rm -f ${afmBin} ${afmBin}.digest`);
         }
         // 1. Shallow clone guard
         let isShallow = false;
