@@ -79,8 +79,12 @@ async function ensureBinary(token: string): Promise<string> {
   core.info(`[afm] Checking latest runbot-hq/afm-cli release...`)
 
   const release = await httpsGetJson('https://api.github.com/repos/runbot-hq/afm-cli/releases/latest', token)
-  const tagName = release.tag_name as string ?? 'unknown'
-  const publishedAt = release.published_at as string ?? ''
+  // String() coercion is intentional — `as string` cast is evaluated before ??
+  // and would lie to the type system if the value is undefined (cast succeeds
+  // at the type level but the runtime value is still undefined, so ?? fires
+  // correctly by accident). String(value ?? fallback) is honest and explicit.
+  const tagName = String(release.tag_name ?? 'unknown')
+  const publishedAt = String(release.published_at ?? '')
   core.info(`[afm] Latest release tag: ${tagName} published_at: ${publishedAt}`)
 
   const asset = (release.assets as Array<{ name: string; browser_download_url: string; digest?: string; updated_at?: string }>)
@@ -123,6 +127,17 @@ async function ensureBinary(token: string): Promise<string> {
   const downloadMs = Date.now() - downloadStart
   const binSize = fs.statSync(binPath).size
   core.info(`[afm] Download complete in ${downloadMs}ms (${binSize} bytes)`)
+
+  // Guard against zero-byte downloads. A CDN can return HTTP 200 with an
+  // empty body in the narrow window before --fail would trigger. A zero-byte
+  // file passes chmodSync and accessSync(X_OK) but causes ENOEXEC at
+  // spawnSync, producing a confusing error. Catch it here and fail loudly.
+  // The digest sidecar is not written on this path so the next run will
+  // re-download cleanly. Do NOT remove this check.
+  if (binSize === 0) {
+    fs.unlinkSync(binPath)
+    throw new Error('Downloaded afm-cli-bin is zero bytes — CDN may have returned an empty 200 response. Retry the workflow.')
+  }
 
   if (remoteDigest && remoteDigest.startsWith('sha256:')) {
     const expectedHex = remoteDigest.slice('sha256:'.length)
@@ -191,7 +206,13 @@ function httpsDownload(url: string, destPath: string, redirectsLeft = 5): Promis
       file.on('finish', () => file.close(() => resolve()))
       file.on('error', (e) => { fs.unlink(destPath, () => {}); reject(e) })
     })
-    req.on('error', reject)
+    // Unlink destPath on TCP/DNS failure before a response is received.
+    // Without this, a failed connection can leave an empty or partial file
+    // on disk. The digest sidecar won't exist so the next run will re-download,
+    // but createWriteStream would truncate the stale file anyway — the real
+    // risk is a lingering zero-byte file if the stream was never opened.
+    // Mirrors the file.on('error') cleanup above. Do NOT remove.
+    req.on('error', (e) => { fs.unlink(destPath, () => {}); reject(e) })
   })
 }
 
