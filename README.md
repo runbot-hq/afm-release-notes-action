@@ -161,7 +161,15 @@ jobs:
 
 ## Rebuilding Artifacts
 
-`dist/index.js` is a committed build artifact, automatically rebuilt by `.github/workflows/build-artifacts.yml` on every push to `main`. To rebuild manually:
+`dist/index.js` is a committed build artifact, automatically rebuilt by `.github/workflows/build-artifacts.yml` on every push to any branch that touches `src/**`, `package.json`, or `tsconfig.json`. The workflow commits the rebuilt `dist/` back to the same branch automatically — usually within a minute of a push.
+
+> **For PR reviewers:** `dist/index.js` may appear out of sync with `src/index.ts` immediately
+> after a source commit. This is expected — `build-artifacts.yml` commits the rebuilt `dist/`
+> back to the branch automatically on every `src/**` push. `check-artifacts.yml` then verifies
+> the committed `dist/` matches a clean rebuild before the PR can merge, so the dist is
+> always correct at merge time. You do not need to rebuild or commit `dist/` manually.
+
+To rebuild manually (e.g. for local testing):
 
 ```bash
 # TypeScript bundle
