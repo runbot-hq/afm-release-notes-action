@@ -30809,6 +30809,8 @@ async function run() {
                 // throw and surface via core.setFailed with the overflow detail.
                 core.warning(`[afm] Attempt 1 — context window overflow (${String(e).slice(0, 120)}). Re-truncating to 75% and retrying immediately...`);
                 const overflowBudget = Math.floor(prompt.length * 0.75);
+                // usedCommits/usedFiles intentionally — already-capped by step 5; passing
+                // the original lists would re-expand the prompt past overflowBudget.
                 const { prompt: smallerPrompt } = truncatePromptToFit(safeTag, safePrevTag, usedCommits, usedFiles, promptExtra, overflowBudget);
                 core.info(`[afm] Overflow-retry prompt: ${smallerPrompt.length} chars (budget: ${overflowBudget})`);
                 try {
@@ -30823,6 +30825,10 @@ async function run() {
             }
             else {
                 // Cold-start / transient error — wait 15s and retry with the original prompt.
+                // Canary: if the error string mentions context/token/window but isContextOverflowError
+                // did not match, the Apple enum may have been renamed — update isContextOverflowError
+                // and see runbot-hq/afm-cli#2 for structured exit code tracking.
+                core.debug(`[afm] Cold-start branch — error did not match isContextOverflowError: ${String(e).slice(0, 200)}`);
                 core.info('[afm] Attempt 1 failed — retrying in 15s (cold-start model load)...');
                 await new Promise(r => setTimeout(r, 15_000));
                 try {
