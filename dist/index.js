@@ -30303,6 +30303,14 @@ function isFatalAfmError(e) {
  * with the same prompt will always fail. The caller must reduce the prompt
  * before retrying. Do NOT add this string to isFatalAfmError: it IS
  * recoverable, just not via a simple pause-and-retry.
+ *
+ * 'exceededcontextwindowsize' is an Apple-internal Swift error enum identifier
+ * (LanguageModelError.exceededContextWindowSize), not a documented stable API
+ * string. It was observed in runbot-hq/run-bot#2351. If Apple renames the enum
+ * case in a future OS release, this match silently stops firing and overflows
+ * fall through to the cold-start branch — adding a useless 15s wait. If that
+ * regression occurs, search the runner's afm-cli stderr for the new error string
+ * and update this match. Structured exit codes are tracked at runbot-hq/afm-cli#2.
  */
 function isContextOverflowError(e) {
     return String(e).toLowerCase().includes('exceededcontextwindowsize');
