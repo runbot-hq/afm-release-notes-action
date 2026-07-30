@@ -937,6 +937,14 @@ async function run(): Promise<void> {
 
     core.info(`[afm] Generated: ${title}`)
 
+    // Log release notes output to step log as a collapsible group (mirrors
+    // local-ai-code-review-action PR #24) so raw output is inspectable
+    // directly from the Actions UI without leaving the step log.
+    await core.group('AI Release Notes Output', async () => {
+      core.info(`Title: ${title}`)
+      core.info(`Body:\n${finalBody}`)
+    })
+
     // 9. Write outputs
     core.setOutput('release_title', title)
     core.setOutput('release_body', finalBody)
