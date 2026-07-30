@@ -30298,6 +30298,16 @@ function isFatalAfmError(e) {
         msg.includes('mdm policy'));
 }
 /**
+ * Returns true when the AFM error is a hard context-window overflow
+ * (exceededContextWindowSize). This is a deterministic limit — retrying
+ * with the same prompt will always fail. The caller must reduce the prompt
+ * before retrying. Do NOT add this string to isFatalAfmError: it IS
+ * recoverable, just not via a simple pause-and-retry.
+ */
+function isContextOverflowError(e) {
+    return String(e).toLowerCase().includes('exceededcontextwindowsize');
+}
+/**
  * Parses AFM output into { title, body }.
  *
  * Handles three recognised formats in priority order:
@@ -30415,7 +30425,18 @@ function parseAfmOutput(raw, currentTag) {
 // previous order was safe at runtime. However, declaring the constant after the
 // function that uses it is a readability hazard and a latent footgun if the call
 // site ever moves earlier. Constant declared first, then the functions that use it.
-const MAX_PROMPT_CHARS = 13_500;
+//
+// WHY 12_000 and not 13_500 (the previous value)?
+// The failure in issue #2351 showed 4,091 tokens from 13,500 chars — a real density
+// of ~3.29 chars/token, not the assumed 3–3.5. The instructions string passed to
+// LanguageModelSession(instructions:) also consumes context tokens on top of the
+// prompt. Corrected formula:
+//   4096 - 300 (response headroom) - 60 (instructions) = 3,736 available prompt tokens
+//   3,736 × 3.29 chars/token ≈ 12,292 → rounded down to 12,000
+// At 12,000 chars the same worst-case density produces ~3,647 tokens — 449 tokens
+// of headroom instead of the previous 5. Do NOT raise this without re-measuring
+// real token counts on dense commit logs.
+const MAX_PROMPT_CHARS = 12_000;
 /**
  * Assembles the prompt string from its components.
  *
@@ -30455,12 +30476,14 @@ function buildPrompt(safeTag, safePrevTag, commits, files, promptExtra) {
  * To guarantee the suffix is never truncated, the caller passes
  * MAX_PROMPT_CHARS - strictSuffix.length as the budget. The default
  * (MAX_PROMPT_CHARS) is used for the normal first-attempt call.
+ * The overflow-retry path passes Math.floor(prompt.length * 0.75) so the
+ * re-truncated prompt is guaranteed to be smaller than the overflowing one.
  *
- * WHY 13_500 and not 16_384 (4096 tokens × 4 chars/token)?
+ * WHY 12_000 and not 16_384 (4096 tokens × 4 chars/token)?
  * ANSWER: The 4 chars/token estimate is conservative — real token counts for
- * code/commit messages run 3–3.5 chars/token. 13_500 gives ~720 tokens of
- * headroom for the instructions string (~45 tokens) and the model response
- * (~675 tokens usable). Do NOT raise this without re-measuring real token counts.
+ * code/commit messages run 3–3.5 chars/token. 12_000 gives ~449 tokens of
+ * headroom for the instructions string (~60 tokens) and the model response
+ * (~389 tokens usable). Do NOT raise this without re-measuring real token counts.
  *
  * WHY progressively halve instead of binary-search?
  * ANSWER: The loop runs at most log2(80) ≈ 7 times. Binary search adds
@@ -30497,7 +30520,7 @@ function truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra, 
     // KNOWN RESIDUAL GAP: after dropping, the prompt still contains boilerplate
     // + tags + promptExtra ≈ 1,100 chars worst-case. If charBudget were ever set
     // below ~1,100 the returned prompt would silently exceed it. In practice the
-    // minimum caller budget is MAX_PROMPT_CHARS - strictSuffix.length ≈ 13,368 —
+    // minimum caller budget is MAX_PROMPT_CHARS - strictSuffix.length ≈ 11,868 —
     // far above 1,100 — so this gap is unreachable. Do NOT add a throw: a thin
     // release note is better than a hard job failure.
     if (prompt.length > charBudget) {
@@ -30691,7 +30714,7 @@ async function run() {
         // The per-list caps above (80 commits, 150 files) are not sufficient alone —
         // a release with many long commit messages can still exceed AFM's 4096-token
         // context window. truncatePromptToFit measures the assembled string and halves
-        // lists until it fits MAX_PROMPT_CHARS (13_500).
+        // lists until it fits MAX_PROMPT_CHARS (12_000).
         //
         // WHY promptExtra is also stripped of control chars:
         // ANSWER: safeTag and safePrevTag both apply /[\x00-\x1f\x7f]/g before being
@@ -30739,6 +30762,21 @@ async function run() {
         const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}';
         const afmOptions = { instructions };
         // 6. Call afm-cli
+        //
+        // Two distinct failure modes are handled separately:
+        //
+        // A. exceededContextWindowSize (context overflow) — deterministic: the same
+        //    prompt will always fail regardless of how long we wait. Re-truncate to
+        //    75% of the current prompt length and retry immediately. No pause needed.
+        //    isContextOverflowError() matches this case.
+        //
+        // B. ETIMEDOUT (cold-start) — transient: the model binary is loading and needs
+        //    time. Retry after a 15s warm-up pause. isFatalAfmError() does NOT match
+        //    ETIMEDOUT, so it falls through to the existing cold-start path.
+        //
+        // Do NOT merge these two paths — they require different remediation and a
+        // combined handler would either waste 15s on an overflow or skip the warm-up
+        // needed for a genuine cold-start.
         core.info('[afm] Calling afm-cli...');
         let raw = '';
         try {
@@ -30748,16 +30786,41 @@ async function run() {
             core.debug(`[afm] Attempt 1 error: ${String(e)}`);
             if (isFatalAfmError(e))
                 throw e;
-            core.info('[afm] Attempt 1 failed — retrying in 15s (cold-start model load)...');
-            await new Promise(r => setTimeout(r, 15_000));
-            try {
-                raw = afmCli(afmBin, prompt, afmOptions);
+            if (isContextOverflowError(e)) {
+                // Attempt 1 overflowed the context window. Re-truncate to 75% of the
+                // current prompt length and retry immediately — no pause, this is
+                // deterministic. 75% (not 50%) is intentional: the overflow was marginal
+                // (4,091/4,096 tokens), so a smaller reduction is usually sufficient and
+                // preserves more commit context. If the re-truncated prompt still overflows
+                // (very unusual — would require a further density spike), it will throw
+                // and surface via core.setFailed with the overflow detail.
+                core.warning(`[afm] Attempt 1 — context window overflow (${String(e).slice(0, 120)}). Re-truncating to 75% and retrying immediately...`);
+                const overflowBudget = Math.floor(prompt.length * 0.75);
+                const { prompt: smallerPrompt } = truncatePromptToFit(safeTag, safePrevTag, usedCommits, usedFiles, promptExtra, overflowBudget);
+                core.info(`[afm] Overflow-retry prompt: ${smallerPrompt.length} chars (budget: ${overflowBudget})`);
+                try {
+                    raw = afmCli(afmBin, smallerPrompt, afmOptions);
+                }
+                catch (e2) {
+                    const detail = String(e2);
+                    throw new Error(`[afm] Overflow-retry failed (binary: ${afmBin}): ${detail}. ` +
+                        'The re-truncated prompt still exceeded the context window or hit another error. ' +
+                        'Consider filing an issue with the token count from the original error.');
+                }
             }
-            catch (e2) {
-                const detail = String(e2);
-                throw new Error(`[afm] Attempt 2 failed (binary: ${afmBin}): ${detail}. ` +
-                    'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
-                    'consider increasing the timeout or pre-warming the runner.');
+            else {
+                // Cold-start / transient error — wait 15s and retry with the original prompt.
+                core.info('[afm] Attempt 1 failed — retrying in 15s (cold-start model load)...');
+                await new Promise(r => setTimeout(r, 15_000));
+                try {
+                    raw = afmCli(afmBin, prompt, afmOptions);
+                }
+                catch (e2) {
+                    const detail = String(e2);
+                    throw new Error(`[afm] Attempt 2 failed (binary: ${afmBin}): ${detail}. ` +
+                        'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
+                        'consider increasing the timeout or pre-warming the runner.');
+                }
             }
         }
         if (!raw)
