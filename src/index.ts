@@ -847,10 +847,12 @@ async function run(): Promise<void> {
       throw new Error('Internal error: strictSuffix contains non-ASCII characters — charBudget calculation would be incorrect. Keep strictSuffix pure ASCII.')
     }
 
-    // usedCommits/usedFiles: post-truncation lists, used ONLY for the warning
-    // and core.info lines immediately below.
-    // They are NOT referenced again after this block — not in step 6, not in
-    // step 7. Step 7 operates on `prompt` (a string), not on these arrays.
+    // usedCommits/usedFiles: post-truncation lists retained for use in three places:
+    //   1. The truncation warning and core.info log immediately below.
+    //   2. Step 6's overflow-retry path — passed to truncatePromptToFit with a
+    //      reduced budget so the halving loop can shed additional items.
+    //   3. Step 7's strict-retry path — passed to truncatePromptToFit with
+    //      MAX_PROMPT_CHARS - strictSuffix.length to leave room for the suffix.
     const { prompt, commits: usedCommits, files: usedFiles } = truncatePromptToFit(
       safeTag, safePrevTag, commits, files, promptExtra
     )
@@ -894,11 +896,14 @@ async function run(): Promise<void> {
       if (isContextOverflowError(e)) {
         // Attempt 1 overflowed the context window. Re-truncate to 75% of the
         // current prompt length and retry immediately — no pause, this is
-        // deterministic. 75% (not 50%) is intentional: the overflow was marginal
-        // (4,091/4,096 tokens), so a smaller reduction is usually sufficient and
-        // preserves more commit context. If the re-truncated prompt still overflows
-        // (very unusual — would require a further density spike), it will throw
-        // and surface via core.setFailed with the overflow detail.
+        // deterministic. 75% (not 50%) is intentional: with MAX_PROMPT_CHARS at
+        // 12,000 chars, a prompt that still overflows has a token density higher
+        // than ~3.41 chars/token (the density at which 12,000 chars hits 4,096
+        // tokens less response/instructions headroom). At 75% the budget becomes
+        // ~9,000 chars ≈ 2,735 tokens — well within the limit even at extreme
+        // densities, while preserving more commit context than a 50% cut would.
+        // If the re-truncated prompt still overflows (extremely unusual), it will
+        // throw and surface via core.setFailed with the overflow detail.
         core.warning(`[afm] Attempt 1 — context window overflow (${String(e).slice(0, 120)}). Re-truncating to 75% and retrying immediately...`)
         const overflowBudget = Math.floor(prompt.length * 0.75)
         const { prompt: smallerPrompt } = truncatePromptToFit(
