@@ -30298,22 +30298,35 @@ function isFatalAfmError(e) {
         msg.includes('mdm policy'));
 }
 /**
- * Returns true when the AFM error is a hard context-window overflow
- * (exceededContextWindowSize). This is a deterministic limit — retrying
- * with the same prompt will always fail. The caller must reduce the prompt
- * before retrying. Do NOT add this string to isFatalAfmError: it IS
- * recoverable, just not via a simple pause-and-retry.
+ * Returns true when the AFM error is a hard context-window overflow.
  *
- * 'exceededcontextwindowsize' is an Apple-internal Swift error enum identifier
- * (LanguageModelError.exceededContextWindowSize), not a documented stable API
- * string. It was observed in runbot-hq/run-bot#2351. If Apple renames the enum
- * case in a future OS release, this match silently stops firing and overflows
- * fall through to the cold-start branch — adding a useless 15s wait. If that
- * regression occurs, search the runner's afm-cli stderr for the new error string
- * and update this match. Structured exit codes are tracked at runbot-hq/afm-cli#2.
+ * Two strings are matched as a defence-in-depth hedge:
+ *
+ * 1. 'exceededcontextwindowsize' — the Swift enum identifier
+ *    (LanguageModelError.exceededContextWindowSize) observed in
+ *    runbot-hq/run-bot#2351. This is an Apple-internal identifier, not a
+ *    documented stable API string. If Apple renames the enum case in a future
+ *    OS release this match silently stops firing.
+ *
+ * 2. 'exceeds the maximum allowed context size' — the human-readable
+ *    FoundationModels framework error message observed in the same failure
+ *    ("Content contains 4091 tokens, which exceeds the maximum allowed context
+ *    size of 4096."). Framework-level prose is typically more stable across
+ *    OS versions than internal enum identifiers, so this serves as a fallback
+ *    if the enum name changes.
+ *
+ * Either match is sufficient. Both strings are lowercased before comparison.
+ *
+ * This is a deterministic limit — retrying with the same prompt will always
+ * fail. The caller must reduce the prompt before retrying. Do NOT add either
+ * string to isFatalAfmError: the overflow IS recoverable, just not via a
+ * simple pause-and-retry. Structured exit codes are tracked at
+ * runbot-hq/afm-cli#2.
  */
 function isContextOverflowError(e) {
-    return String(e).toLowerCase().includes('exceededcontextwindowsize');
+    const msg = String(e).toLowerCase();
+    return (msg.includes('exceededcontextwindowsize') ||
+        msg.includes('exceeds the maximum allowed context size'));
 }
 /**
  * Parses AFM output into { title, body }.
@@ -30811,7 +30824,12 @@ async function run() {
                 const overflowBudget = Math.floor(prompt.length * 0.75);
                 // usedCommits/usedFiles intentionally — already-capped by step 5; passing
                 // the original lists would re-expand the prompt past overflowBudget.
-                const { prompt: smallerPrompt } = truncatePromptToFit(safeTag, safePrevTag, usedCommits, usedFiles, promptExtra, overflowBudget);
+                const { prompt: smallerPrompt, commits: overflowCommits, files: overflowFiles } = truncatePromptToFit(safeTag, safePrevTag, usedCommits, usedFiles, promptExtra, overflowBudget);
+                if (overflowCommits.length === 0 && overflowFiles.length === 0) {
+                    core.warning('[afm] Overflow re-truncation dropped all commits and files — ' +
+                        'release note will be generated with no diff context. ' +
+                        'This can happen when individual commit messages or filenames are extremely long.');
+                }
                 core.info(`[afm] Overflow-retry prompt: ${smallerPrompt.length} chars (budget: ${overflowBudget})`);
                 try {
                     raw = afmCli(afmBin, smallerPrompt, afmOptions);
