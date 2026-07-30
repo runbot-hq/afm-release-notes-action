@@ -928,7 +928,7 @@ async function run(): Promise<void> {
         // If the re-truncated prompt still overflows (extremely unusual), it will
         // throw and surface via core.setFailed with the overflow detail.
         core.warning(`[afm] Attempt 1 — context window overflow (${String(e).slice(0, 120)}). Re-truncating to 75% and retrying immediately...`)
-        const overflowBudget = Math.floor(prompt.length * 0.75)
+        const overflowBudget = Math.floor(Math.min(prompt.length, MAX_PROMPT_CHARS) * 0.75)
         // usedCommits/usedFiles intentionally — already-capped by step 5; passing
         // the original lists would re-expand the prompt past overflowBudget.
         const { prompt: smallerPrompt, commits: overflowCommits, files: overflowFiles } = truncatePromptToFit(
@@ -948,8 +948,7 @@ async function run(): Promise<void> {
           const detail = String(e2)
           throw new Error(
             `[afm] Overflow-retry failed (binary: ${afmBin}): ${detail}. ` +
-            'The re-truncated prompt still exceeded the context window or hit another error. ' +
-            'Consider filing an issue with the token count from the original error.'
+            `Original overflow: ${String(e).slice(0, 200)}`
           )
         }
       } else {
