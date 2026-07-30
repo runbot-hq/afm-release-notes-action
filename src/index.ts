@@ -935,7 +935,23 @@ async function run(): Promise<void> {
       ? (core.warning('Generated body exceeds 120000 chars — truncating'), body.slice(0, 120_000))
       : body
 
-    core.info(`[afm] Generated: ${title}`)
+    // Log release notes output to step log as a collapsible group (mirrors
+    // local-ai-code-review-action PR #24) so raw output is inspectable
+    // directly from the Actions UI without leaving the step log.
+    //
+    // Body is previewed at 2000 chars max — finalBody can be up to 120,000 chars
+    // and logging it verbatim would bloat the step log with no added value over
+    // the Job Summary (step 10), which already renders the full body.
+    //
+    // Title is sliced to 100 chars in the group label — the raw model title has
+    // no length cap and an unbounded string would produce an unreadably wide
+    // collapsed group header in the Actions UI.
+    await core.group(`AI Release Notes Output — ${title.slice(0, 100)}`, async () => {
+      const bodyPreview = finalBody.length > 2_000
+        ? `${finalBody.slice(0, 2_000)}\n…(${finalBody.length} chars total — full output in Job Summary)`
+        : finalBody
+      core.info(`Body:\n${bodyPreview}`)
+    })
 
     // 9. Write outputs
     core.setOutput('release_title', title)
