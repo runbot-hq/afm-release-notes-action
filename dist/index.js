@@ -30033,38 +30033,50 @@ function isFatalAfmError(e) {
     //
     // SOURCE 1 — main.swift fputs() strings (all begin with "error:", lowercased here).
     //   Fatal (do NOT retry):
-    //     "error: apple intelligence unavailable"  — .unavailable(reason) case
-    //     "error: unknown model availability state" — @unknown default case
-    //     "error: afm-cli requires macos"           — #available guard (version number varies)
+    //     "error: apple intelligence unavailable"           — .unavailable(reason) case
+    //     "error: unknown model availability state"         — @unknown default case
+    //     "error: afm-cli requires macos"                   — #available guard (version number varies)
     //     "error: foundationmodels framework not available" — #else branch
     //   Non-fatal (retryable — NOT in this list):
     //     "error: inference failed"  — session.respond() throw, may recover on retry
     //
     // SOURCE 2 — OS / MDM errors surfaced via spawnSync result.error or raw stderr.
-    //   'not authorized'   — macOS MDM/entitlement denial
-    //   'permission denied' — POSIX EACCES.
+    //   'not authorized'    — macOS MDM/entitlement denial
+    //   'permission denied' — POSIX EACCES
     //
-    //   WHY these are matched with /^.../m (line-anchored) instead of .includes():
-    //   The error thrown for a non-zero exit is:
-    //     `afm-cli exited ${status}: ${result.stderr?.trim()}`
-    //   stderr is passed verbatim. If afm-cli ever echoes back part of a commit
-    //   message in its error output (e.g. a commit titled "fix: not authorized
-    //   endpoint call"), a bare .includes() would return true and suppress the
-    //   cold-start retry — turning a transient ETIMEDOUT into a permanent failure.
-    //   Line-anchoring constrains the match to the start of a line in the error
-    //   string, which is where the OS/MDM denial strings actually appear.
-    //   This is the same invariant the JSDoc previously described as a
-    //   "theoretical edge" — it is now enforced structurally rather than assumed.
+    // WHY ALL fatal strings now use /^.../im (line-anchored, case-insensitive)
+    // instead of .includes():
     //
-    //   'mdm policy'       — MDM policy strings (uncommon in commit messages, kept as .includes)
+    // The error thrown for a non-zero exit is:
+    //   `afm-cli exited ${status}: ${result.stderr?.trim()}`
+    // stderr is passed verbatim and can contain arbitrary content — including
+    // Apple's debug descriptions that embed human-readable reasons. For example,
+    // a future exceededContextWindowSize debug description could embed a phrase
+    // like "Apple Intelligence unavailable" as a sub-reason string. A bare
+    // .includes() on the full lowercased error string would match that substring
+    // and return true, suppressing the cold-start retry on what was actually a
+    // retryable inference error.
+    //
+    // Line-anchoring (/^.../m, matches start of any line) constrains each check
+    // to lines that *begin* with the fatal string — exactly where afm-cli emits
+    // them. This makes false-positive matches from embedded debug descriptions
+    // structurally impossible: an embedded phrase appears mid-line (after a dash,
+    // parenthesis, or quote), never at the start of a line.
+    //
+    // The optional prefix `(afm-cli exited \d+: )?` handles both the wrapped
+    // Node throw format (`afm-cli exited 1: error: ...`) and a hypothetical direct
+    // stderr line (`error: ...`) with the same pattern.
+    //
+    // 'mdm policy' is kept as a line-anchored check for consistency.
+    // It is uncommon in commit messages and the line-anchor approach is uniform.
     const msg = String(e).toLowerCase();
-    return (msg.includes('error: apple intelligence unavailable') ||
-        msg.includes('error: unknown model availability state') ||
-        msg.includes('error: afm-cli requires macos') ||
-        msg.includes('error: foundationmodels framework not available') ||
+    return (/^(afm-cli exited \d+: )?error: apple intelligence unavailable/im.test(msg) ||
+        /^(afm-cli exited \d+: )?error: unknown model availability state/im.test(msg) ||
+        /^(afm-cli exited \d+: )?error: afm-cli requires macos/im.test(msg) ||
+        /^(afm-cli exited \d+: )?error: foundationmodels framework not available/im.test(msg) ||
         /^(error: )?not authorized/m.test(msg) ||
         /^(error: )?permission denied/m.test(msg) ||
-        msg.includes('mdm policy'));
+        /^(afm-cli exited \d+: )?mdm policy/im.test(msg));
 }
 
 
@@ -30685,7 +30697,18 @@ async function run() {
         // injection risk (afmCli uses spawnSync), but control chars could corrupt
         // the prompt content or cause unexpected model behaviour. Strip applied
         // consistently with all other user-controlled strings embedded in the prompt.
-        const promptExtra = core.getInput('prompt_extra').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 300);
+        //
+        // WHY warn on prompt_extra truncation:
+        // The 300-char cap on prompt_extra is a silent slice — a user who supplies
+        // a longer instruction string would have it truncated with no log entry,
+        // potentially causing confusing model output. The warning is emitted before
+        // slicing so the original length is visible in the Actions log.
+        const promptExtraRaw = core.getInput('prompt_extra').replace(/[\x00-\x1f\x7f]/g, '');
+        if (promptExtraRaw.length > 300) {
+            core.warning(`[afm] prompt_extra is ${promptExtraRaw.length} chars — truncating to 300. ` +
+                'Shorten the prompt_extra input to suppress this warning.');
+        }
+        const promptExtra = promptExtraRaw.slice(0, 300);
         const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200);
         // Preflight loop: call afm-cli --count-tokens to get the exact token count
