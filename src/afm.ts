@@ -90,8 +90,7 @@ export function isFatalAfmError(e: unknown): boolean {
   //   'not authorized'    — macOS MDM/entitlement denial
   //   'permission denied' — POSIX EACCES
   //
-  // WHY ALL fatal strings now use /^.../im (line-anchored, case-insensitive)
-  // instead of .includes():
+  // WHY ALL fatal strings use /^.../im (line-anchored, case-insensitive):
   //
   // The error thrown for a non-zero exit is:
   //   `afm-cli exited ${status}: ${result.stderr?.trim()}`
@@ -111,18 +110,17 @@ export function isFatalAfmError(e: unknown): boolean {
   //
   // The optional prefix `(afm-cli exited \d+: )?` handles both the wrapped
   // Node throw format (`afm-cli exited 1: error: ...`) and a hypothetical direct
-  // stderr line (`error: ...`) with the same pattern.
-  //
-  // 'mdm policy' is kept as a line-anchored check for consistency.
-  // It is uncommon in commit messages and the line-anchor approach is uniform.
+  // stderr line (`error: ...`) with the same pattern. Applied uniformly to all
+  // seven patterns — including 'not authorized' and 'permission denied' — so
+  // the anchoring invariant holds across the full function without exceptions.
   const msg = String(e).toLowerCase()
   return (
     /^(afm-cli exited \d+: )?error: apple intelligence unavailable/im.test(msg) ||
     /^(afm-cli exited \d+: )?error: unknown model availability state/im.test(msg) ||
     /^(afm-cli exited \d+: )?error: afm-cli requires macos/im.test(msg) ||
     /^(afm-cli exited \d+: )?error: foundationmodels framework not available/im.test(msg) ||
-    /^(error: )?not authorized/m.test(msg) ||
-    /^(error: )?permission denied/m.test(msg) ||
+    /^(afm-cli exited \d+: )?(error: )?not authorized/im.test(msg) ||
+    /^(afm-cli exited \d+: )?(error: )?permission denied/im.test(msg) ||
     /^(afm-cli exited \d+: )?mdm policy/im.test(msg)
   )
 }

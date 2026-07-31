@@ -24,8 +24,9 @@ import { parseAfmOutput, buildPrompt } from './prompt'
 // are not included in the tokenCount(for:) result. The 60-token reserve is
 // therefore a char-based estimate (~190 chars ÷ 3.29 chars/token ≈ 58 tokens).
 // This is the only remaining estimation in an otherwise exact-count system.
-// INVARIANT: keep the instructions string (defined below, step 5) under ~190 chars.
-// If it grows beyond that, recalculate and update the reserve here accordingly.
+// INVARIANT: keep the instructions string (defined below, step 5) under ~190 chars
+// AND ASCII-only. Both constraints are enforced by runtime guards below.
+// If the string must grow, recalculate and update the reserve here accordingly.
 const TOKEN_BUDGET = 8192 - 300 - 60 // = 7832
 
 // PROMPT_BUDGET: the ceiling used by the step-5 preflight halving loop.
@@ -132,20 +133,32 @@ async function run(): Promise<void> {
     // Instructions string for LanguageModelSession(instructions:).
     // Declared and validated here — before step 5 — so a violation is caught at
     // action startup rather than after all preflight CLI calls complete.
-    // INVARIANT: keep this string under ~190 chars. The 60-token reserve in
-    // TOKEN_BUDGET is calibrated to this length (~190 chars ÷ 3.29 chars/token
-    // ≈ 58 tokens). Instructions are not included in the afm-cli --count-tokens
-    // result (they are passed separately at inference time), so this reservation
-    // is the only guard. If this string grows, update the reserve in TOKEN_BUDGET.
-    // IMPORTANT: ASCII-only. String.prototype.length counts UTF-16 code units, which
-    // equals char count only for ASCII. Non-ASCII characters (em-dash, curly quotes,
-    // CJK, etc.) tokenise at higher density than ASCII — adding them would silently
-    // underestimate the token cost and erode the 60-token reserve. Keep ASCII-only.
+    //
+    // TWO invariants are enforced by the runtime guards immediately below:
+    //
+    //   1. LENGTH ≤ 190 chars.
+    //      The 60-token reserve in TOKEN_BUDGET is calibrated to this length
+    //      (~190 chars ÷ 3.29 chars/token ≈ 58 tokens). Instructions are not
+    //      included in the afm-cli --count-tokens result (passed separately at
+    //      inference time), so this reservation is the only guard. If the string
+    //      must grow, update the reserve in TOKEN_BUDGET.
+    //
+    //   2. ASCII-only.
+    //      String.prototype.length counts UTF-16 code units, which equals char
+    //      count only for ASCII. Non-ASCII characters (em-dash, curly quotes,
+    //      CJK, etc.) tokenise at higher density than ASCII — adding them would
+    //      silently underestimate the token cost and erode the 60-token reserve.
+    //      The ASCII guard is machine-enforced (not comment-only) so a future
+    //      edit introducing a non-ASCII character is caught at action startup
+    //      rather than silently eroding the budget in production.
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
-    // Runtime guard for the 190-char invariant above. A future edit that grows
-    // this string without noticing the comment would silently erode the 60-token
-    // reserve — this throws at action startup (before any AFM call) so the
-    // violation is caught in CI rather than corrupting a live release.
+    if (/[^\x00-\x7F]/.test(instructions)) {
+      throw new Error(
+        '[afm] instructions string contains non-ASCII characters — violates the ASCII-only invariant. ' +
+        'Non-ASCII characters tokenise at higher density and silently erode the 60-token TOKEN_BUDGET reserve. ' +
+        'Use ASCII equivalents (e.g. hyphen instead of em-dash, straight quotes instead of curly quotes).'
+      )
+    }
     if (instructions.length > 190) {
       throw new Error(
         `[afm] instructions string is ${instructions.length} chars — exceeds the 190-char invariant. ` +
@@ -488,8 +501,8 @@ async function run(): Promise<void> {
       core.debug(`[afm] Strict-retry token count: ${strictTokenCount} / ${TOKEN_BUDGET}`)
       if (strictTokenCount > TOKEN_BUDGET) throw new Error(
         `[afm] Strict-retry prompt exceeds TOKEN_BUDGET (${strictTokenCount} > ${TOKEN_BUDGET}) — ` +
-        `strictSuffix may have grown beyond the 50-token PROMPT_BUDGET reserve. ` +
-        `Update PROMPT_BUDGET if strictSuffix was intentionally enlarged. ` +
+        `strictSuffix has grown beyond the 50-token reserve in PROMPT_BUDGET. ` +
+        `Update the PROMPT_BUDGET reserve (currently TOKEN_BUDGET - 50) to match the new strictSuffix token cost. ` +
         `(commits in prompt: ${promptCommits.length}, files in prompt: ${promptFiles.length})`
       )
       try {
