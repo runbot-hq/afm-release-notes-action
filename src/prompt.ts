@@ -247,13 +247,16 @@ export function truncatePromptToFit(
   // long filenames or commit messages). Drop both lists entirely.
   //
   // KNOWN RESIDUAL GAP: after dropping, the prompt still contains boilerplate
-  // + tags + promptExtra ≈ 1,400 chars worst-case (boilerplate ~1,100 + up to
-  // 300 chars of promptExtra). If charBudget were ever set below ~1,400 the
+  // + tags + promptExtra ≈ 1,500 chars worst-case (fixed boilerplate ~1,100
+  // + safeTag up to 200 chars + safePrevTag up to 200 chars, both embedded
+  // twice in the template, contribute ~400 chars at maximum length; promptExtra
+  // adds up to 300 chars on top). If charBudget were ever set below ~1,500 the
   // returned prompt would silently exceed it. In practice the minimum caller
   // budget is activeOverflowBudget - strictSuffix.length ≈ 8,868 (when the
-  // overflow path was taken at ~9,000 chars) — far above 1,400 — so this gap
-  // is unreachable. Do NOT add a throw: a thin release note is better than a
-  // hard job failure.
+  // overflow path was taken at ~9,000 chars) — far above 1,500 — so this gap
+  // is unreachable. The strictBudget guard in index.ts step 7 throws explicitly
+  // if this invariant is ever violated at runtime. Do NOT add a throw here:
+  // a thin release note is better than a hard job failure at the truncation site.
   if (prompt.length > charBudget) {
     c = []
     f = []

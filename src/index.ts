@@ -442,6 +442,20 @@ async function run(): Promise<void> {
       // budget seen (activeOverflowBudget when the overflow path was taken).
       // strictSuffix is then appended unconditionally.
       const strictBudget = Math.min(MAX_PROMPT_CHARS, activeOverflowBudget) - strictSuffix.length
+      // Guard: strictBudget must be positive and large enough for truncatePromptToFit
+      // to return a non-empty prompt. The minimum realistic value is ~8,738 (when
+      // overflow path taken at ~9,000 chars, minus ~130 suffix, minus ~130 strictSuffix
+      // length = ~8,740). If this ever fires it means activeOverflowBudget drifted
+      // below ~1,500 (the worst-case boilerplate floor documented in prompt.ts), which
+      // would indicate a budget accounting bug upstream. Fail loudly rather than
+      // silently passing a near-zero budget to truncatePromptToFit.
+      if (strictBudget <= 0) {
+        throw new Error(
+          `Internal error: strictBudget is ${strictBudget} — activeOverflowBudget (${activeOverflowBudget}) ` +
+          `is too small to accommodate strictSuffix (${strictSuffix.length} chars). ` +
+          'This indicates a budget accounting bug; please report at runbot-hq/afm-release-notes-action.'
+        )
+      }
       const { prompt: strictBase } = truncatePromptToFit(
         safeTag, safePrevTag, activeCommits, activeFiles, promptExtra,
         strictBudget
