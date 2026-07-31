@@ -30044,8 +30044,7 @@ function isFatalAfmError(e) {
     //   'not authorized'    — macOS MDM/entitlement denial
     //   'permission denied' — POSIX EACCES
     //
-    // WHY ALL fatal strings now use /^.../im (line-anchored, case-insensitive)
-    // instead of .includes():
+    // WHY ALL fatal strings use /^.../im (line-anchored, case-insensitive):
     //
     // The error thrown for a non-zero exit is:
     //   `afm-cli exited ${status}: ${result.stderr?.trim()}`
@@ -30065,17 +30064,16 @@ function isFatalAfmError(e) {
     //
     // The optional prefix `(afm-cli exited \d+: )?` handles both the wrapped
     // Node throw format (`afm-cli exited 1: error: ...`) and a hypothetical direct
-    // stderr line (`error: ...`) with the same pattern.
-    //
-    // 'mdm policy' is kept as a line-anchored check for consistency.
-    // It is uncommon in commit messages and the line-anchor approach is uniform.
+    // stderr line (`error: ...`) with the same pattern. Applied uniformly to all
+    // seven patterns — including 'not authorized' and 'permission denied' — so
+    // the anchoring invariant holds across the full function without exceptions.
     const msg = String(e).toLowerCase();
     return (/^(afm-cli exited \d+: )?error: apple intelligence unavailable/im.test(msg) ||
         /^(afm-cli exited \d+: )?error: unknown model availability state/im.test(msg) ||
         /^(afm-cli exited \d+: )?error: afm-cli requires macos/im.test(msg) ||
         /^(afm-cli exited \d+: )?error: foundationmodels framework not available/im.test(msg) ||
-        /^(error: )?not authorized/m.test(msg) ||
-        /^(error: )?permission denied/m.test(msg) ||
+        /^(afm-cli exited \d+: )?(error: )?not authorized/im.test(msg) ||
+        /^(afm-cli exited \d+: )?(error: )?permission denied/im.test(msg) ||
         /^(afm-cli exited \d+: )?mdm policy/im.test(msg));
 }
 
@@ -30430,8 +30428,9 @@ const prompt_1 = __nccwpck_require__(705);
 // are not included in the tokenCount(for:) result. The 60-token reserve is
 // therefore a char-based estimate (~190 chars ÷ 3.29 chars/token ≈ 58 tokens).
 // This is the only remaining estimation in an otherwise exact-count system.
-// INVARIANT: keep the instructions string (defined below, step 5) under ~190 chars.
-// If it grows beyond that, recalculate and update the reserve here accordingly.
+// INVARIANT: keep the instructions string (defined below, step 5) under ~190 chars
+// AND ASCII-only. Both constraints are enforced by runtime guards below.
+// If the string must grow, recalculate and update the reserve here accordingly.
 const TOKEN_BUDGET = 8192 - 300 - 60; // = 7832
 // PROMPT_BUDGET: the ceiling used by the step-5 preflight halving loop.
 //
@@ -30527,20 +30526,30 @@ async function run() {
         // Instructions string for LanguageModelSession(instructions:).
         // Declared and validated here — before step 5 — so a violation is caught at
         // action startup rather than after all preflight CLI calls complete.
-        // INVARIANT: keep this string under ~190 chars. The 60-token reserve in
-        // TOKEN_BUDGET is calibrated to this length (~190 chars ÷ 3.29 chars/token
-        // ≈ 58 tokens). Instructions are not included in the afm-cli --count-tokens
-        // result (they are passed separately at inference time), so this reservation
-        // is the only guard. If this string grows, update the reserve in TOKEN_BUDGET.
-        // IMPORTANT: ASCII-only. String.prototype.length counts UTF-16 code units, which
-        // equals char count only for ASCII. Non-ASCII characters (em-dash, curly quotes,
-        // CJK, etc.) tokenise at higher density than ASCII — adding them would silently
-        // underestimate the token cost and erode the 60-token reserve. Keep ASCII-only.
+        //
+        // TWO invariants are enforced by the runtime guards immediately below:
+        //
+        //   1. LENGTH ≤ 190 chars.
+        //      The 60-token reserve in TOKEN_BUDGET is calibrated to this length
+        //      (~190 chars ÷ 3.29 chars/token ≈ 58 tokens). Instructions are not
+        //      included in the afm-cli --count-tokens result (passed separately at
+        //      inference time), so this reservation is the only guard. If the string
+        //      must grow, update the reserve in TOKEN_BUDGET.
+        //
+        //   2. ASCII-only.
+        //      String.prototype.length counts UTF-16 code units, which equals char
+        //      count only for ASCII. Non-ASCII characters (em-dash, curly quotes,
+        //      CJK, etc.) tokenise at higher density than ASCII — adding them would
+        //      silently underestimate the token cost and erode the 60-token reserve.
+        //      The ASCII guard is machine-enforced (not comment-only) so a future
+        //      edit introducing a non-ASCII character is caught at action startup
+        //      rather than silently eroding the budget in production.
         const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}';
-        // Runtime guard for the 190-char invariant above. A future edit that grows
-        // this string without noticing the comment would silently erode the 60-token
-        // reserve — this throws at action startup (before any AFM call) so the
-        // violation is caught in CI rather than corrupting a live release.
+        if (/[^\x00-\x7F]/.test(instructions)) {
+            throw new Error('[afm] instructions string contains non-ASCII characters — violates the ASCII-only invariant. ' +
+                'Non-ASCII characters tokenise at higher density and silently erode the 60-token TOKEN_BUDGET reserve. ' +
+                'Use ASCII equivalents (e.g. hyphen instead of em-dash, straight quotes instead of curly quotes).');
+        }
         if (instructions.length > 190) {
             throw new Error(`[afm] instructions string is ${instructions.length} chars — exceeds the 190-char invariant. ` +
                 'Update the TOKEN_BUDGET reserve if the string must grow.');
@@ -30864,8 +30873,8 @@ async function run() {
             core.debug(`[afm] Strict-retry token count: ${strictTokenCount} / ${TOKEN_BUDGET}`);
             if (strictTokenCount > TOKEN_BUDGET)
                 throw new Error(`[afm] Strict-retry prompt exceeds TOKEN_BUDGET (${strictTokenCount} > ${TOKEN_BUDGET}) — ` +
-                    `strictSuffix may have grown beyond the 50-token PROMPT_BUDGET reserve. ` +
-                    `Update PROMPT_BUDGET if strictSuffix was intentionally enlarged. ` +
+                    `strictSuffix has grown beyond the 50-token reserve in PROMPT_BUDGET. ` +
+                    `Update the PROMPT_BUDGET reserve (currently TOKEN_BUDGET - 50) to match the new strictSuffix token cost. ` +
                     `(commits in prompt: ${promptCommits.length}, files in prompt: ${promptFiles.length})`);
             try {
                 raw = (0, afm_1.afmCli)(afmBin, strictPrompt, afmOptions);
