@@ -109,8 +109,8 @@ async function run(): Promise<void> {
       )
     }
     // The probe integer is not used for budget calculations — this is an
-    // availability check only. Logged at debug level for startup traceability.
-    core.debug(`[afm] Startup probe token count: ${parseInt(probeRaw, 10)}`)
+    // availability check only. probeRaw is already validated as all-digits above.
+    core.debug(`[afm] Startup probe token count: ${probeRaw}`)
     core.info('[afm] --count-tokens available ✓')
 
     // Instructions string for LanguageModelSession(instructions:).
@@ -448,7 +448,9 @@ async function run(): Promise<void> {
       core.debug(`[afm] Strict-retry token count: ${strictTokenCount} / ${TOKEN_BUDGET}`)
       if (strictTokenCount > TOKEN_BUDGET) throw new Error(
         `[afm] Strict-retry prompt exceeds TOKEN_BUDGET (${strictTokenCount} > ${TOKEN_BUDGET}). ` +
-        'Base prompt is at or near budget ceiling — cannot append strictSuffix safely.'
+        `Base prompt is at or near budget ceiling — cannot append strictSuffix safely. ` +
+        `(commits in prompt: ${promptCommits.length}, files in prompt: ${promptFiles.length}; ` +
+        `consider reducing prompt_extra length if set.)`
       )
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)

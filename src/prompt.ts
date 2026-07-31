@@ -154,9 +154,11 @@ export function buildPrompt(
     '',
     'Commits:',
     ...commits.map(c => `- ${c}`),
-    '',
-    'Changed files:',
-    ...files.map(f => `- ${f}`),
+    ...(files.length ? [
+      '',
+      'Changed files:',
+      ...files.map(f => `- ${f}`),
+    ] : []),
     ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
   ].join('\n')
 }
