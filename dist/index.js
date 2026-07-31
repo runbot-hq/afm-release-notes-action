@@ -30662,6 +30662,13 @@ async function run() {
         // re-expands past the last known-good truncation boundary.
         let activeCommits = usedCommits;
         let activeFiles = usedFiles;
+        // activeOverflowBudget tracks the tightest char budget seen so far.
+        // Defaults to MAX_PROMPT_CHARS (no overflow path taken). Updated to
+        // overflowBudget if step 6 takes the overflow-retry path, so step 7
+        // caps its budget to Math.min(MAX_PROMPT_CHARS - strictSuffix.length,
+        // activeOverflowBudget) and never sends a prompt larger than the one
+        // that already overflowed.
+        let activeOverflowBudget = prompt_1.MAX_PROMPT_CHARS;
         if (usedCommits.length < postFilterCommitCount || usedFiles.length < postFilterFileCount) {
             core.warning(`[afm] Prompt truncated to fit AFM context window (${prompt_1.MAX_PROMPT_CHARS} chars): ` +
                 `commits ${totalCommits} → ${postFilterCommitCount} → ${usedCommits.length}, ` +
@@ -30711,11 +30718,13 @@ async function run() {
                 // usedCommits/usedFiles intentionally — already-capped by step 5; passing
                 // the original lists would re-expand the prompt past overflowBudget.
                 const { prompt: smallerPrompt, commits: overflowCommits, files: overflowFiles } = (0, prompt_1.truncatePromptToFit)(safeTag, safePrevTag, usedCommits, usedFiles, promptExtra, overflowBudget);
-                // Update activeCommits/activeFiles to the narrower overflow lists so that
-                // step 7's strict-retry (if needed) builds from the smallest known-good
-                // truncation boundary rather than re-expanding to the larger step-5 set.
+                // Update activeCommits/activeFiles/activeOverflowBudget to the narrower
+                // overflow values so that step 7's strict-retry (if needed) builds from
+                // the smallest known-good truncation boundary and budget, never re-expanding
+                // to a prompt larger than the one that already overflowed.
                 activeCommits = overflowCommits;
                 activeFiles = overflowFiles;
+                activeOverflowBudget = overflowBudget;
                 if (overflowCommits.length === 0 && overflowFiles.length === 0) {
                     core.warning('[afm] Overflow re-truncation dropped all commits and files — ' +
                         'release note will be generated with no diff context. ' +
@@ -30759,8 +30768,9 @@ async function run() {
         // ╠══════════════════════════════════════════════════════════════════════╣
         // ║                                                                      ║
         // ║  DOES:     call truncatePromptToFit with a reduced charBudget        ║
-        // ║            (MAX_PROMPT_CHARS - strictSuffix.length) so the suffix   ║
-        // ║            is guaranteed to fit, then append strictSuffix            ║
+        // ║            (Math.min(MAX_PROMPT_CHARS, activeOverflowBudget)         ║
+        // ║            - strictSuffix.length) so the suffix is guaranteed to fit ║
+        // ║            and the prompt never exceeds the tightest budget seen.    ║
         // ║  DOES NOT: get a 15s pause+retry loop (see WHY below)               ║
         // ║                                                                      ║
         // ║  WHY re-truncate instead of slicing after append?                   ║
@@ -30768,6 +30778,16 @@ async function run() {
         // ║  whenever prompt is already at the cap — the very instruction meant  ║
         // ║  to fix malformed output gets silently dropped. Re-truncating with   ║
         // ║  a reduced budget guarantees the suffix is always present in full.   ║
+        // ║                                                                      ║
+        // ║  WHY Math.min(MAX_PROMPT_CHARS, activeOverflowBudget)?              ║
+        // ║  If step 6 took the overflow path (activeOverflowBudget < MAX_PROMPT ║
+        // ║  _CHARS), the overflow-retry budget was ~9,000 chars. Sending a      ║
+        // ║  strict-retry prompt at the default ~11,868-char budget would exceed  ║
+        // ║  the window that already overflowed and guarantee a second overflow.  ║
+        // ║  Capping to activeOverflowBudget - strictSuffix.length ensures the   ║
+        // ║  strict-retry is always at most as large as the last successful call. ║
+        // ║  When no overflow occurred, activeOverflowBudget = MAX_PROMPT_CHARS  ║
+        // ║  and the cap is a no-op.                                             ║
         // ║                                                                      ║
         // ║  IS PASSING activeCommits/activeFiles (narrowest known-good set) OK? ║
         // ║  Yes. activeCommits/activeFiles are initialised from step 5's        ║
@@ -30793,13 +30813,15 @@ async function run() {
             // ANSWER: Slicing (prompt + strictSuffix) to MAX_PROMPT_CHARS would always
             // amputate the suffix for any prompt near the cap — the very instruction
             // meant to fix malformed output gets silently dropped. Instead, re-run
-            // truncatePromptToFit with charBudget = MAX_PROMPT_CHARS - strictSuffix.length,
-            // so the returned prompt is guaranteed to leave room for the full suffix.
-            // strictSuffix is then appended unconditionally. The resulting prompt is at
-            // most MAX_PROMPT_CHARS chars total — identical to the first-attempt budget.
-            const { prompt: strictBase } = (0, prompt_1.truncatePromptToFit)(safeTag, safePrevTag, activeCommits, activeFiles, promptExtra, prompt_1.MAX_PROMPT_CHARS - strictSuffix.length);
+            // truncatePromptToFit with charBudget = Math.min(MAX_PROMPT_CHARS,
+            // activeOverflowBudget) - strictSuffix.length, so the returned prompt is
+            // guaranteed to leave room for the full suffix and never exceeds the tightest
+            // budget seen (activeOverflowBudget when the overflow path was taken).
+            // strictSuffix is then appended unconditionally.
+            const strictBudget = Math.min(prompt_1.MAX_PROMPT_CHARS, activeOverflowBudget) - strictSuffix.length;
+            const { prompt: strictBase } = (0, prompt_1.truncatePromptToFit)(safeTag, safePrevTag, activeCommits, activeFiles, promptExtra, strictBudget);
             const strictPrompt = strictBase + strictSuffix;
-            core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars (budget: ${prompt_1.MAX_PROMPT_CHARS - strictSuffix.length} + ${strictSuffix.length} suffix)`);
+            core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars (budget: ${strictBudget} + ${strictSuffix.length} suffix)`);
             try {
                 raw = (0, afm_1.afmCli)(afmBin, strictPrompt, afmOptions);
             }
@@ -30809,8 +30831,7 @@ async function run() {
                 throw new Error(`[afm] Strict-prompt retry failed (binary: ${afmBin}): ${detail}. ` +
                     (isOverflow2
                         ? 'Context window overflow on strict-retry — token density is too high even at the reduced budget. ' +
-                            'The strict-prompt budget (~11,868 chars) is larger than the overflow-retry budget (~9,000 chars); ' +
-                            'if the overflow-retry prompt also overflowed, this is expected.'
+                            `Strict-retry budget: ${strictBudget} + ${strictSuffix.length} suffix chars.`
                         : 'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
                             'consider increasing the timeout or pre-warming the runner.'));
             }
@@ -31135,11 +31156,13 @@ function truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra, 
     // long filenames or commit messages). Drop both lists entirely.
     //
     // KNOWN RESIDUAL GAP: after dropping, the prompt still contains boilerplate
-    // + tags + promptExtra ≈ 1,100 chars worst-case. If charBudget were ever set
-    // below ~1,100 the returned prompt would silently exceed it. In practice the
-    // minimum caller budget is MAX_PROMPT_CHARS - strictSuffix.length ≈ 11,868 —
-    // far above 1,100 — so this gap is unreachable. Do NOT add a throw: a thin
-    // release note is better than a hard job failure.
+    // + tags + promptExtra ≈ 1,400 chars worst-case (boilerplate ~1,100 + up to
+    // 300 chars of promptExtra). If charBudget were ever set below ~1,400 the
+    // returned prompt would silently exceed it. In practice the minimum caller
+    // budget is activeOverflowBudget - strictSuffix.length ≈ 8,868 (when the
+    // overflow path was taken at ~9,000 chars) — far above 1,400 — so this gap
+    // is unreachable. Do NOT add a throw: a thin release note is better than a
+    // hard job failure.
     if (prompt.length > charBudget) {
         c = [];
         f = [];
