@@ -109,29 +109,3 @@ export function isFatalAfmError(e: unknown): boolean {
     msg.includes('mdm policy')
   )
 }
-
-/**
- * Returns true when the AFM error is a hard context-window overflow.
- *
- * NOTE: This function is dead code now that the exact-token preflight loop
- * (step 5 in run()) guarantees the prompt fits before inference is called.
- * Retained here rather than deleted immediately so a single future PR can
- * remove it in isolation without mixing clean-up into a logic change.
- * Do NOT add new call sites — remove this function in the follow-on clean-up.
- *
- * Two strings are matched as a defence-in-depth hedge:
- *
- * 1. 'exceededcontextwindowsize' — the Swift enum identifier
- *    (LanguageModelError.exceededContextWindowSize) observed in
- *    runbot-hq/run-bot#2351.
- *
- * 2. 'exceeds the maximum allowed context size' — the human-readable
- *    FoundationModels framework error message observed in the same failure.
- */
-export function isContextOverflowError(e: unknown): boolean {
-  const msg = String(e).toLowerCase()
-  return (
-    msg.includes('exceededcontextwindowsize') ||
-    msg.includes('exceeds the maximum allowed context size')
-  )
-}
