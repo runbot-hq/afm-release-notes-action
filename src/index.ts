@@ -389,8 +389,8 @@ async function run(): Promise<void> {
           throw new Error(
             `[afm] Cold-start retry failed (binary: ${afmBin}): ${detail}. ` +
             (isOverflow2
-              ? 'Context window overflow on cold-start retry — the prompt may be right at the token boundary. ' +
-                'Try reducing MAX_PROMPT_CHARS or check for abnormally long commit messages.'
+              ? 'Context window overflow on cold-start retry — prompt may be at the token boundary. ' +
+                'Try reducing prompt_extra length or lowering the per-list caps (commits/files).'
               : 'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
                 'consider increasing the timeout or pre-warming the runner.')
           )

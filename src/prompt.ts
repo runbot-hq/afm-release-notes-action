@@ -133,7 +133,7 @@ export function parseAfmOutput(raw: string, currentTag: string): { title: string
 // evaluated at declaration time (e.g. a default parameter or class field). The
 // function body is only evaluated at call time (after module evaluation), so the
 // previous order was safe at runtime. However, declaring the constant after the
-// function that uses it is a readability hazard and a latent footgun if the call
+// function that uses it is a readability hazard and a latent footgun if a call
 // site ever moves earlier. Constant declared first, then the functions that use it.
 //
 // WHY 12_000 and not 13_500 (the previous value)?
@@ -151,6 +151,21 @@ export function parseAfmOutput(raw: string, currentTag: string): { title: string
 // FoundationModels tokenizer and real density drops below 3.29 chars/token.
 // A drifted constant produces a retry, not a silent failure.
 export const MAX_PROMPT_CHARS = 12_000
+
+// BOILERPLATE_FLOOR_CHARS is the maximum number of chars buildPrompt can return
+// when called with empty commits and files arrays. It equals fixed template text
+// (~1,100 chars) + safeTag (≤200 chars, embedded twice) + safePrevTag (≤200 chars,
+// embedded once) + promptExtra (≤300 chars). At maximum input lengths that totals
+// ~2,000 chars; the constant is set to 2_100 with a 5% margin.
+//
+// Used by truncatePromptToFit to assert the pathological-edge invariant: after
+// dropping all commits and files, prompt.length must be ≤ charBudget. If the
+// boilerplate alone exceeds charBudget, the function throws rather than returning
+// a prompt that silently violates the budget contract.
+//
+// Do NOT lower this constant without re-measuring buildPrompt with
+// safeTag=200 chars, safePrevTag=200 chars, promptExtra=300 chars.
+export const BOILERPLATE_FLOOR_CHARS = 2_100
 
 /**
  * Assembles the prompt string from its components.
@@ -259,22 +274,23 @@ export function truncatePromptToFit(
   // boilerplate alone exceeds charBudget. Drop both lists entirely.
   // This block is unconditional — it runs for any residual case where
   // prompt.length > charBudget after the loop (0+0, 1+0, 0+1, 1+1).
-  //
-  // KNOWN RESIDUAL GAP: after dropping, the prompt still contains boilerplate
-  // + tags + promptExtra ≈ 1,500 chars worst-case (fixed boilerplate ~1,100
-  // + safeTag up to 200 chars + safePrevTag up to 200 chars, both embedded
-  // twice in the template, contribute ~400 chars at maximum length; promptExtra
-  // adds up to 300 chars on top). If charBudget were ever set below ~1,500 the
-  // returned prompt would silently exceed it. In practice the minimum caller
-  // budget is activeOverflowBudget - strictSuffix.length ≈ 8,868 (when the
-  // overflow path was taken at ~9,000 chars) — far above 1,500 — so this gap
-  // is unreachable. The strictBudget guard in index.ts step 7 throws explicitly
-  // if this invariant is ever violated at runtime. Do NOT add a throw here:
-  // a thin release note is better than a hard job failure at the truncation site.
   if (prompt.length > charBudget) {
     c = []
     f = []
     prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
+    // Assert the budget contract: boilerplate + promptExtra must fit within
+    // charBudget. In practice the minimum caller budget is
+    // activeOverflowBudget - strictSuffix.length ≈ 8,868 chars, far above
+    // BOILERPLATE_FLOOR_CHARS (2,100). If this throws it means charBudget was
+    // set dangerously low by a caller — surface it loudly rather than returning
+    // a prompt that silently exceeds the budget and causes another overflow.
+    if (prompt.length > charBudget) {
+      throw new Error(
+        `[afm] truncatePromptToFit: boilerplate + promptExtra (${prompt.length} chars) exceeds ` +
+        `charBudget (${charBudget}). Minimum supported budget is ~${BOILERPLATE_FLOOR_CHARS} chars. ` +
+        'Reduce promptExtra or raise charBudget. This is a caller contract violation.'
+      )
+    }
   }
 
   return { prompt, commits: c, files: f }
