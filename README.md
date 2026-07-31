@@ -139,7 +139,8 @@ jobs:
 
 ## Runner Requirements
 
-- Apple Silicon Mac, macOS 26+, Apple Intelligence enabled in System Settings (per-user — check MDM restrictions)
+- **macOS 26.4 or later** — required for `SystemLanguageModel.tokenCount(for:)`, the API that `afm-cli --count-tokens` calls to measure exact prompt token counts before inference. The action verifies this at startup and fails immediately with a clear error if the runner is on an older macOS 26.x release. macOS 26.0–26.3 are **not supported**.
+- Apple Silicon Mac, Apple Intelligence enabled in System Settings (per-user — check MDM restrictions)
 - Runner labeled `[self-hosted, macOS, apple-intelligence]`
 - No runtime dependencies — `afm-cli-bin` (sourced from [runbot-hq/afm-cli](https://github.com/runbot-hq/afm-cli)) and `dist/index.js` are committed; nothing is downloaded or installed at runtime
 
@@ -149,6 +150,7 @@ jobs:
 
 ## Known Constraints
 
+- **Requires macOS 26.4+** — the token preflight (`afm-cli --count-tokens`) depends on `SystemLanguageModel.tokenCount(for:)`, available from macOS 26.4. The action throws at startup on older runners with a diagnostic that includes the runner OS.
 - **Apple Intelligence is per-user** — may be blocked by MDM. The action fails fast with a clear error message including the runner name.
 - **AFM retried once** — 2 × 60s with a 15s pause between attempts; handles cold-start model loading. Fatal errors (MDM block, AI unavailable, permission denied) skip the retry immediately.
 - **Strict-prompt retry** — if the model returns malformed JSON, the action retries once with a stricter prompt before failing.
