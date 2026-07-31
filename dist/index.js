@@ -31031,6 +31031,10 @@ function parseAfmOutput(raw, currentTag) {
 // At 12,000 chars the same worst-case density produces ~3,647 tokens — 449 tokens
 // of headroom instead of the previous 5. Do NOT raise this without re-measuring
 // real token counts on dense commit logs.
+// The overflow-retry in step 6 (isContextOverflowError → re-truncate to 75%)
+// is the live safety net if this constant drifts — e.g. if Apple updates the
+// FoundationModels tokenizer and real density drops below 3.29 chars/token.
+// A drifted constant produces a retry, not a silent failure.
 exports.MAX_PROMPT_CHARS = 12_000;
 /**
  * Assembles the prompt string from its components.
