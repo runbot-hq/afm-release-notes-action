@@ -249,12 +249,22 @@ async function run(): Promise<void> {
     // usedCommits/usedFiles: post-truncation lists retained for use in three places:
     //   1. The truncation warning and core.info log immediately below.
     //   2. Step 6's overflow-retry path — passed to truncatePromptToFit with a
-    //      reduced budget so the halving loop can shed additional items.
-    //   3. Step 7's strict-retry path — passed to truncatePromptToFit with
-    //      MAX_PROMPT_CHARS - strictSuffix.length to leave room for the suffix.
+    //      reduced budget so the halving loop can shed additional items. If the
+    //      overflow path runs, activeCommits/activeFiles are updated to the
+    //      narrower overflow lists so step 7 works from the smallest known-good set.
+    //   3. Step 7's strict-retry path — uses activeCommits/activeFiles (initialised
+    //      to usedCommits/usedFiles here, updated by step 6 overflow path if taken)
+    //      so the strict-retry never re-expands to a prompt larger than the one
+    //      that last succeeded.
     const { prompt, commits: usedCommits, files: usedFiles } = truncatePromptToFit(
       safeTag, safePrevTag, commits, files, promptExtra
     )
+    // activeCommits/activeFiles track the narrowest truncated lists seen so far.
+    // Initialised from step 5; updated to overflowCommits/overflowFiles if step 6
+    // takes the overflow-retry path. Step 7 always reads from these so it never
+    // re-expands past the last known-good truncation boundary.
+    let activeCommits = usedCommits
+    let activeFiles = usedFiles
 
     if (usedCommits.length < postFilterCommitCount || usedFiles.length < postFilterFileCount) {
       core.warning(
@@ -310,6 +320,11 @@ async function run(): Promise<void> {
         const { prompt: smallerPrompt, commits: overflowCommits, files: overflowFiles } = truncatePromptToFit(
           safeTag, safePrevTag, usedCommits, usedFiles, promptExtra, overflowBudget
         )
+        // Update activeCommits/activeFiles to the narrower overflow lists so that
+        // step 7's strict-retry (if needed) builds from the smallest known-good
+        // truncation boundary rather than re-expanding to the larger step-5 set.
+        activeCommits = overflowCommits
+        activeFiles = overflowFiles
         if (overflowCommits.length === 0 && overflowFiles.length === 0) {
           core.warning(
             '[afm] Overflow re-truncation dropped all commits and files — ' +
@@ -367,10 +382,13 @@ async function run(): Promise<void> {
     // ║  to fix malformed output gets silently dropped. Re-truncating with   ║
     // ║  a reduced budget guarantees the suffix is always present in full.   ║
     // ║                                                                      ║
-    // ║  IS PASSING usedCommits/usedFiles (already-capped from step 5) OK?  ║
-    // ║  Yes. They are already at or below what fits the full budget. The    ║
-    // ║  ~130-char reduction rarely drops even one item; when it does, the   ║
-    // ║  halving loop removes it correctly. Not a bug.                       ║
+    // ║  IS PASSING activeCommits/activeFiles (narrowest known-good set) OK? ║
+    // ║  Yes. activeCommits/activeFiles are initialised from step 5's        ║
+    // ║  usedCommits/usedFiles and updated to overflowCommits/overflowFiles  ║
+    // ║  if step 6 took the overflow path. This guarantees step 7 never      ║
+    // ║  re-expands to a prompt larger than the one that last succeeded.     ║
+    // ║  The ~130-char budget reduction rarely drops even one item; when it  ║
+    // ║  does, the halving loop removes it correctly. Not a bug.             ║
     // ║                                                                      ║
     // ║  WHY no 15s retry loop?                                             ║
     // ║  Step 7 only runs after step 6 returned output (malformed, but      ║
@@ -392,7 +410,7 @@ async function run(): Promise<void> {
       // strictSuffix is then appended unconditionally. The resulting prompt is at
       // most MAX_PROMPT_CHARS chars total — identical to the first-attempt budget.
       const { prompt: strictBase } = truncatePromptToFit(
-        safeTag, safePrevTag, usedCommits, usedFiles, promptExtra,
+        safeTag, safePrevTag, activeCommits, activeFiles, promptExtra,
         MAX_PROMPT_CHARS - strictSuffix.length
       )
       const strictPrompt = strictBase + strictSuffix
