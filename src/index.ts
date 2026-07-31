@@ -425,12 +425,13 @@ async function run(): Promise<void> {
     // the main prompt is in step 5. This closes the edge where a near-budget base
     // prompt + suffix could exceed the context window.
     //
-    // WHY no 15s retry loop:
-    // Step 7 only runs after step 6 returned output (malformed, but returned).
-    // The model is warm — cold-start ETIMEDOUT is not the failure mode here.
-    // This holds whether step 6 succeeded on attempt 1 or attempt 2 (the 15s
-    // wait in step 6 warms the model; by the time step 7 runs, output has already
-    // been returned from a warm model).
+    // WHY a single cold-start retry in step 7:
+    // Step 7 runs after step 6 returned output — the model is warm in the common
+    // case. However, if step 6 succeeded on attempt 1 and the model subsequently
+    // unloads under memory pressure before step 7 runs, the strict-retry inference
+    // call can ETIMEDOUT with the model cold again. A single 15s wait-and-retry
+    // (identical to step 6's pattern) recovers this edge without adding a full
+    // retry loop. Fatal errors still skip the retry immediately.
     const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
     let result: { title: string; body: string }
     try {
@@ -455,12 +456,21 @@ async function run(): Promise<void> {
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {
+        core.debug(`[afm] Strict-retry attempt 1 error: ${String(e2)}`)
         if (isFatalAfmError(e2)) throw e2
-        throw new Error(
-          `[afm] Strict-prompt retry failed (binary: ${afmBin}): ${String(e2)}. ` +
-          'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
-          'consider increasing the timeout or pre-warming the runner.'
-        )
+        // Model may have unloaded between step 6 success and this call — wait and retry once.
+        core.info('[afm] Strict-retry attempt 1 failed — retrying in 15s...')
+        await new Promise(r => setTimeout(r, 15_000))
+        try {
+          raw = afmCli(afmBin, strictPrompt, afmOptions)
+        } catch (e3) {
+          if (isFatalAfmError(e3)) throw e3
+          throw new Error(
+            `[afm] Strict-prompt retry failed after cold-start recovery (binary: ${afmBin}): ${String(e3)}. ` +
+            'If this is ETIMEDOUT, the model may need more than 60s to load — ' +
+            'consider increasing the timeout or pre-warming the runner.'
+          )
+        }
       }
       result = parseAfmOutput(raw, tag)
     }

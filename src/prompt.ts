@@ -151,9 +151,11 @@ export function buildPrompt(
     '',
     `Previous tag: ${safePrevTag}`,
     `Target tag: ${safeTag}`,
-    '',
-    'Commits:',
-    ...commits.map(c => `- ${c}`),
+    ...(commits.length ? [
+      '',
+      'Commits:',
+      ...commits.map(c => `- ${c}`),
+    ] : []),
     ...(files.length ? [
       '',
       'Changed files:',

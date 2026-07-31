@@ -81,7 +81,7 @@ export function isFatalAfmError(e: unknown): boolean {
   //   Fatal (do NOT retry):
   //     "error: apple intelligence unavailable"  — .unavailable(reason) case
   //     "error: unknown model availability state" — @unknown default case
-  //     "error: afm-cli requires macos 26+"       — #available guard
+  //     "error: afm-cli requires macos"           — #available guard (version number varies)
   //     "error: foundationmodels framework not available" — #else branch
   //   Non-fatal (retryable — NOT in this list):
   //     "error: inference failed"  — session.respond() throw, may recover on retry
