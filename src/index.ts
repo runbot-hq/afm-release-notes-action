@@ -1,6 +1,6 @@
 import * as core from '@actions/core'
 import * as github from '@actions/github'
-import { spawnSync, execSync } from 'child_process'
+import { execSync } from 'child_process'
 import * as path from 'path'
 import * as fs from 'fs'
 import * as os from 'os'
@@ -108,6 +108,9 @@ async function run(): Promise<void> {
         'Expected a bare integer. This may indicate an afm-cli version mismatch or a warning line prepended to output.'
       )
     }
+    // The probe integer is not used for budget calculations — this is an
+    // availability check only. Logged at debug level for startup traceability.
+    core.debug(`[afm] Startup probe token count: ${parseInt(probeRaw, 10)}`)
     core.info('[afm] --count-tokens available ✓')
 
     // Instructions string for LanguageModelSession(instructions:).
@@ -324,6 +327,11 @@ async function run(): Promise<void> {
     // Once both lists are at 1, the (> 1 || > 1) condition is false and the
     // loop exits. The floor break fires first if the boilerplate alone exceeds
     // TOKEN_BUDGET (extremely unusual — would require a tag name of >28,000 tokens).
+    //
+    // LOOP INVARIANT: prompt is always built at the bottom of each iteration (or
+    // at init below), then measured at the top of the next iteration. The version
+    // of prompt that exits via `break` is the one just measured and confirmed to
+    // fit — it is the prompt passed to inference in step 6.
     let promptCommits = [...commits]
     let promptFiles = [...files]
     let prompt = buildPrompt(safeTag, safePrevTag, promptCommits, promptFiles, promptExtra)
@@ -420,8 +428,9 @@ async function run(): Promise<void> {
     // WHY no 15s retry loop:
     // Step 7 only runs after step 6 returned output (malformed, but returned).
     // The model is warm — cold-start ETIMEDOUT is not the failure mode here.
-    // A warm model that returned malformed output will not recover from a 15s
-    // pause on the same prompt.
+    // This holds whether step 6 succeeded on attempt 1 or attempt 2 (the 15s
+    // wait in step 6 warms the model; by the time step 7 runs, output has already
+    // been returned from a warm model).
     const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
     let result: { title: string; body: string }
     try {
