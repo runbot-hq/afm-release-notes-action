@@ -1025,10 +1025,15 @@ async function run(): Promise<void> {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {
         const detail = String(e2)
+        const isOverflow2 = isContextOverflowError(e2)
         throw new Error(
           `[afm] Strict-prompt retry failed (binary: ${afmBin}): ${detail}. ` +
-          'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
-          'consider increasing the timeout or pre-warming the runner.'
+          (isOverflow2
+            ? 'Context window overflow on strict-retry — token density is too high even at the reduced budget. ' +
+              'The strict-prompt budget (~11,868 chars) is larger than the overflow-retry budget (~9,000 chars); ' +
+              'if the overflow-retry prompt also overflowed, this is expected.'
+            : 'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
+              'consider increasing the timeout or pre-warming the runner.')
         )
       }
       result = parseAfmOutput(raw, tag)
