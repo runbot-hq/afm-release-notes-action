@@ -30893,6 +30893,8 @@ async function run() {
                 raw = (0, afm_1.afmCli)(afmBin, strictPrompt, afmOptions);
             }
             catch (e2) {
+                if ((0, afm_1.isFatalAfmError)(e2))
+                    throw e2;
                 const detail = String(e2);
                 const isOverflow2 = (0, afm_1.isContextOverflowError)(e2);
                 throw new Error(`[afm] Strict-prompt retry failed (binary: ${afmBin}): ${detail}. ` +
