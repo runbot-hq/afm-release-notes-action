@@ -507,6 +507,7 @@ async function run(): Promise<void> {
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {
+        if (isFatalAfmError(e2)) throw e2
         const detail = String(e2)
         const isOverflow2 = isContextOverflowError(e2)
         throw new Error(
