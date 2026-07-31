@@ -235,30 +235,30 @@ export function truncatePromptToFit(
   // DOES THIS LOOP TERMINATE?
   // ANSWER: Yes, always. Math.max(1, Math.floor(n/2)) pegs at 1 once n=1,
   // so each side stops shrinking independently at 1. Once BOTH lists reach
-  // length 1, (c.length > 0 || f.length > 0) remains true — the pathological-
-  // edge block below handles the 1+1 > charBudget case by dropping both to [].
-  // If either list arrives as [] (e.g. overflow-retry called with already-empty
-  // lists from step 5's pathological-edge drop), the halving body is guarded by
-  // the inner `> 1` checks and skips that list — but the outer condition uses
-  // > 0 so the loop does NOT exit prematurely; it falls through to the
-  // pathological-edge block, which drops the remaining non-empty list and
-  // rebuilds, correctly handling the 0+n and 0+0 cases.
+  // length 1, (c.length > 1 || f.length > 1) is false and the loop exits.
+  // The pathological-edge block below is unconditional (guarded only by
+  // prompt.length > charBudget, not by list lengths) so it always handles
+  // the residual case — whether lists arrived as [1,…] or as [].
   //
-  // WHY > 0 and not > 1?
-  // With > 1: if both lists are [] (length 0), (0 > 1 || 0 > 1) is immediately
-  // false — the loop exits without running, and the pathological-edge block is
-  // unreachable, returning a boilerplate-only prompt that silently exceeds
-  // charBudget. Changing to > 0 ensures the pathological-edge block is always
-  // reached when the prompt still exceeds charBudget, regardless of input length.
-  while (prompt.length > charBudget && (c.length > 0 || f.length > 0)) {
+  // WHY > 1 and not > 0?
+  // With > 0: if c=1 and f=[] (or vice versa), the outer condition stays true
+  // (1 > 0 || 0 > 0) but neither inner guard fires (c.length > 1 is false,
+  // f.length > 1 is false), so the loop rebuilds an identical prompt on every
+  // iteration — an infinite no-op spin. Reverting to > 1 exits the loop as
+  // soon as neither list can shrink further, and the pathological-edge block
+  // below handles all residual cases (0+0, 1+0, 0+1, 1+1 > charBudget)
+  // unconditionally. Do NOT change this back to > 0.
+  while (prompt.length > charBudget && (c.length > 1 || f.length > 1)) {
     if (c.length > 1) c = c.slice(0, Math.max(1, Math.floor(c.length / 2)))
     if (f.length > 1) f = f.slice(0, Math.max(1, Math.floor(f.length / 2)))
     prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
   }
 
   // Pathological edge: even 1 commit + 1 file exceeds charBudget (extremely
-  // long filenames or commit messages), or both lists arrived as [] and the
+  // long filenames or commit messages), or lists arrived as [] and the
   // boilerplate alone exceeds charBudget. Drop both lists entirely.
+  // This block is unconditional — it runs for any residual case where
+  // prompt.length > charBudget after the loop (0+0, 1+0, 0+1, 1+1).
   //
   // KNOWN RESIDUAL GAP: after dropping, the prompt still contains boilerplate
   // + tags + promptExtra ≈ 1,500 chars worst-case (fixed boilerplate ~1,100

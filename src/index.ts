@@ -357,9 +357,15 @@ async function run(): Promise<void> {
           raw = afmCli(afmBin, smallerPrompt, afmOptions)
         } catch (e2) {
           const detail = String(e2)
+          const isOverflow2 = isContextOverflowError(e2)
           throw new Error(
             `[afm] Overflow-retry failed (binary: ${afmBin}): ${detail}. ` +
-            `Original overflow: ${String(e).slice(0, 200)}`
+            (isOverflow2
+              ? `Context window overflow on overflow-retry — token density is too high even at the reduced budget (${overflowBudget} chars). ` +
+                'This is extremely unusual; the token density of this release diff may be abnormally high.'
+              : 'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
+                'consider increasing the timeout or pre-warming the runner.') +
+            ` Original overflow: ${String(e).slice(0, 200)}`
           )
         }
       } else {
