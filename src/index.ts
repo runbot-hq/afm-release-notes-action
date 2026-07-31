@@ -72,23 +72,58 @@ async function run(): Promise<void> {
     // number, the flag is available and the runner OS is sufficient.
     // The dummy prompt is intentionally short to keep the startup check fast.
     //
-    // Return value is validated with isNaN for consistency with the preflight
-    // loop's own guard — if afm-cli returns a non-numeric string here (e.g. a
-    // warning line on a future version), we surface the problem at startup
-    // rather than letting it propagate to the first real preflight call.
+    // TWO distinct failure modes are handled separately:
+    //   A. afmCli throws (exit non-zero, spawn error, ENOMEM, etc.)
+    //      → isFatalAfmError classifies it; availability errors surface as
+    //        the macOS 26.4+ message; unrelated spawn errors get a generic message.
+    //   B. afmCli succeeds (exit 0) but returns non-numeric output
+    //      → indicates a future afm-cli format change, not an OS version problem;
+    //        surfaced with a distinct "unexpected output" message.
+    // Do NOT merge these two paths into a single catch — the error diagnoses differ.
+    let probeRaw: string
     try {
-      const probeRaw = afmCli(afmBin, 'ping', { countTokens: true })
-      if (isNaN(parseInt(probeRaw, 10))) {
-        throw new Error(`afm-cli --count-tokens returned non-numeric output: "${probeRaw}"`)
-      }
+      probeRaw = afmCli(afmBin, 'ping', { countTokens: true })
     } catch (e) {
+      if (isFatalAfmError(e)) {
+        throw new Error(
+          '[afm] afm-cli --count-tokens failed — this action requires macOS 26.4+. ' +
+          `Runner OS: ${process.env.ImageOS ?? process.env.RUNNER_OS ?? 'unknown'}. ` +
+          `Error: ${String(e)}`
+        )
+      }
       throw new Error(
-        '[afm] afm-cli --count-tokens failed — this action requires macOS 26.4+. ' +
-        `Runner OS: ${process.env.ImageOS ?? process.env.RUNNER_OS ?? 'unknown'}. ` +
-        `Error: ${String(e)}`
+        `[afm] afm-cli failed to spawn during --count-tokens probe (binary: ${afmBin}): ${String(e)}. ` +
+        'Check that the binary is present, executable, and the runner has sufficient resources.'
+      )
+    }
+    if (isNaN(parseInt(probeRaw, 10))) {
+      throw new Error(
+        `[afm] afm-cli --count-tokens returned unexpected output: "${probeRaw}". ` +
+        'Expected a bare integer. This may indicate an afm-cli version mismatch or a warning line prepended to output.'
       )
     }
     core.info('[afm] --count-tokens available ✓')
+
+    // Instructions string for LanguageModelSession(instructions:).
+    // Declared and validated here — before step 5 — so a violation is caught at
+    // action startup rather than after all preflight CLI calls complete.
+    // INVARIANT: keep this string under ~190 chars. The 60-token reserve in
+    // TOKEN_BUDGET is calibrated to this length (~190 chars ÷ 3.29 chars/token
+    // ≈ 58 tokens). Instructions are not included in the afm-cli --count-tokens
+    // result (they are passed separately at inference time), so this reservation
+    // is the only guard. If this string grows, update the reserve in TOKEN_BUDGET.
+    const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
+    // Runtime guard for the 190-char invariant above. A future edit that grows
+    // this string without noticing the comment would silently erode the 60-token
+    // reserve — this throws at action startup (before any AFM call) so the
+    // violation is caught in CI rather than corrupting a live release.
+    if (instructions.length > 190) {
+      throw new Error(
+        `[afm] instructions string is ${instructions.length} chars — exceeds the 190-char invariant. ` +
+        'Update the TOKEN_BUDGET reserve if the string must grow.'
+      )
+    }
+    const afmOptions = { instructions }
 
     // 1. Shallow clone guard
     let isShallow = false
@@ -308,6 +343,15 @@ async function run(): Promise<void> {
         promptCommits = []
         promptFiles = []
         prompt = buildPrompt(safeTag, safePrevTag, promptCommits, promptFiles, promptExtra)
+        // Measure the floor prompt before proceeding to preserve the invariant
+        // that step 6 always receives a prompt confirmed to fit TOKEN_BUDGET.
+        // Boilerplate-only prompts are tiny in practice, but the guarantee should
+        // be exact rather than assumed.
+        const floorRaw = afmCli(afmBin, prompt, { countTokens: true })
+        const floorCount = parseInt(floorRaw, 10)
+        if (isNaN(floorCount)) throw new Error(`[afm] --count-tokens returned non-numeric output on floor prompt: "${floorRaw}"`)
+        if (floorCount > TOKEN_BUDGET) throw new Error(`[afm] Floor prompt (boilerplate only) exceeds TOKEN_BUDGET (${floorCount} > ${TOKEN_BUDGET}). Tag names may be pathologically long.`)
+        core.debug(`[afm] Floor prompt token count: ${floorCount} / ${TOKEN_BUDGET}`)
         break
       }
       if (promptCommits.length > 1) promptCommits = promptCommits.slice(0, Math.max(1, Math.floor(promptCommits.length / 2)))
@@ -323,25 +367,6 @@ async function run(): Promise<void> {
       )
     }
     core.info(`[afm] Prompt ready: ${prompt.length} chars, ${promptCommits.length} commits, ${promptFiles.length} files`)
-
-    // Instructions string for LanguageModelSession(instructions:).
-    // INVARIANT: keep this string under ~190 chars. The 60-token reserve in
-    // TOKEN_BUDGET is calibrated to this length (~190 chars ÷ 3.29 chars/token
-    // ≈ 58 tokens). Instructions are not included in the afm-cli --count-tokens
-    // result (they are passed separately at inference time), so this reservation
-    // is the only guard. If this string grows, update the reserve in TOKEN_BUDGET.
-    const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
-    // Runtime guard for the 190-char invariant above. A future edit that grows
-    // this string without noticing the comment would silently erode the 60-token
-    // reserve — this throws at action startup (before any AFM call) so the
-    // violation is caught in CI rather than corrupting a live release.
-    if (instructions.length > 190) {
-      throw new Error(
-        `[afm] instructions string is ${instructions.length} chars — exceeds the 190-char invariant. ` +
-        'Update the TOKEN_BUDGET reserve if the string must grow.'
-      )
-    }
-    const afmOptions = { instructions }
 
     // 6. Call afm-cli
     //
@@ -382,9 +407,10 @@ async function run(): Promise<void> {
     // fits TOKEN_BUDGET with exact token counts.
     //
     // WHY overflow on the strict-retry is impossible:
-    // prompt is confirmed ≤ 7,832 tokens by the preflight. The suffix is ~153
-    // chars (~46 tokens at 3.29 chars/token). 7,832 + 46 = 7,878, which is below
-    // 8,132 (8,192 − 60 instructions reserve) — the true prompt-usable ceiling.
+    // prompt is confirmed ≤ 7,832 tokens by the preflight. The suffix is 152 chars.
+    // 7,832 + (suffix token count) is well below 8,132 (8,192 − 60 instructions
+    // reserve) — the true prompt-usable ceiling. The suffix token cost can be
+    // verified exactly with: afm-cli --count-tokens --prompt "$strictSuffix".
     // NOTE: the 300-token response headroom is reserved for model output and is
     // NOT reusable as prompt slack. Do not cite it as the reason overflow is safe.
     //
