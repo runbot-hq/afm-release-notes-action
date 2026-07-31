@@ -89,14 +89,17 @@ async function run(): Promise<void> {
     // number, the flag is available and the runner OS is sufficient.
     // The dummy prompt is intentionally short to keep the startup check fast.
     //
-    // TWO distinct failure modes are handled separately:
-    //   A. afmCli throws (exit non-zero, spawn error, ENOMEM, etc.)
-    //      → isFatalAfmError classifies it; availability errors surface as
-    //        the macOS 26.4+ message; unrelated spawn errors get a generic message.
-    //   B. afmCli succeeds (exit 0) but returns non-numeric output
-    //      → indicates a future afm-cli format change, not an OS version problem;
-    //        surfaced with a distinct "unexpected output" message.
-    // Do NOT merge these two paths into a single catch — the error diagnoses differ.
+    // THREE distinct failure modes are handled separately in the catch below:
+    //   A. isFatalAfmError returns true for a permission/MDM denial
+    //      → binary is present but not authorised to run — surfaced as an
+    //        access/MDM error, NOT a macOS version error.
+    //   B. isFatalAfmError returns true for an availability/OS-version error
+    //      → afm-cli ran but Apple Intelligence is unavailable or the OS is too
+    //        old — surfaced as the macOS 26.4+ message.
+    //   C. afmCli throws for any other reason (ENOMEM, spawn failure, etc.)
+    //      → generic spawn error message.
+    // Do NOT collapse A and B into a single isFatalAfmError branch — the
+    // diagnoses are actionably different (check permissions vs. upgrade macOS).
     //
     // WHY /^\d+$/ instead of parseInt/isNaN:
     // parseInt("1 token", 10) === 1 — it stops at the first non-numeric character
@@ -108,6 +111,19 @@ async function run(): Promise<void> {
       probeRaw = afmCli(afmBin, 'ping', { countTokens: true })
     } catch (e) {
       if (isFatalAfmError(e)) {
+        const msg = String(e).toLowerCase()
+        const isAccessDenied =
+          /not authorized/i.test(msg) ||
+          /permission denied/i.test(msg) ||
+          /mdm policy/i.test(msg)
+        if (isAccessDenied) {
+          throw new Error(
+            `[afm] afm-cli --count-tokens failed — binary not authorised to run. ` +
+            'This is typically an MDM policy restriction or a missing entitlement. ' +
+            `Runner OS: ${process.env.ImageOS ?? process.env.RUNNER_OS ?? 'unknown'}. ` +
+            `Error: ${String(e)}`
+          )
+        }
         throw new Error(
           '[afm] afm-cli --count-tokens failed — this action requires macOS 26.4+. ' +
           `Runner OS: ${process.env.ImageOS ?? process.env.RUNNER_OS ?? 'unknown'}. ` +
@@ -305,8 +321,22 @@ async function run(): Promise<void> {
       throw e
     }
 
-    let commits = compare.data.commits.map(c => c.commit.message.slice(0, 120))
-    let files = compare.data.files?.map(f => `${f.status} ${f.filename}`) ?? []
+    // WHY control characters are stripped from commit messages and file paths:
+    // safeTag, safePrevTag, and promptExtra all have /[\x00-\x1f\x7f]/g stripped
+    // before being embedded in the prompt. Commit messages and file paths come
+    // from the GitHub API and can contain control characters — in particular \n
+    // and \r from multi-line commit messages, and \t from tooling-generated
+    // messages. These are not a shell injection risk (afmCli uses spawnSync)
+    // but they corrupt the "- ${msg}" / "- ${file}" line format in buildPrompt,
+    // causing the model to see malformed bullet structure. Replaced with a space
+    // rather than the empty string — invisible deletion is harder to diagnose
+    // than a visible placeholder when debugging unexpected model output.
+    let commits = compare.data.commits.map(c =>
+      c.commit.message.replace(/[\x00-\x1f\x7f]/g, ' ').trimEnd().slice(0, 120)
+    )
+    let files = compare.data.files?.map(f =>
+      `${f.status} ${f.filename.replace(/[\x00-\x1f\x7f]/g, ' ')}`
+    ) ?? []
 
     const totalCommits = commits.length
     const totalFiles = files.length
