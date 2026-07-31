@@ -30656,6 +30656,11 @@ async function run() {
         //      to usedCommits/usedFiles here, updated by step 6 overflow path if taken)
         //      so the strict-retry never re-expands to a prompt larger than the one
         //      that last succeeded.
+        //
+        // IMMUTABILITY CONTRACT: usedCommits/usedFiles are the internal arrays returned
+        // by truncatePromptToFit. Do NOT push/pop/splice them after this point — they
+        // seed activeCommits/activeFiles used by steps 6 and 7. Copy first if needed:
+        //   const copy = [...usedCommits]
         const { prompt, commits: usedCommits, files: usedFiles } = (0, prompt_1.truncatePromptToFit)(safeTag, safePrevTag, commits, files, promptExtra);
         // activeCommits/activeFiles track the narrowest truncated lists seen so far.
         // Initialised from step 5; updated to overflowCommits/overflowFiles if step 6
@@ -30723,6 +30728,14 @@ async function run() {
                 // If the re-truncated prompt still overflows (extremely unusual), it will
                 // throw and surface via core.setFailed with the overflow detail.
                 core.warning(`[afm] Attempt 1 — context window overflow (${String(e).slice(0, 120)}). Re-truncating to 75% and retrying immediately...`);
+                // WHY Math.min(prompt.length, MAX_PROMPT_CHARS) and not just prompt.length * 0.75:
+                // truncatePromptToFit (step 5) enforces charBudget = MAX_PROMPT_CHARS, so
+                // prompt.length is always ≤ MAX_PROMPT_CHARS here — the Math.min is a no-op
+                // in the normal path. It is retained as a future-proof defensive clamp: if a
+                // caller ever passes a larger charBudget to truncatePromptToFit, prompt.length
+                // could exceed MAX_PROMPT_CHARS and the clamp becomes load-bearing. The intent
+                // is "75% of the actual prompt length, capped at MAX_PROMPT_CHARS" — not
+                // "75% of MAX_PROMPT_CHARS unconditionally". Not a bug; not redundant by accident.
                 const overflowBudget = Math.floor(Math.min(prompt.length, prompt_1.MAX_PROMPT_CHARS) * 0.75);
                 // usedCommits/usedFiles intentionally — already-capped by step 5; passing
                 // the original lists would re-expand the prompt past overflowBudget.
@@ -30731,8 +30744,20 @@ async function run() {
                 // overflow values so that step 7's strict-retry (if needed) builds from
                 // the smallest known-good truncation boundary and budget, never re-expanding
                 // to a prompt larger than the one that already overflowed.
+                //
+                // IMMUTABILITY CONTRACT: overflowCommits/overflowFiles are the internal arrays
+                // returned by truncatePromptToFit. Do NOT push/pop/splice them — they are
+                // aliased by activeCommits/activeFiles and read by step 7's strict-retry.
+                // Copy first if you need to extend: [...activeCommits].
                 activeCommits = overflowCommits;
                 activeFiles = overflowFiles;
+                // WHY overflowBudget and not smallerPrompt.length:
+                // smallerPrompt.length ≤ overflowBudget (the halving loop can land below
+                // budget). Step 7 re-truncates with this value as its cap, so it will produce
+                // a prompt ≤ overflowBudget regardless. Using smallerPrompt.length would be
+                // marginally tighter but step 7's truncatePromptToFit call would reach the
+                // same or smaller result anyway. overflowBudget is the correct "budget we
+                // passed to the model" sentinel — not a bug.
                 activeOverflowBudget = overflowBudget;
                 // Capture the overflow error detail for downstream error messages.
                 // If step 7 later fails (e.g. strict-retry returns malformed JSON), this
