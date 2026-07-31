@@ -318,7 +318,20 @@ async function run(): Promise<void> {
     // injection risk (afmCli uses spawnSync), but control chars could corrupt
     // the prompt content or cause unexpected model behaviour. Strip applied
     // consistently with all other user-controlled strings embedded in the prompt.
-    const promptExtra = core.getInput('prompt_extra').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 300)
+    //
+    // WHY warn on prompt_extra truncation:
+    // The 300-char cap on prompt_extra is a silent slice — a user who supplies
+    // a longer instruction string would have it truncated with no log entry,
+    // potentially causing confusing model output. The warning is emitted before
+    // slicing so the original length is visible in the Actions log.
+    const promptExtraRaw = core.getInput('prompt_extra').replace(/[\x00-\x1f\x7f]/g, '')
+    if (promptExtraRaw.length > 300) {
+      core.warning(
+        `[afm] prompt_extra is ${promptExtraRaw.length} chars — truncating to 300. ` +
+        'Shorten the prompt_extra input to suppress this warning.'
+      )
+    }
+    const promptExtra = promptExtraRaw.slice(0, 300)
     const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
     const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
 
