@@ -30051,6 +30051,11 @@ function isFatalAfmError(e) {
     //                         'permission denied' is the canonical OS-level message for
     //                         EACCES on macOS and is far less likely to appear accidentally
     //                         in non-permission-related error text.
+    //                         THEORETICAL EDGE: if stderr ever contains 'permission denied'
+    //                         from non-POSIX sources (e.g. a model failure message that
+    //                         quotes a commit containing that phrase), this would be a
+    //                         false-fatal. In practice afm-cli stderr is tightly controlled
+    //                         and does not include commit content, so the risk is negligible.
     //   'mdm policy'       — MDM policy strings
     const msg = String(e).toLowerCase();
     return (msg.includes('error: apple intelligence unavailable') ||
@@ -30465,6 +30470,12 @@ async function run() {
         //      → indicates a future afm-cli format change, not an OS version problem;
         //        surfaced with a distinct "unexpected output" message.
         // Do NOT merge these two paths into a single catch — the error diagnoses differ.
+        //
+        // WHY /^\d+$/ instead of parseInt/isNaN:
+        // parseInt("1 token", 10) === 1 — it stops at the first non-numeric character
+        // and the isNaN guard passes silently. /^\d+$/ requires the entire string to be
+        // digits, catching warning lines prepended to the count (e.g. "warning: ...\n1"
+        // after trim) or suffixed units. Used consistently in probe and preflight loop.
         let probeRaw;
         try {
             probeRaw = (0, afm_1.afmCli)(afmBin, 'ping', { countTokens: true });
@@ -30478,7 +30489,7 @@ async function run() {
             throw new Error(`[afm] afm-cli failed to spawn during --count-tokens probe (binary: ${afmBin}): ${String(e)}. ` +
                 'Check that the binary is present, executable, and the runner has sufficient resources.');
         }
-        if (isNaN(parseInt(probeRaw, 10))) {
+        if (!/^\d+$/.test(probeRaw)) {
             throw new Error(`[afm] afm-cli --count-tokens returned unexpected output: "${probeRaw}". ` +
                 'Expected a bare integer. This may indicate an afm-cli version mismatch or a warning line prepended to output.');
         }
@@ -30491,6 +30502,10 @@ async function run() {
         // ≈ 58 tokens). Instructions are not included in the afm-cli --count-tokens
         // result (they are passed separately at inference time), so this reservation
         // is the only guard. If this string grows, update the reserve in TOKEN_BUDGET.
+        // IMPORTANT: ASCII-only. String.prototype.length counts UTF-16 code units, which
+        // equals char count only for ASCII. Non-ASCII characters (em-dash, curly quotes,
+        // CJK, etc.) tokenise at higher density than ASCII — adding them would silently
+        // underestimate the token cost and erode the 60-token reserve. Keep ASCII-only.
         const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}';
         // Runtime guard for the 190-char invariant above. A future edit that grows
         // this string without noticing the comment would silently erode the 60-token
@@ -30682,18 +30697,18 @@ async function run() {
         core.info('[afm] Running token preflight...');
         while (true) {
             const raw = (0, afm_1.afmCli)(afmBin, prompt, { countTokens: true });
-            const tokenCount = parseInt(raw, 10);
-            // Guard: afm-cli --count-tokens must return a bare integer. If it returns
-            // anything else (debug line, empty string, future format change), parseInt
-            // yields NaN and NaN <= TOKEN_BUDGET is false — the loop would spin to the
-            // floor and silently generate a zero-context release note. Throw immediately
-            // so the root cause is visible in the Actions log rather than buried.
-            if (isNaN(tokenCount)) {
+            // Guard: afm-cli --count-tokens must return a bare integer. /^\d+$/ is used
+            // instead of parseInt/isNaN because parseInt("1 token", 10) === 1 — it stops
+            // at the first non-numeric character and the isNaN guard passes silently.
+            // /^\d+$/ requires the full string to be digits, catching prepended warning
+            // lines or suffixed units that parseInt would silently accept.
+            if (!/^\d+$/.test(raw)) {
                 throw new Error(`[afm] --count-tokens returned non-numeric output: "${raw}"`);
             }
+            const tokenCount = parseInt(raw, 10);
             core.debug(`[afm] Preflight token count: ${tokenCount} / ${TOKEN_BUDGET}`);
             if (tokenCount <= TOKEN_BUDGET)
-                break;
+                break; // prompt holds the version just measured and confirmed to fit
             if (promptCommits.length <= 1 && promptFiles.length <= 1) {
                 // Floor: boilerplate + 1 commit + 1 file still exceeds budget.
                 // Extremely unusual — drop both lists and proceed. The model will
@@ -30708,9 +30723,9 @@ async function run() {
                 // Boilerplate-only prompts are tiny in practice, but the guarantee should
                 // be exact rather than assumed.
                 const floorRaw = (0, afm_1.afmCli)(afmBin, prompt, { countTokens: true });
-                const floorCount = parseInt(floorRaw, 10);
-                if (isNaN(floorCount))
+                if (!/^\d+$/.test(floorRaw))
                     throw new Error(`[afm] --count-tokens returned non-numeric output on floor prompt: "${floorRaw}"`);
+                const floorCount = parseInt(floorRaw, 10);
                 if (floorCount > TOKEN_BUDGET)
                     throw new Error(`[afm] Floor prompt (boilerplate only) exceeds TOKEN_BUDGET (${floorCount} > ${TOKEN_BUDGET}). Tag names may be pathologically long.`);
                 core.debug(`[afm] Floor prompt token count: ${floorCount} / ${TOKEN_BUDGET}`);
@@ -30767,12 +30782,13 @@ async function run() {
         // fits TOKEN_BUDGET with exact token counts.
         //
         // WHY overflow on the strict-retry is impossible:
-        // prompt is confirmed ≤ 7,832 tokens by the preflight. The suffix is 152 chars.
-        // 7,832 + (suffix token count) is well below 8,132 (8,192 − 60 instructions
-        // reserve) — the true prompt-usable ceiling. The suffix token cost can be
-        // verified exactly with: afm-cli --count-tokens --prompt "$strictSuffix".
-        // NOTE: the 300-token response headroom is reserved for model output and is
-        // NOT reusable as prompt slack. Do not cite it as the reason overflow is safe.
+        // The preflight confirmed prompt ≤ 7,832 tokens (TOKEN_BUDGET). The suffix is
+        // 152 chars; its exact token cost is measurable with:
+        //   afm-cli --count-tokens --prompt "$strictSuffix"
+        // At any realistic token density, prompt + suffix stays well below 8,132
+        // (= 8,192 − 60 instructions reserve), the true prompt-usable ceiling.
+        // The 300-token response headroom is a separate reservation for model output
+        // and is NOT part of this calculation — do not cite it as prompt slack.
         //
         // WHY no 15s retry loop:
         // Step 7 only runs after step 6 returned output (malformed, but returned).
