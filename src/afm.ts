@@ -97,6 +97,11 @@ export function isFatalAfmError(e: unknown): boolean {
   //                         'permission denied' is the canonical OS-level message for
   //                         EACCES on macOS and is far less likely to appear accidentally
   //                         in non-permission-related error text.
+  //                         THEORETICAL EDGE: if stderr ever contains 'permission denied'
+  //                         from non-POSIX sources (e.g. a model failure message that
+  //                         quotes a commit containing that phrase), this would be a
+  //                         false-fatal. In practice afm-cli stderr is tightly controlled
+  //                         and does not include commit content, so the risk is negligible.
   //   'mdm policy'       — MDM policy strings
   const msg = String(e).toLowerCase()
   return (
