@@ -56,6 +56,27 @@ async function run(): Promise<void> {
       )
     }
 
+    // Verify --count-tokens is available. This flag requires macOS 26.4+
+    // (SystemLanguageModel.tokenCount(for:) API). If the runner is on an older
+    // macOS 26.x release, afm-cli exits 1 and we surface a clear error here
+    // rather than letting the preflight loop throw mid-run with a cryptic message.
+    //
+    // WHY a dummy prompt instead of a dedicated --version or --ping flag:
+    // afm-cli has no version/ping flag. Passing a minimal prompt exercises the
+    // exact code path the preflight loop uses — if it exits 0 and returns a
+    // number, the flag is available and the runner OS is sufficient.
+    // The dummy prompt is intentionally short to keep the startup check fast.
+    try {
+      afmCli(afmBin, 'ping', { countTokens: true })
+    } catch (e) {
+      throw new Error(
+        '[afm] afm-cli --count-tokens failed — this action requires macOS 26.4+. ' +
+        `Runner OS: ${process.env.ImageOS ?? process.env.RUNNER_OS ?? 'unknown'}. ` +
+        `Error: ${String(e)}`
+      )
+    }
+    core.info('[afm] --count-tokens available ✓')
+
     // 1. Shallow clone guard
     let isShallow = false
     try {
@@ -251,7 +272,16 @@ async function run(): Promise<void> {
 
     core.info('[afm] Running token preflight...')
     while (true) {
-      const tokenCount = parseInt(afmCli(afmBin, prompt, { countTokens: true }), 10)
+      const raw = afmCli(afmBin, prompt, { countTokens: true })
+      const tokenCount = parseInt(raw, 10)
+      // Guard: afm-cli --count-tokens must return a bare integer. If it returns
+      // anything else (debug line, empty string, future format change), parseInt
+      // yields NaN and NaN <= TOKEN_BUDGET is false — the loop would spin to the
+      // floor and silently generate a zero-context release note. Throw immediately
+      // so the root cause is visible in the Actions log rather than buried.
+      if (isNaN(tokenCount)) {
+        throw new Error(`[afm] --count-tokens returned non-numeric output: "${raw}"`)
+      }
       core.debug(`[afm] Preflight token count: ${tokenCount} / ${TOKEN_BUDGET}`)
       if (tokenCount <= TOKEN_BUDGET) break
       if (promptCommits.length <= 1 && promptFiles.length <= 1) {
