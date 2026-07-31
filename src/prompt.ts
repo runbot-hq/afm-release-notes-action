@@ -235,16 +235,30 @@ export function truncatePromptToFit(
   // DOES THIS LOOP TERMINATE?
   // ANSWER: Yes, always. Math.max(1, Math.floor(n/2)) pegs at 1 once n=1,
   // so each side stops shrinking independently at 1. Once BOTH lists reach
-  // length 1, (c.length > 1 || f.length > 1) is false and the loop exits.
-  // The pathological-edge block below handles the rare 1+1 > charBudget case.
-  while (prompt.length > charBudget && (c.length > 1 || f.length > 1)) {
+  // length 1, (c.length > 0 || f.length > 0) remains true — the pathological-
+  // edge block below handles the 1+1 > charBudget case by dropping both to [].
+  // If either list arrives as [] (e.g. overflow-retry called with already-empty
+  // lists from step 5's pathological-edge drop), the halving body is guarded by
+  // the inner `> 1` checks and skips that list — but the outer condition uses
+  // > 0 so the loop does NOT exit prematurely; it falls through to the
+  // pathological-edge block, which drops the remaining non-empty list and
+  // rebuilds, correctly handling the 0+n and 0+0 cases.
+  //
+  // WHY > 0 and not > 1?
+  // With > 1: if both lists are [] (length 0), (0 > 1 || 0 > 1) is immediately
+  // false — the loop exits without running, and the pathological-edge block is
+  // unreachable, returning a boilerplate-only prompt that silently exceeds
+  // charBudget. Changing to > 0 ensures the pathological-edge block is always
+  // reached when the prompt still exceeds charBudget, regardless of input length.
+  while (prompt.length > charBudget && (c.length > 0 || f.length > 0)) {
     if (c.length > 1) c = c.slice(0, Math.max(1, Math.floor(c.length / 2)))
     if (f.length > 1) f = f.slice(0, Math.max(1, Math.floor(f.length / 2)))
     prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
   }
 
   // Pathological edge: even 1 commit + 1 file exceeds charBudget (extremely
-  // long filenames or commit messages). Drop both lists entirely.
+  // long filenames or commit messages), or both lists arrived as [] and the
+  // boilerplate alone exceeds charBudget. Drop both lists entirely.
   //
   // KNOWN RESIDUAL GAP: after dropping, the prompt still contains boilerplate
   // + tags + promptExtra ≈ 1,500 chars worst-case (fixed boilerplate ~1,100
