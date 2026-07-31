@@ -30629,21 +30629,22 @@ async function run() {
         // always reference the same string — do NOT duplicate or edit this string
         // without updating the charBudget call in step 7.
         //
-        // IMPORTANT: strictSuffix must remain pure ASCII.
-        // String.prototype.length counts UTF-16 code units. For ASCII this equals
-        // the char count AFM sees, keeping the charBudget math exact. Adding emoji
-        // or non-ASCII here would silently miscalculate headroom. (~130 chars)
+        // IMPORTANT: strictSuffix must contain only single-code-unit characters (U+0000–U+007F).
+        // String.prototype.length counts UTF-16 code units. For characters in this range
+        // .length equals the character count AFM sees, keeping the charBudget math exact.
+        // Any character outside this range (emoji, non-ASCII letters, arrows, curly quotes)
+        // is encoded as two UTF-16 code units (surrogate pair) or as a multi-byte UTF-8
+        // sequence, making .length smaller than the actual encoded size and silently
+        // underestimating the remaining budget. The guard below catches this at action
+        // startup — long before any AFM call — so the miscalculation is caught in CI
+        // rather than corrupting a live release. (~130 chars)
         const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}';
-        // WHY this guard exists:
-        // String.prototype.length counts UTF-16 code units, not bytes or tokens.
-        // For pure ASCII the count equals what AFM sees, so the charBudget
-        // subtraction (MAX_PROMPT_CHARS - strictSuffix.length) is exact.
-        // A non-ASCII edit (emoji, arrow, curly quote) would silently make
-        // .length smaller than the actual encoded size, underestimating headroom.
-        // This throws at action startup — long before any AFM call — so the
-        // miscalculation is caught in CI rather than corrupting a live release.
+        // Guard: rejects any character above U+007F (i.e. outside the single-code-unit
+        // ASCII range). Control characters (U+0000–U+001F, U+007F) are single-code-unit
+        // and do not affect .length accuracy — they are intentionally allowed through.
+        // The risk being guarded is multi-byte characters (U+0080+), not control chars.
         if (!/^[\x00-\x7f]*$/.test(strictSuffix)) {
-            throw new Error('Internal error: strictSuffix contains non-ASCII characters — charBudget calculation would be incorrect. Keep strictSuffix pure ASCII.');
+            throw new Error('Internal error: strictSuffix contains characters above U+007F — charBudget calculation would be incorrect. Keep all characters in the U+0000–U+007F range.');
         }
         // usedCommits/usedFiles: post-truncation lists retained for use in three places:
         //   1. The truncation warning and core.info log immediately below.
@@ -30665,10 +30666,15 @@ async function run() {
         // activeOverflowBudget tracks the tightest char budget seen so far.
         // Defaults to MAX_PROMPT_CHARS (no overflow path taken). Updated to
         // overflowBudget if step 6 takes the overflow-retry path, so step 7
-        // caps its budget to Math.min(MAX_PROMPT_CHARS - strictSuffix.length,
-        // activeOverflowBudget) and never sends a prompt larger than the one
+        // caps its budget to Math.min(MAX_PROMPT_CHARS, activeOverflowBudget)
+        // - strictSuffix.length and never sends a prompt larger than the one
         // that already overflowed.
         let activeOverflowBudget = prompt_1.MAX_PROMPT_CHARS;
+        // priorOverflowDetail captures the step-6 overflow error string if the
+        // overflow path was taken. Appended to any subsequent failure message so
+        // that a double-failure (overflow → malformed strict-retry output) carries
+        // the full error chain in core.setFailed rather than only the later error.
+        let priorOverflowDetail;
         if (usedCommits.length < postFilterCommitCount || usedFiles.length < postFilterFileCount) {
             core.warning(`[afm] Prompt truncated to fit AFM context window (${prompt_1.MAX_PROMPT_CHARS} chars): ` +
                 `commits ${totalCommits} → ${postFilterCommitCount} → ${usedCommits.length}, ` +
@@ -30725,6 +30731,11 @@ async function run() {
                 activeCommits = overflowCommits;
                 activeFiles = overflowFiles;
                 activeOverflowBudget = overflowBudget;
+                // Capture the overflow error detail for downstream error messages.
+                // If step 7 later fails (e.g. strict-retry returns malformed JSON), this
+                // string is appended to core.setFailed so the full error chain is visible
+                // in the Actions log — not just the final format-parse failure.
+                priorOverflowDetail = String(e).slice(0, 200);
                 if (overflowCommits.length === 0 && overflowFiles.length === 0) {
                     core.warning('[afm] Overflow re-truncation dropped all commits and files — ' +
                         'release note will be generated with no diff context. ' +
@@ -30753,7 +30764,7 @@ async function run() {
                 }
                 catch (e2) {
                     const detail = String(e2);
-                    throw new Error(`[afm] Attempt 2 failed (binary: ${afmBin}): ${detail}. ` +
+                    throw new Error(`[afm] Cold-start retry failed (binary: ${afmBin}): ${detail}. ` +
                         'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
                         'consider increasing the timeout or pre-warming the runner.');
                 }
@@ -30833,9 +30844,18 @@ async function run() {
                         ? 'Context window overflow on strict-retry — token density is too high even at the reduced budget. ' +
                             `Strict-retry budget: ${strictBudget} + ${strictSuffix.length} suffix chars.`
                         : 'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
-                            'consider increasing the timeout or pre-warming the runner.'));
+                            'consider increasing the timeout or pre-warming the runner.') +
+                    (priorOverflowDetail ? ` Prior overflow (step 6): ${priorOverflowDetail}` : ''));
             }
-            result = (0, prompt_1.parseAfmOutput)(raw, tag);
+            // If strict-retry returned output but it still fails to parse, propagate
+            // with prior overflow context attached so the full chain is visible.
+            try {
+                result = (0, prompt_1.parseAfmOutput)(raw, tag);
+            }
+            catch (e3) {
+                throw new Error(`[afm] Strict-retry output still malformed: ${String(e3).slice(0, 300)}.` +
+                    (priorOverflowDetail ? ` Prior overflow (step 6): ${priorOverflowDetail}` : ''));
+            }
         }
         const { title, body } = result;
         if (!title || !body)
