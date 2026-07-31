@@ -30042,28 +30042,28 @@ function isFatalAfmError(e) {
     //
     // SOURCE 2 — OS / MDM errors surfaced via spawnSync result.error or raw stderr.
     //   'not authorized'   — macOS MDM/entitlement denial
-    //   'permission denied' — POSIX EACCES, matched via Node.js error message rather
-    //                         than err.code so it catches both Error objects and raw
-    //                         stderr strings from spawnSync. 'eacces' was used previously
-    //                         but is too broad — it can appear in file paths or commit
-    //                         messages propagated into error strings, causing a false-fatal
-    //                         classification that suppresses a potentially recoverable retry.
-    //                         'permission denied' is the canonical OS-level message for
-    //                         EACCES on macOS and is far less likely to appear accidentally
-    //                         in non-permission-related error text.
-    //                         THEORETICAL EDGE: if stderr ever contains 'permission denied'
-    //                         from non-POSIX sources (e.g. a model failure message that
-    //                         quotes a commit containing that phrase), this would be a
-    //                         false-fatal. In practice afm-cli stderr is tightly controlled
-    //                         and does not include commit content, so the risk is negligible.
-    //   'mdm policy'       — MDM policy strings
+    //   'permission denied' — POSIX EACCES.
+    //
+    //   WHY these are matched with /^.../m (line-anchored) instead of .includes():
+    //   The error thrown for a non-zero exit is:
+    //     `afm-cli exited ${status}: ${result.stderr?.trim()}`
+    //   stderr is passed verbatim. If afm-cli ever echoes back part of a commit
+    //   message in its error output (e.g. a commit titled "fix: not authorized
+    //   endpoint call"), a bare .includes() would return true and suppress the
+    //   cold-start retry — turning a transient ETIMEDOUT into a permanent failure.
+    //   Line-anchoring constrains the match to the start of a line in the error
+    //   string, which is where the OS/MDM denial strings actually appear.
+    //   This is the same invariant the JSDoc previously described as a
+    //   "theoretical edge" — it is now enforced structurally rather than assumed.
+    //
+    //   'mdm policy'       — MDM policy strings (uncommon in commit messages, kept as .includes)
     const msg = String(e).toLowerCase();
     return (msg.includes('error: apple intelligence unavailable') ||
         msg.includes('error: unknown model availability state') ||
         msg.includes('error: afm-cli requires macos') ||
         msg.includes('error: foundationmodels framework not available') ||
-        msg.includes('not authorized') ||
-        msg.includes('permission denied') ||
+        /^(error: )?not authorized/m.test(msg) ||
+        /^(error: )?permission denied/m.test(msg) ||
         msg.includes('mdm policy'));
 }
 
@@ -30494,8 +30494,8 @@ async function run() {
                 'Expected a bare integer. This may indicate an afm-cli version mismatch or a warning line prepended to output.');
         }
         // The probe integer is not used for budget calculations — this is an
-        // availability check only. Logged at debug level for startup traceability.
-        core.debug(`[afm] Startup probe token count: ${parseInt(probeRaw, 10)}`);
+        // availability check only. probeRaw is already validated as all-digits above.
+        core.debug(`[afm] Startup probe token count: ${probeRaw}`);
         core.info('[afm] --count-tokens available ✓');
         // Instructions string for LanguageModelSession(instructions:).
         // Declared and validated here — before step 5 — so a violation is caught at
@@ -30815,7 +30815,9 @@ async function run() {
             core.debug(`[afm] Strict-retry token count: ${strictTokenCount} / ${TOKEN_BUDGET}`);
             if (strictTokenCount > TOKEN_BUDGET)
                 throw new Error(`[afm] Strict-retry prompt exceeds TOKEN_BUDGET (${strictTokenCount} > ${TOKEN_BUDGET}). ` +
-                    'Base prompt is at or near budget ceiling — cannot append strictSuffix safely.');
+                    `Base prompt is at or near budget ceiling — cannot append strictSuffix safely. ` +
+                    `(commits in prompt: ${promptCommits.length}, files in prompt: ${promptFiles.length}; ` +
+                    `consider reducing prompt_extra length if set.)`);
             try {
                 raw = (0, afm_1.afmCli)(afmBin, strictPrompt, afmOptions);
             }
@@ -31062,9 +31064,11 @@ function buildPrompt(safeTag, safePrevTag, commits, files, promptExtra) {
         '',
         'Commits:',
         ...commits.map(c => `- ${c}`),
-        '',
-        'Changed files:',
-        ...files.map(f => `- ${f}`),
+        ...(files.length ? [
+            '',
+            'Changed files:',
+            ...files.map(f => `- ${f}`),
+        ] : []),
         ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
     ].join('\n');
 }
