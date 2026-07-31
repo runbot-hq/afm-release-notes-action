@@ -71,8 +71,16 @@ async function run(): Promise<void> {
     // exact code path the preflight loop uses — if it exits 0 and returns a
     // number, the flag is available and the runner OS is sufficient.
     // The dummy prompt is intentionally short to keep the startup check fast.
+    //
+    // Return value is validated with isNaN for consistency with the preflight
+    // loop's own guard — if afm-cli returns a non-numeric string here (e.g. a
+    // warning line on a future version), we surface the problem at startup
+    // rather than letting it propagate to the first real preflight call.
     try {
-      afmCli(afmBin, 'ping', { countTokens: true })
+      const probeRaw = afmCli(afmBin, 'ping', { countTokens: true })
+      if (isNaN(parseInt(probeRaw, 10))) {
+        throw new Error(`afm-cli --count-tokens returned non-numeric output: "${probeRaw}"`)
+      }
     } catch (e) {
       throw new Error(
         '[afm] afm-cli --count-tokens failed — this action requires macOS 26.4+. ' +
@@ -323,6 +331,16 @@ async function run(): Promise<void> {
     // result (they are passed separately at inference time), so this reservation
     // is the only guard. If this string grows, update the reserve in TOKEN_BUDGET.
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
+    // Runtime guard for the 190-char invariant above. A future edit that grows
+    // this string without noticing the comment would silently erode the 60-token
+    // reserve — this throws at action startup (before any AFM call) so the
+    // violation is caught in CI rather than corrupting a live release.
+    if (instructions.length > 190) {
+      throw new Error(
+        `[afm] instructions string is ${instructions.length} chars — exceeds the 190-char invariant. ` +
+        'Update the TOKEN_BUDGET reserve if the string must grow.'
+      )
+    }
     const afmOptions = { instructions }
 
     // 6. Call afm-cli
@@ -361,10 +379,14 @@ async function run(): Promise<void> {
     //
     // strictSuffix appended to the existing prompt — no re-truncation needed
     // because the preflight loop (step 5) has already confirmed the base prompt
-    // fits TOKEN_BUDGET with exact token counts. The suffix is ~153 chars
-    // (~46 tokens at 3.29 chars/token), well within the 300-token response
-    // headroom reserved in TOKEN_BUDGET. Overflow on the strict-retry is
-    // therefore impossible.
+    // fits TOKEN_BUDGET with exact token counts.
+    //
+    // WHY overflow on the strict-retry is impossible:
+    // prompt is confirmed ≤ 7,832 tokens by the preflight. The suffix is ~153
+    // chars (~46 tokens at 3.29 chars/token). 7,832 + 46 = 7,878, which is below
+    // 8,132 (8,192 − 60 instructions reserve) — the true prompt-usable ceiling.
+    // NOTE: the 300-token response headroom is reserved for model output and is
+    // NOT reusable as prompt slack. Do not cite it as the reason overflow is safe.
     //
     // WHY no 15s retry loop:
     // Step 7 only runs after step 6 returned output (malformed, but returned).
