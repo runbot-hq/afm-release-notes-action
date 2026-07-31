@@ -30830,6 +30830,18 @@ async function run() {
             // budget seen (activeOverflowBudget when the overflow path was taken).
             // strictSuffix is then appended unconditionally.
             const strictBudget = Math.min(prompt_1.MAX_PROMPT_CHARS, activeOverflowBudget) - strictSuffix.length;
+            // Guard: strictBudget must be positive and large enough for truncatePromptToFit
+            // to return a non-empty prompt. The minimum realistic value is ~8,738 (when
+            // overflow path taken at ~9,000 chars, minus ~130 suffix, minus ~130 strictSuffix
+            // length = ~8,740). If this ever fires it means activeOverflowBudget drifted
+            // below ~1,500 (the worst-case boilerplate floor documented in prompt.ts), which
+            // would indicate a budget accounting bug upstream. Fail loudly rather than
+            // silently passing a near-zero budget to truncatePromptToFit.
+            if (strictBudget <= 0) {
+                throw new Error(`Internal error: strictBudget is ${strictBudget} — activeOverflowBudget (${activeOverflowBudget}) ` +
+                    `is too small to accommodate strictSuffix (${strictSuffix.length} chars). ` +
+                    'This indicates a budget accounting bug; please report at runbot-hq/afm-release-notes-action.');
+            }
             const { prompt: strictBase } = (0, prompt_1.truncatePromptToFit)(safeTag, safePrevTag, activeCommits, activeFiles, promptExtra, strictBudget);
             const strictPrompt = strictBase + strictSuffix;
             core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars (budget: ${strictBudget} + ${strictSuffix.length} suffix)`);
@@ -31176,13 +31188,16 @@ function truncatePromptToFit(safeTag, safePrevTag, commits, files, promptExtra, 
     // long filenames or commit messages). Drop both lists entirely.
     //
     // KNOWN RESIDUAL GAP: after dropping, the prompt still contains boilerplate
-    // + tags + promptExtra ≈ 1,400 chars worst-case (boilerplate ~1,100 + up to
-    // 300 chars of promptExtra). If charBudget were ever set below ~1,400 the
+    // + tags + promptExtra ≈ 1,500 chars worst-case (fixed boilerplate ~1,100
+    // + safeTag up to 200 chars + safePrevTag up to 200 chars, both embedded
+    // twice in the template, contribute ~400 chars at maximum length; promptExtra
+    // adds up to 300 chars on top). If charBudget were ever set below ~1,500 the
     // returned prompt would silently exceed it. In practice the minimum caller
     // budget is activeOverflowBudget - strictSuffix.length ≈ 8,868 (when the
-    // overflow path was taken at ~9,000 chars) — far above 1,400 — so this gap
-    // is unreachable. Do NOT add a throw: a thin release note is better than a
-    // hard job failure.
+    // overflow path was taken at ~9,000 chars) — far above 1,500 — so this gap
+    // is unreachable. The strictBudget guard in index.ts step 7 throws explicitly
+    // if this invariant is ever violated at runtime. Do NOT add a throw here:
+    // a thin release note is better than a hard job failure at the truncation site.
     if (prompt.length > charBudget) {
         c = [];
         f = [];
