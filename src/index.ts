@@ -288,7 +288,7 @@ async function run(): Promise<void> {
     }
     core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`)
 
-    // ~151 chars at 3.29 chars/token ≈ 46 tokens; budget formula uses 60 as headroom.
+    // ~190 chars at 3.29 chars/token ≈ 58 tokens; budget formula uses 60 as headroom.
     // If this string grows, revisit the token deduction in the MAX_PROMPT_CHARS comment
     // in prompt.ts — the formula is: 4096 - 300 (response) - 60 (instructions) = 3,736.
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
@@ -359,6 +359,7 @@ async function run(): Promise<void> {
         try {
           raw = afmCli(afmBin, smallerPrompt, afmOptions)
         } catch (e2) {
+          if (isFatalAfmError(e2)) throw e2
           const detail = String(e2)
           const isOverflow2 = isContextOverflowError(e2)
           throw new Error(
@@ -384,6 +385,7 @@ async function run(): Promise<void> {
         try {
           raw = afmCli(afmBin, prompt, afmOptions)
         } catch (e2) {
+          if (isFatalAfmError(e2)) throw e2
           const detail = String(e2)
           const isOverflow2 = isContextOverflowError(e2)
           throw new Error(
