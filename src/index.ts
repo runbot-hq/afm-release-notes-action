@@ -8,7 +8,7 @@ import * as os from 'os'
 import { git } from './git'
 import { ensureBinary, httpsGetJson, httpsDownload, sha256File } from './binary'
 import { afmCli, isFatalAfmError } from './afm'
-import { PARSE_FAILED, parseAfmOutput, buildPrompt } from './prompt'
+import { parseAfmOutput, buildPrompt } from './prompt'
 
 // TOKEN_BUDGET: the maximum number of tokens the prompt may consume.
 //
@@ -27,6 +27,22 @@ import { PARSE_FAILED, parseAfmOutput, buildPrompt } from './prompt'
 // INVARIANT: keep the instructions string (defined below, step 5) under ~190 chars.
 // If it grows beyond that, recalculate and update the reserve here accordingly.
 const TOKEN_BUDGET = 8192 - 300 - 60 // = 7832
+
+// PROMPT_BUDGET: the ceiling used by the step-5 preflight halving loop.
+//
+// Reserves 50 tokens below TOKEN_BUDGET for the strictSuffix appended in step 7
+// when the first parse fails. strictSuffix is ~130 chars / ~40 tokens; 50 tokens
+// is a conservative upper bound. By reserving here rather than re-running the
+// halving loop in step 7, the "strict-prompt overflow is impossible" invariant
+// is established upfront — the step-7 TOKEN_BUDGET check becomes a true last-resort
+// guard for pathological cases (e.g. a future suffix change that exceeds 50 tokens)
+// rather than a normal near-ceiling failure mode.
+//
+// TOKEN_BUDGET (not PROMPT_BUDGET) is still used for the floor check in step 5:
+// the floor prompt (boilerplate + no commits/files) is tiny and the full budget
+// is appropriate there. Do NOT replace TOKEN_BUDGET with PROMPT_BUDGET in the
+// floor check or the strict-retry overflow guard.
+const PROMPT_BUDGET = TOKEN_BUDGET - 50 // = 7782
 
 async function run(): Promise<void> {
   try {
@@ -307,7 +323,15 @@ async function run(): Promise<void> {
     const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
 
     // Preflight loop: call afm-cli --count-tokens to get the exact token count
-    // for the assembled prompt. Halve both lists until the count fits TOKEN_BUDGET.
+    // for the assembled prompt. Halve both lists until the count fits PROMPT_BUDGET.
+    //
+    // WHY PROMPT_BUDGET (not TOKEN_BUDGET) here:
+    // PROMPT_BUDGET = TOKEN_BUDGET - 50. The 50-token reserve is headroom for
+    // strictSuffix (~40 tokens) appended in step 7 on parse failure. Reserving
+    // upfront means step 7 can always append strictSuffix without a context
+    // overflow — the step-7 TOKEN_BUDGET guard is a last-resort invariant check
+    // for pathological cases (e.g. a future strictSuffix > 50 tokens), not a
+    // normal failure mode. See PROMPT_BUDGET declaration above for full rationale.
     //
     // WHY exact token counts instead of a char-budget estimate:
     // The char-budget approach (MAX_PROMPT_CHARS = 12_000) used ~3.29 chars/token
@@ -326,7 +350,7 @@ async function run(): Promise<void> {
     // Yes. Math.floor(n/2) with Math.max(1, ...) pegs each list at 1 once n=1.
     // Once both lists are at 1, the (> 1 || > 1) condition is false and the
     // loop exits. The floor break fires first if the boilerplate alone exceeds
-    // TOKEN_BUDGET (extremely unusual — would require a tag name of >28,000 tokens).
+    // PROMPT_BUDGET (extremely unusual — would require a tag name of ~28,000 tokens).
     //
     // LOOP INVARIANT: prompt is always built at the bottom of each iteration (or
     // at init below), then measured at the top of the next iteration. The version
@@ -348,14 +372,14 @@ async function run(): Promise<void> {
         throw new Error(`[afm] --count-tokens returned non-numeric output: "${raw}"`)
       }
       const tokenCount = parseInt(raw, 10)
-      core.debug(`[afm] Preflight token count: ${tokenCount} / ${TOKEN_BUDGET}`)
-      if (tokenCount <= TOKEN_BUDGET) break // prompt holds the version just measured and confirmed to fit
+      core.debug(`[afm] Preflight token count: ${tokenCount} / ${PROMPT_BUDGET}`)
+      if (tokenCount <= PROMPT_BUDGET) break // prompt holds the version just measured and confirmed to fit
       if (promptCommits.length <= 1 && promptFiles.length <= 1) {
         // Floor: boilerplate + 1 commit + 1 file still exceeds budget.
         // Extremely unusual — drop both lists and proceed. The model will
         // generate a minimal release note from tag names alone.
         core.warning(
-          '[afm] Preflight: prompt exceeds TOKEN_BUDGET even at minimum list size — ' +
+          '[afm] Preflight: prompt exceeds PROMPT_BUDGET even at minimum list size — ' +
           'dropping all commits and files. Release note will have no diff context.'
         )
         promptCommits = []
@@ -363,6 +387,8 @@ async function run(): Promise<void> {
         prompt = buildPrompt(safeTag, safePrevTag, promptCommits, promptFiles, promptExtra)
         // Measure the floor prompt before proceeding to preserve the invariant
         // that step 6 always receives a prompt confirmed to fit TOKEN_BUDGET.
+        // TOKEN_BUDGET (not PROMPT_BUDGET) is correct here: the floor prompt has
+        // no list content, so strict-suffix headroom is not required.
         // Boilerplate-only prompts are tiny in practice, but the guarantee should
         // be exact rather than assumed.
         const floorRaw = afmCli(afmBin, prompt, { countTokens: true })
@@ -379,7 +405,7 @@ async function run(): Promise<void> {
 
     if (promptCommits.length < postFilterCommitCount || promptFiles.length < postFilterFileCount) {
       core.warning(
-        `[afm] Prompt truncated to fit TOKEN_BUDGET (${TOKEN_BUDGET} tokens): ` +
+        `[afm] Prompt truncated to fit PROMPT_BUDGET (${PROMPT_BUDGET} tokens): ` +
         `commits ${totalCommits} → ${postFilterCommitCount} → ${promptCommits.length}, ` +
         `files ${totalFiles} → ${postFilterFileCount} → ${promptFiles.length}`
       )
@@ -389,7 +415,8 @@ async function run(): Promise<void> {
     // 6. Call afm-cli
     //
     // Context overflow is impossible here — the preflight loop (step 5) has
-    // confirmed the prompt fits within TOKEN_BUDGET using exact token counts.
+    // confirmed the prompt fits within PROMPT_BUDGET (TOKEN_BUDGET - 50), which
+    // includes headroom for the strictSuffix appended in step 7.
     // The only transient failure mode is ETIMEDOUT (cold-start model load).
     // isFatalAfmError() is called first to avoid retrying unrecoverable errors.
     core.info('[afm] Calling afm-cli...')
@@ -421,9 +448,11 @@ async function run(): Promise<void> {
     // 7. Parse output — strict-prompt retry if the format is wrong.
     //
     // strictSuffix is appended to prompt when the first parse fails. The combined
-    // strictPrompt is preflighted with --count-tokens before inference, exactly as
-    // the main prompt is in step 5. This closes the edge where a near-budget base
-    // prompt + suffix could exceed the context window.
+    // strictPrompt fits within TOKEN_BUDGET because the step-5 preflight loop
+    // halved the base prompt to PROMPT_BUDGET = TOKEN_BUDGET - 50, reserving
+    // exactly the headroom strictSuffix needs (~40 tokens). The TOKEN_BUDGET
+    // guard below is therefore a true invariant check — it can only fire if
+    // strictSuffix is ever changed to exceed 50 tokens.
     //
     // WHY a single cold-start retry in step 7:
     // Step 7 runs after step 6 returned output — the model is warm in the common
@@ -440,18 +469,15 @@ async function run(): Promise<void> {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
       const strictPrompt = prompt + strictSuffix
       core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars`)
-      // Preflight the strict prompt before inference — the suffix adds tokens and
-      // the base prompt may be near TOKEN_BUDGET. This mirrors the main preflight
-      // loop and ensures the "overflow impossible" invariant holds on this path too.
       const strictRaw = afmCli(afmBin, strictPrompt, { countTokens: true })
       if (!/^\d+$/.test(strictRaw)) throw new Error(`[afm] --count-tokens returned non-numeric output for strict prompt: "${strictRaw}"`)
       const strictTokenCount = parseInt(strictRaw, 10)
       core.debug(`[afm] Strict-retry token count: ${strictTokenCount} / ${TOKEN_BUDGET}`)
       if (strictTokenCount > TOKEN_BUDGET) throw new Error(
-        `[afm] Strict-retry prompt exceeds TOKEN_BUDGET (${strictTokenCount} > ${TOKEN_BUDGET}). ` +
-        `Base prompt is at or near budget ceiling — cannot append strictSuffix safely. ` +
-        `(commits in prompt: ${promptCommits.length}, files in prompt: ${promptFiles.length}; ` +
-        `consider reducing prompt_extra length if set.)`
+        `[afm] Strict-retry prompt exceeds TOKEN_BUDGET (${strictTokenCount} > ${TOKEN_BUDGET}) — ` +
+        `strictSuffix may have grown beyond the 50-token PROMPT_BUDGET reserve. ` +
+        `Update PROMPT_BUDGET if strictSuffix was intentionally enlarged. ` +
+        `(commits in prompt: ${promptCommits.length}, files in prompt: ${promptFiles.length})`
       )
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
