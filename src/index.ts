@@ -412,18 +412,10 @@ async function run(): Promise<void> {
 
     // 7. Parse output — strict-prompt retry if the format is wrong.
     //
-    // strictSuffix appended to the existing prompt — no re-truncation needed
-    // because the preflight loop (step 5) has already confirmed the base prompt
-    // fits TOKEN_BUDGET with exact token counts.
-    //
-    // WHY overflow on the strict-retry is impossible:
-    // The preflight confirmed prompt ≤ 7,832 tokens (TOKEN_BUDGET). The suffix is
-    // 152 chars; its exact token cost is measurable with:
-    //   afm-cli --count-tokens --prompt "$strictSuffix"
-    // At any realistic token density, prompt + suffix stays well below 8,132
-    // (= 8,192 − 60 instructions reserve), the true prompt-usable ceiling.
-    // The 300-token response headroom is a separate reservation for model output
-    // and is NOT part of this calculation — do not cite it as prompt slack.
+    // strictSuffix is appended to prompt when the first parse fails. The combined
+    // strictPrompt is preflighted with --count-tokens before inference, exactly as
+    // the main prompt is in step 5. This closes the edge where a near-budget base
+    // prompt + suffix could exceed the context window.
     //
     // WHY no 15s retry loop:
     // Step 7 only runs after step 6 returned output (malformed, but returned).
@@ -438,6 +430,17 @@ async function run(): Promise<void> {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
       const strictPrompt = prompt + strictSuffix
       core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars`)
+      // Preflight the strict prompt before inference — the suffix adds tokens and
+      // the base prompt may be near TOKEN_BUDGET. This mirrors the main preflight
+      // loop and ensures the "overflow impossible" invariant holds on this path too.
+      const strictRaw = afmCli(afmBin, strictPrompt, { countTokens: true })
+      if (!/^\d+$/.test(strictRaw)) throw new Error(`[afm] --count-tokens returned non-numeric output for strict prompt: "${strictRaw}"`)
+      const strictTokenCount = parseInt(strictRaw, 10)
+      core.debug(`[afm] Strict-retry token count: ${strictTokenCount} / ${TOKEN_BUDGET}`)
+      if (strictTokenCount > TOKEN_BUDGET) throw new Error(
+        `[afm] Strict-retry prompt exceeds TOKEN_BUDGET (${strictTokenCount} > ${TOKEN_BUDGET}). ` +
+        'Base prompt is at or near budget ceiling — cannot append strictSuffix safely.'
+      )
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {
