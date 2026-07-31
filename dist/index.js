@@ -29963,7 +29963,6 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.afmCli = afmCli;
 exports.isFatalAfmError = isFatalAfmError;
-exports.isContextOverflowError = isContextOverflowError;
 const core = __importStar(__nccwpck_require__(7484));
 const child_process_1 = __nccwpck_require__(5317);
 /**
@@ -30061,29 +30060,6 @@ function isFatalAfmError(e) {
         msg.includes('not authorized') ||
         msg.includes('permission denied') ||
         msg.includes('mdm policy'));
-}
-/**
- * Returns true when the AFM error is a hard context-window overflow.
- *
- * NOTE: This function is dead code now that the exact-token preflight loop
- * (step 5 in run()) guarantees the prompt fits before inference is called.
- * Retained here rather than deleted immediately so a single future PR can
- * remove it in isolation without mixing clean-up into a logic change.
- * Do NOT add new call sites — remove this function in the follow-on clean-up.
- *
- * Two strings are matched as a defence-in-depth hedge:
- *
- * 1. 'exceededcontextwindowsize' — the Swift enum identifier
- *    (LanguageModelError.exceededContextWindowSize) observed in
- *    runbot-hq/run-bot#2351.
- *
- * 2. 'exceeds the maximum allowed context size' — the human-readable
- *    FoundationModels framework error message observed in the same failure.
- */
-function isContextOverflowError(e) {
-    const msg = String(e).toLowerCase();
-    return (msg.includes('exceededcontextwindowsize') ||
-        msg.includes('exceeds the maximum allowed context size'));
 }
 
 
@@ -30431,9 +30407,14 @@ const prompt_1 = __nccwpck_require__(705);
 //    60 tokens — instructions string passed to LanguageModelSession(instructions:)
 // Leaving 7,832 tokens available for the prompt.
 //
-// This constant is only used as a guard in the preflight loop. Actual token
-// counts come from afm-cli --count-tokens (SystemLanguageModel.tokenCount(for:)),
-// which is exact and input-type-agnostic — no chars/token estimate needed.
+// WHY the instructions reservation is an estimate, not an exact count:
+// afm-cli --count-tokens measures the prompt argument only — instructions are
+// passed separately to LanguageModelSession(instructions:) at inference time and
+// are not included in the tokenCount(for:) result. The 60-token reserve is
+// therefore a char-based estimate (~190 chars ÷ 3.29 chars/token ≈ 58 tokens).
+// This is the only remaining estimation in an otherwise exact-count system.
+// INVARIANT: keep the instructions string (defined below, step 5) under ~190 chars.
+// If it grows beyond that, recalculate and update the reserve here accordingly.
 const TOKEN_BUDGET = 8192 - 300 - 60; // = 7832
 async function run() {
     try {
@@ -30700,8 +30681,12 @@ async function run() {
                 `files ${totalFiles} → ${postFilterFileCount} → ${promptFiles.length}`);
         }
         core.info(`[afm] Prompt ready: ${prompt.length} chars, ${promptCommits.length} commits, ${promptFiles.length} files`);
-        // ~190 chars at 3.29 chars/token ≈ 58 tokens; well within the 60-token
-        // instructions reservation in TOKEN_BUDGET.
+        // Instructions string for LanguageModelSession(instructions:).
+        // INVARIANT: keep this string under ~190 chars. The 60-token reserve in
+        // TOKEN_BUDGET is calibrated to this length (~190 chars ÷ 3.29 chars/token
+        // ≈ 58 tokens). Instructions are not included in the afm-cli --count-tokens
+        // result (they are passed separately at inference time), so this reservation
+        // is the only guard. If this string grows, update the reserve in TOKEN_BUDGET.
         const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}';
         const afmOptions = { instructions };
         // 6. Call afm-cli
@@ -30740,9 +30725,10 @@ async function run() {
         //
         // strictSuffix appended to the existing prompt — no re-truncation needed
         // because the preflight loop (step 5) has already confirmed the base prompt
-        // fits TOKEN_BUDGET with exact token counts. The suffix adds ~130 chars
-        // (~40 tokens), well within the 300-token response headroom reserved in
-        // TOKEN_BUDGET. Overflow on the strict-retry is therefore impossible.
+        // fits TOKEN_BUDGET with exact token counts. The suffix is ~153 chars
+        // (~46 tokens at 3.29 chars/token), well within the 300-token response
+        // headroom reserved in TOKEN_BUDGET. Overflow on the strict-retry is
+        // therefore impossible.
         //
         // WHY no 15s retry loop:
         // Step 7 only runs after step 6 returned output (malformed, but returned).
