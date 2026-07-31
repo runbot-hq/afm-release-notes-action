@@ -288,6 +288,9 @@ async function run(): Promise<void> {
     }
     core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`)
 
+    // ~151 chars at 3.29 chars/token ≈ 46 tokens; budget formula uses 60 as headroom.
+    // If this string grows, revisit the token deduction in the MAX_PROMPT_CHARS comment
+    // in prompt.ts — the formula is: 4096 - 300 (response) - 60 (instructions) = 3,736.
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
     const afmOptions = { instructions }
 
@@ -370,6 +373,8 @@ async function run(): Promise<void> {
         }
       } else {
         // Cold-start / transient error — wait 15s and retry with the original prompt.
+        // activeCommits/activeFiles are NOT updated here — the cold-start path retries
+        // the same prompt, so the existing lists remain correct for step 7 if needed.
         // Canary: if the error string mentions context/token/window but isContextOverflowError
         // did not match, the Apple enum may have been renamed — update isContextOverflowError
         // and see runbot-hq/afm-cli#2 for structured exit code tracking.
@@ -380,10 +385,14 @@ async function run(): Promise<void> {
           raw = afmCli(afmBin, prompt, afmOptions)
         } catch (e2) {
           const detail = String(e2)
+          const isOverflow2 = isContextOverflowError(e2)
           throw new Error(
             `[afm] Cold-start retry failed (binary: ${afmBin}): ${detail}. ` +
-            'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
-            'consider increasing the timeout or pre-warming the runner.'
+            (isOverflow2
+              ? 'Context window overflow on cold-start retry — the prompt may be right at the token boundary. ' +
+                'Try reducing MAX_PROMPT_CHARS or check for abnormally long commit messages.'
+              : 'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
+                'consider increasing the timeout or pre-warming the runner.')
           )
         }
       }
