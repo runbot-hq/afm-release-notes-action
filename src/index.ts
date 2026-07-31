@@ -106,16 +106,22 @@ async function run(): Promise<void> {
     // and the isNaN guard passes silently. /^\d+$/ requires the entire string to be
     // digits, catching warning lines prepended to the count (e.g. "warning: ...\n1"
     // after trim) or suffixed units. Used consistently in probe and preflight loop.
+    //
+    // WHY anchored regexes for isAccessDenied (matching isFatalAfmError's style):
+    // isFatalAfmError uses line-anchored patterns (^) so only lines that begin
+    // with the expected prefix are matched — a downstream tool writing e.g.
+    // "internal: permission denied" mid-stderr would not trigger the pattern.
+    // The isAccessDenied check here uses the same anchored form for consistency
+    // and to avoid matching mid-line occurrences from unrelated stderr output.
     let probeRaw: string
     try {
       probeRaw = afmCli(afmBin, 'ping', { countTokens: true })
     } catch (e) {
       if (isFatalAfmError(e)) {
-        const msg = String(e).toLowerCase()
         const isAccessDenied =
-          /not authorized/i.test(msg) ||
-          /permission denied/i.test(msg) ||
-          /mdm policy/i.test(msg)
+          /^(afm-cli exited \d+: )?(error: )?not authorized/im.test(String(e)) ||
+          /^(afm-cli exited \d+: )?(error: )?permission denied/im.test(String(e)) ||
+          /^(afm-cli exited \d+: )?(error: )?mdm policy/im.test(String(e))
         if (isAccessDenied) {
           throw new Error(
             `[afm] afm-cli --count-tokens failed — binary not authorised to run. ` +
@@ -517,6 +523,15 @@ async function run(): Promise<void> {
     // call can ETIMEDOUT with the model cold again. A single 15s wait-and-retry
     // (identical to step 6's pattern) recovers this edge without adding a full
     // retry loop. Fatal errors still skip the retry immediately.
+    //
+    // WHY strictInferenceRaw instead of reusing raw for the inference result:
+    // The --count-tokens preflight call immediately above returns a bare integer
+    // string (token count), not model output. Using a distinct variable name for
+    // the inference result makes the two-step pattern (count → infer) impossible
+    // to accidentally collapse in a future refactor — if the two calls were ever
+    // merged or swapped, raw would silently hold the integer string and
+    // parseAfmOutput would throw a spurious format error. strictInferenceRaw is
+    // explicitly assigned to raw only after both calls complete successfully.
     const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
     let result: { title: string; body: string }
     try {
@@ -535,8 +550,9 @@ async function run(): Promise<void> {
         `Update the PROMPT_BUDGET reserve (currently TOKEN_BUDGET - 50) to match the new strictSuffix token cost. ` +
         `(commits in prompt: ${promptCommits.length}, files in prompt: ${promptFiles.length})`
       )
+      let strictInferenceRaw: string
       try {
-        raw = afmCli(afmBin, strictPrompt, afmOptions)
+        strictInferenceRaw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {
         core.debug(`[afm] Strict-retry attempt 1 error: ${String(e2)}`)
         if (isFatalAfmError(e2)) throw e2
@@ -544,7 +560,8 @@ async function run(): Promise<void> {
         core.info('[afm] Strict-retry attempt 1 failed — retrying in 15s...')
         await new Promise(r => setTimeout(r, 15_000))
         try {
-          raw = afmCli(afmBin, strictPrompt, afmOptions)
+          strictInferenceRaw = afmCli(afmBin, strictPrompt, afmOptions)
+          core.debug('[afm] Strict-retry cold-start recovery succeeded')
         } catch (e3) {
           if (isFatalAfmError(e3)) throw e3
           throw new Error(
@@ -554,6 +571,7 @@ async function run(): Promise<void> {
           )
         }
       }
+      raw = strictInferenceRaw
       result = parseAfmOutput(raw, tag)
     }
 
