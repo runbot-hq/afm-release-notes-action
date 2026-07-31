@@ -7,8 +7,21 @@ import * as os from 'os'
 
 import { git } from './git'
 import { ensureBinary, httpsGetJson, httpsDownload, sha256File } from './binary'
-import { afmCli, isFatalAfmError, isContextOverflowError } from './afm'
-import { PARSE_FAILED, parseAfmOutput, MAX_PROMPT_CHARS, buildPrompt, truncatePromptToFit } from './prompt'
+import { afmCli, isFatalAfmError } from './afm'
+import { PARSE_FAILED, parseAfmOutput, buildPrompt } from './prompt'
+
+// TOKEN_BUDGET: the maximum number of tokens the prompt may consume.
+//
+// The on-device FoundationModels context window is 8,192 tokens (doubled from
+// 4,096 in the rebuilt model — see afm-cli#2 / WWDC26). We reserve:
+//   300 tokens — model response headroom
+//    60 tokens — instructions string passed to LanguageModelSession(instructions:)
+// Leaving 7,832 tokens available for the prompt.
+//
+// This constant is only used as a guard in the preflight loop. Actual token
+// counts come from afm-cli --count-tokens (SystemLanguageModel.tokenCount(for:)),
+// which is exact and input-type-agnostic — no chars/token estimate needed.
+const TOKEN_BUDGET = 8192 - 300 - 60 // = 7832
 
 async function run(): Promise<void> {
   try {
@@ -195,25 +208,13 @@ async function run(): Promise<void> {
       .slice(0, 80)
     files = files.slice(0, 150)
 
-    // Capture counts AFTER the WIP/fixup/squash filter AND the .slice(0,80)/slice(0,150)
-    // pre-caps, but BEFORE prompt-level truncation. Named "postFilter" (not "preCapped")
-    // because the filter runs before the slice — a release with 82 commits where 3 are
-    // WIP-filtered would give postFilterCommitCount=79, not 80. The truncation warning
-    // below uses these to show the full pipeline:
-    //   totalCommits (raw API) → postFilterCommitCount (after filter+slice) → usedCommits.length (after prompt cap)
-    // e.g. "commits 312 → 79 → 12" where 312→79 = filter+slice, 79→12 = prompt truncation.
     const postFilterCommitCount = commits.length
     const postFilterFileCount = files.length
 
-    // 5. Assemble and cap prompt
-    //
-    // The per-list caps above (80 commits, 150 files) are not sufficient alone —
-    // a release with many long commit messages can still exceed AFM's 4096-token
-    // context window. truncatePromptToFit measures the assembled string and halves
-    // lists until it fits MAX_PROMPT_CHARS (12_000).
+    // 5. Assemble prompt and preflight token count
     //
     // WHY promptExtra is also stripped of control chars:
-    // ANSWER: safeTag and safePrevTag both apply /[\x00-\x1f\x7f]/g before being
+    // safeTag and safePrevTag both apply /[\x00-\x1f\x7f]/g before being
     // embedded in the prompt. promptExtra comes from core.getInput(), which
     // passes caller-supplied workflow input through unchanged. Not a shell
     // injection risk (afmCli uses spawnSync), but control chars could corrupt
@@ -223,98 +224,74 @@ async function run(): Promise<void> {
     const safeTag = tag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
     const safePrevTag = prevTag.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200)
 
-    // strictSuffix is defined here (before the first truncatePromptToFit call) so
-    // its .length can be subtracted from the budget when building the strict-retry
-    // prompt. Defined once to ensure the budget calculation and the actual append
-    // always reference the same string — do NOT duplicate or edit this string
-    // without updating the charBudget call in step 7.
+    // Preflight loop: call afm-cli --count-tokens to get the exact token count
+    // for the assembled prompt. Halve both lists until the count fits TOKEN_BUDGET.
     //
-    // IMPORTANT: strictSuffix must contain only single-code-unit characters (U+0000–U+007F).
-    // String.prototype.length counts UTF-16 code units. For characters in this range
-    // .length equals the character count AFM sees, keeping the charBudget math exact.
-    // Any character outside this range (emoji, non-ASCII letters, arrows, curly quotes)
-    // is encoded as two UTF-16 code units (surrogate pair) or as a multi-byte UTF-8
-    // sequence, making .length smaller than the actual encoded size and silently
-    // underestimating the remaining budget. The guard below catches this at action
-    // startup — long before any AFM call — so the miscalculation is caught in CI
-    // rather than corrupting a live release. (~130 chars)
-    const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
-    // Guard: rejects any character above U+007F (i.e. outside the single-code-unit
-    // ASCII range). Control characters (U+0000–U+001F, U+007F) are single-code-unit
-    // and do not affect .length accuracy — they are intentionally allowed through.
-    // The risk being guarded is multi-byte characters (U+0080+), not control chars.
-    if (!/^[\x00-\x7f]*$/.test(strictSuffix)) {
-      throw new Error('Internal error: strictSuffix contains characters above U+007F — charBudget calculation would be incorrect. Keep all characters in the U+0000–U+007F range.')
+    // WHY exact token counts instead of a char-budget estimate:
+    // The char-budget approach (MAX_PROMPT_CHARS = 12_000) used ~3.29 chars/token
+    // as a worst-case estimate. Token density varies by content type — CJK text,
+    // dense commit messages, and generated output all tokenise differently.
+    // afm-cli --count-tokens calls SystemLanguageModel.tokenCount(for:), which
+    // returns the exact count the model sees, making overflow impossible.
+    //
+    // WHY > 1 and not > 0 in the halving condition:
+    // With > 0: if promptCommits=1 and promptFiles=[] (or vice versa), the outer
+    // condition stays true but neither inner guard fires, spinning forever.
+    // > 1 exits the loop as soon as neither list can shrink further and the
+    // floor break below handles the residual case.
+    //
+    // DOES THIS LOOP TERMINATE?
+    // Yes. Math.floor(n/2) with Math.max(1, ...) pegs each list at 1 once n=1.
+    // Once both lists are at 1, the (> 1 || > 1) condition is false and the
+    // loop exits. The floor break fires first if the boilerplate alone exceeds
+    // TOKEN_BUDGET (extremely unusual — would require a tag name of >28,000 tokens).
+    let promptCommits = [...commits]
+    let promptFiles = [...files]
+    let prompt = buildPrompt(safeTag, safePrevTag, promptCommits, promptFiles, promptExtra)
+
+    core.info('[afm] Running token preflight...')
+    while (true) {
+      const tokenCount = parseInt(afmCli(afmBin, prompt, { countTokens: true }), 10)
+      core.debug(`[afm] Preflight token count: ${tokenCount} / ${TOKEN_BUDGET}`)
+      if (tokenCount <= TOKEN_BUDGET) break
+      if (promptCommits.length <= 1 && promptFiles.length <= 1) {
+        // Floor: boilerplate + 1 commit + 1 file still exceeds budget.
+        // Extremely unusual — drop both lists and proceed. The model will
+        // generate a minimal release note from tag names alone.
+        core.warning(
+          '[afm] Preflight: prompt exceeds TOKEN_BUDGET even at minimum list size — ' +
+          'dropping all commits and files. Release note will have no diff context.'
+        )
+        promptCommits = []
+        promptFiles = []
+        prompt = buildPrompt(safeTag, safePrevTag, promptCommits, promptFiles, promptExtra)
+        break
+      }
+      if (promptCommits.length > 1) promptCommits = promptCommits.slice(0, Math.max(1, Math.floor(promptCommits.length / 2)))
+      if (promptFiles.length > 1) promptFiles = promptFiles.slice(0, Math.max(1, Math.floor(promptFiles.length / 2)))
+      prompt = buildPrompt(safeTag, safePrevTag, promptCommits, promptFiles, promptExtra)
     }
 
-    // usedCommits/usedFiles: post-truncation lists retained for use in three places:
-    //   1. The truncation warning and core.info log immediately below.
-    //   2. Step 6's overflow-retry path — passed to truncatePromptToFit with a
-    //      reduced budget so the halving loop can shed additional items. If the
-    //      overflow path runs, activeCommits/activeFiles are updated to the
-    //      narrower overflow lists so step 7 works from the smallest known-good set.
-    //   3. Step 7's strict-retry path — uses activeCommits/activeFiles (initialised
-    //      to usedCommits/usedFiles here, updated by step 6 overflow path if taken)
-    //      so the strict-retry never re-expands to a prompt larger than the one
-    //      that last succeeded.
-    //
-    // IMMUTABILITY CONTRACT: usedCommits/usedFiles are the internal arrays returned
-    // by truncatePromptToFit. Do NOT push/pop/splice them after this point — they
-    // seed activeCommits/activeFiles used by steps 6 and 7. Copy first if needed:
-    //   const copy = [...usedCommits]
-    const { prompt, commits: usedCommits, files: usedFiles } = truncatePromptToFit(
-      safeTag, safePrevTag, commits, files, promptExtra
-    )
-    // activeCommits/activeFiles track the narrowest truncated lists seen so far.
-    // Initialised from step 5; updated to overflowCommits/overflowFiles if step 6
-    // takes the overflow-retry path. Step 7 always reads from these so it never
-    // re-expands past the last known-good truncation boundary.
-    let activeCommits = usedCommits
-    let activeFiles = usedFiles
-    // activeOverflowBudget tracks the tightest char budget seen so far.
-    // Defaults to MAX_PROMPT_CHARS (no overflow path taken). Updated to
-    // overflowBudget if step 6 takes the overflow-retry path, so step 7
-    // caps its budget to Math.min(MAX_PROMPT_CHARS, activeOverflowBudget)
-    // - strictSuffix.length and never sends a prompt larger than the one
-    // that already overflowed.
-    let activeOverflowBudget = MAX_PROMPT_CHARS
-    // priorOverflowDetail captures the step-6 overflow error string if the
-    // overflow path was taken. Appended to any subsequent failure message so
-    // that a double-failure (overflow → malformed strict-retry output) carries
-    // the full error chain in core.setFailed rather than only the later error.
-    let priorOverflowDetail: string | undefined
-
-    if (usedCommits.length < postFilterCommitCount || usedFiles.length < postFilterFileCount) {
+    if (promptCommits.length < postFilterCommitCount || promptFiles.length < postFilterFileCount) {
       core.warning(
-        `[afm] Prompt truncated to fit AFM context window (${MAX_PROMPT_CHARS} chars): ` +
-        `commits ${totalCommits} → ${postFilterCommitCount} → ${usedCommits.length}, ` +
-        `files ${totalFiles} → ${postFilterFileCount} → ${usedFiles.length}`
+        `[afm] Prompt truncated to fit TOKEN_BUDGET (${TOKEN_BUDGET} tokens): ` +
+        `commits ${totalCommits} → ${postFilterCommitCount} → ${promptCommits.length}, ` +
+        `files ${totalFiles} → ${postFilterFileCount} → ${promptFiles.length}`
       )
     }
-    core.info(`[afm] Prompt: ${prompt.length} chars, ${usedCommits.length} commits, ${usedFiles.length} files`)
+    core.info(`[afm] Prompt ready: ${prompt.length} chars, ${promptCommits.length} commits, ${promptFiles.length} files`)
 
-    // ~190 chars at 3.29 chars/token ≈ 58 tokens; budget formula uses 60 as headroom.
-    // If this string grows, revisit the token deduction in the MAX_PROMPT_CHARS comment
-    // in prompt.ts — the formula is: 4096 - 300 (response) - 60 (instructions) = 3,736.
+    // ~190 chars at 3.29 chars/token ≈ 58 tokens; well within the 60-token
+    // instructions reservation in TOKEN_BUDGET.
     const instructions = 'You are a technical writer generating GitHub release notes. Always respond with valid JSON only — no markdown fences, no prose, no extra keys. Output exactly: {"title": "...", "body": "..."}'
     const afmOptions = { instructions }
 
     // 6. Call afm-cli
     //
-    // Two distinct failure modes are handled separately:
-    //
-    // A. exceededContextWindowSize (context overflow) — deterministic: the same
-    //    prompt will always fail regardless of how long we wait. Re-truncate to
-    //    75% of the current prompt length and retry immediately. No pause needed.
-    //    isContextOverflowError() matches this case.
-    //
-    // B. ETIMEDOUT (cold-start) — transient: the model binary is loading and needs
-    //    time. Retry after a 15s warm-up pause. isFatalAfmError() does NOT match
-    //    ETIMEDOUT, so it falls through to the existing cold-start path.
-    //
-    // Do NOT merge these two paths — they require different remediation and a
-    // combined handler would either waste 15s on an overflow or skip the warm-up
-    // needed for a genuine cold-start.
+    // Context overflow is impossible here — the preflight loop (step 5) has
+    // confirmed the prompt fits within TOKEN_BUDGET using exact token counts.
+    // The only transient failure mode is ETIMEDOUT (cold-start model load).
+    // isFatalAfmError() is called first to avoid retrying unrecoverable errors.
     core.info('[afm] Calling afm-cli...')
     let raw = ''
     try {
@@ -323,105 +300,19 @@ async function run(): Promise<void> {
       core.debug(`[afm] Attempt 1 error: ${String(e)}`)
       if (isFatalAfmError(e)) throw e
 
-      if (isContextOverflowError(e)) {
-        // Attempt 1 overflowed the context window. Re-truncate to 75% of the
-        // current prompt length and retry immediately — no pause, this is
-        // deterministic. 75% (not 50%) is intentional: with MAX_PROMPT_CHARS at
-        // 12,000 chars, a prompt that still overflows has a token density higher
-        // than ~3.41 chars/token (the density at which 12,000 chars hits 4,096
-        // tokens less response/instructions headroom). At 75% the budget becomes
-        // ~9,000 chars ≈ 2,735 tokens — well within the limit even at extreme
-        // densities, while preserving more commit context than a 50% cut would.
-        // If the re-truncated prompt still overflows (extremely unusual), it will
-        // throw and surface via core.setFailed with the overflow detail.
-        core.warning(`[afm] Attempt 1 — context window overflow (${String(e).slice(0, 120)}). Re-truncating to 75% and retrying immediately...`)
-        // WHY Math.min(prompt.length, MAX_PROMPT_CHARS) and not just prompt.length * 0.75:
-        // truncatePromptToFit (step 5) enforces charBudget = MAX_PROMPT_CHARS, so
-        // prompt.length is always ≤ MAX_PROMPT_CHARS here — the Math.min is a no-op
-        // in the normal path. It is retained as a future-proof defensive clamp: if a
-        // caller ever passes a larger charBudget to truncatePromptToFit, prompt.length
-        // could exceed MAX_PROMPT_CHARS and the clamp becomes load-bearing. The intent
-        // is "75% of the actual prompt length, capped at MAX_PROMPT_CHARS" — not
-        // "75% of MAX_PROMPT_CHARS unconditionally". Not a bug; not redundant by accident.
-        const overflowBudget = Math.floor(Math.min(prompt.length, MAX_PROMPT_CHARS) * 0.75)
-        // usedCommits/usedFiles intentionally — already-capped by step 5; passing
-        // the original lists would re-expand the prompt past overflowBudget.
-        const { prompt: smallerPrompt, commits: overflowCommits, files: overflowFiles } = truncatePromptToFit(
-          safeTag, safePrevTag, usedCommits, usedFiles, promptExtra, overflowBudget
+      // Cold-start / transient error — wait 15s and retry.
+      core.info('[afm] Attempt 1 failed — retrying in 15s (cold-start model load)...')
+      await new Promise(r => setTimeout(r, 15_000))
+      try {
+        raw = afmCli(afmBin, prompt, afmOptions)
+      } catch (e2) {
+        if (isFatalAfmError(e2)) throw e2
+        const detail = String(e2)
+        throw new Error(
+          `[afm] Cold-start retry failed (binary: ${afmBin}): ${detail}. ` +
+          'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
+          'consider increasing the timeout or pre-warming the runner.'
         )
-        // Update activeCommits/activeFiles/activeOverflowBudget to the narrower
-        // overflow values so that step 7's strict-retry (if needed) builds from
-        // the smallest known-good truncation boundary and budget, never re-expanding
-        // to a prompt larger than the one that already overflowed.
-        //
-        // IMMUTABILITY CONTRACT: overflowCommits/overflowFiles are the internal arrays
-        // returned by truncatePromptToFit. Do NOT push/pop/splice them — they are
-        // aliased by activeCommits/activeFiles and read by step 7's strict-retry.
-        // Copy first if you need to extend: [...activeCommits].
-        activeCommits = overflowCommits
-        activeFiles = overflowFiles
-        // WHY overflowBudget and not smallerPrompt.length:
-        // smallerPrompt.length ≤ overflowBudget (the halving loop can land below
-        // budget). Step 7 re-truncates with this value as its cap, so it will produce
-        // a prompt ≤ overflowBudget regardless. Using smallerPrompt.length would be
-        // marginally tighter but step 7's truncatePromptToFit call would reach the
-        // same or smaller result anyway. overflowBudget is the correct "budget we
-        // passed to the model" sentinel — not a bug.
-        activeOverflowBudget = overflowBudget
-        // Capture the overflow error detail for downstream error messages.
-        // If step 7 later fails (e.g. strict-retry returns malformed JSON), this
-        // string is appended to core.setFailed so the full error chain is visible
-        // in the Actions log — not just the final format-parse failure.
-        priorOverflowDetail = String(e).slice(0, 200)
-        if (overflowCommits.length === 0 && overflowFiles.length === 0) {
-          core.warning(
-            '[afm] Overflow re-truncation dropped all commits and files — ' +
-            'release note will be generated with no diff context. ' +
-            'This can happen when individual commit messages or filenames are extremely long.'
-          )
-        }
-        core.info(`[afm] Overflow-retry prompt: ${smallerPrompt.length} chars (budget: ${overflowBudget})`)
-        try {
-          raw = afmCli(afmBin, smallerPrompt, afmOptions)
-        } catch (e2) {
-          if (isFatalAfmError(e2)) throw e2
-          const detail = String(e2)
-          const isOverflow2 = isContextOverflowError(e2)
-          throw new Error(
-            `[afm] Overflow-retry failed (binary: ${afmBin}): ${detail}. ` +
-            (isOverflow2
-              ? `Context window overflow on overflow-retry — token density is too high even at the reduced budget (${overflowBudget} chars). ` +
-                'This is extremely unusual; the token density of this release diff may be abnormally high.'
-              : 'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
-                'consider increasing the timeout or pre-warming the runner.') +
-            ` Original overflow: ${String(e).slice(0, 200)}`
-          )
-        }
-      } else {
-        // Cold-start / transient error — wait 15s and retry with the original prompt.
-        // activeCommits/activeFiles are NOT updated here — the cold-start path retries
-        // the same prompt, so the existing lists remain correct for step 7 if needed.
-        // Canary: if the error string mentions context/token/window but isContextOverflowError
-        // did not match, the Apple enum may have been renamed — update isContextOverflowError
-        // and see runbot-hq/afm-cli#2 for structured exit code tracking.
-        core.debug(`[afm] Cold-start branch — error did not match isContextOverflowError: ${String(e).slice(0, 200)}`)
-        core.info('[afm] Attempt 1 failed — retrying in 15s (cold-start model load)...')
-        await new Promise(r => setTimeout(r, 15_000))
-        try {
-          raw = afmCli(afmBin, prompt, afmOptions)
-        } catch (e2) {
-          if (isFatalAfmError(e2)) throw e2
-          const detail = String(e2)
-          const isOverflow2 = isContextOverflowError(e2)
-          throw new Error(
-            `[afm] Cold-start retry failed (binary: ${afmBin}): ${detail}. ` +
-            (isOverflow2
-              ? 'Context window overflow on cold-start retry — prompt may be at the token boundary. ' +
-                'Try reducing prompt_extra length or lowering the per-list caps (commits/files).'
-              : 'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
-                'consider increasing the timeout or pre-warming the runner.')
-          )
-        }
       }
     }
 
@@ -429,107 +320,36 @@ async function run(): Promise<void> {
 
     // 7. Parse output — strict-prompt retry if the format is wrong.
     //
-    // ╔══════════════════════════════════════════════════════════════════════╗
-    // ║  WHAT STEP 7 DOES AND DOES NOT DO — READ BEFORE RAISING A FINDING  ║
-    // ╠══════════════════════════════════════════════════════════════════════╣
-    // ║                                                                      ║
-    // ║  DOES:     call truncatePromptToFit with a reduced charBudget        ║
-    // ║            (Math.min(MAX_PROMPT_CHARS, activeOverflowBudget)         ║
-    // ║            - strictSuffix.length) so the suffix is guaranteed to fit ║
-    // ║            and the prompt never exceeds the tightest budget seen.    ║
-    // ║  DOES NOT: get a 15s pause+retry loop (see WHY below)               ║
-    // ║                                                                      ║
-    // ║  WHY re-truncate instead of slicing after append?                   ║
-    // ║  Slicing (prompt + suffix) to MAX_PROMPT_CHARS amputates the suffix ║
-    // ║  whenever prompt is already at the cap — the very instruction meant  ║
-    // ║  to fix malformed output gets silently dropped. Re-truncating with   ║
-    // ║  a reduced budget guarantees the suffix is always present in full.   ║
-    // ║                                                                      ║
-    // ║  WHY Math.min(MAX_PROMPT_CHARS, activeOverflowBudget)?              ║
-    // ║  If step 6 took the overflow path (activeOverflowBudget < MAX_PROMPT ║
-    // ║  _CHARS), the overflow-retry budget was ~9,000 chars. Sending a      ║
-    // ║  strict-retry prompt at the default ~11,868-char budget would exceed  ║
-    // ║  the window that already overflowed and guarantee a second overflow.  ║
-    // ║  Capping to activeOverflowBudget - strictSuffix.length ensures the   ║
-    // ║  strict-retry is always at most as large as the last successful call. ║
-    // ║  When no overflow occurred, activeOverflowBudget = MAX_PROMPT_CHARS  ║
-    // ║  and the cap is a no-op.                                             ║
-    // ║                                                                      ║
-    // ║  IS PASSING activeCommits/activeFiles (narrowest known-good set) OK? ║
-    // ║  Yes. activeCommits/activeFiles are initialised from step 5's        ║
-    // ║  usedCommits/usedFiles and updated to overflowCommits/overflowFiles  ║
-    // ║  if step 6 took the overflow path. This guarantees step 7 never      ║
-    // ║  re-expands to a prompt larger than the one that last succeeded.     ║
-    // ║  The ~130-char budget reduction rarely drops even one item; when it  ║
-    // ║  does, the halving loop removes it correctly. Not a bug.             ║
-    // ║                                                                      ║
-    // ║  WHY no 15s retry loop?                                             ║
-    // ║  Step 7 only runs after step 6 returned output (malformed, but      ║
-    // ║  returned). The model is warm — cold-start ETIMEDOUT is not the     ║
-    // ║  failure mode. A warm model that returned malformed output will      ║
-    // ║  not recover from a 15s pause on the same prompt.                   ║
-    // ╚══════════════════════════════════════════════════════════════════════╝
+    // strictSuffix appended to the existing prompt — no re-truncation needed
+    // because the preflight loop (step 5) has already confirmed the base prompt
+    // fits TOKEN_BUDGET with exact token counts. The suffix adds ~130 chars
+    // (~40 tokens), well within the 300-token response headroom reserved in
+    // TOKEN_BUDGET. Overflow on the strict-retry is therefore impossible.
+    //
+    // WHY no 15s retry loop:
+    // Step 7 only runs after step 6 returned output (malformed, but returned).
+    // The model is warm — cold-start ETIMEDOUT is not the failure mode here.
+    // A warm model that returned malformed output will not recover from a 15s
+    // pause on the same prompt.
+    const strictSuffix = '\n\nIMPORTANT: You MUST respond with ONLY a JSON object. No text before or after. No markdown. Exactly: {"title": "string", "body": "string"}'
     let result: { title: string; body: string }
     try {
       result = parseAfmOutput(raw, tag)
     } catch (e) {
       core.warning(`Output malformed — retrying with stricter prompt: ${e}`)
-      // WHY we re-truncate with a reduced budget instead of slicing after append:
-      // ANSWER: Slicing (prompt + strictSuffix) to MAX_PROMPT_CHARS would always
-      // amputate the suffix for any prompt near the cap — the very instruction
-      // meant to fix malformed output gets silently dropped. Instead, re-run
-      // truncatePromptToFit with charBudget = Math.min(MAX_PROMPT_CHARS,
-      // activeOverflowBudget) - strictSuffix.length, so the returned prompt is
-      // guaranteed to leave room for the full suffix and never exceeds the tightest
-      // budget seen (activeOverflowBudget when the overflow path was taken).
-      // strictSuffix is then appended unconditionally.
-      const strictBudget = Math.min(MAX_PROMPT_CHARS, activeOverflowBudget) - strictSuffix.length
-      // Guard: strictBudget must be positive and large enough for truncatePromptToFit
-      // to return a non-empty prompt. The minimum realistic value is ~8,738 (when
-      // overflow path taken at ~9,000 chars, minus ~130 suffix, minus ~130 strictSuffix
-      // length = ~8,740). If this ever fires it means activeOverflowBudget drifted
-      // below ~1,500 (the worst-case boilerplate floor documented in prompt.ts), which
-      // would indicate a budget accounting bug upstream. Fail loudly rather than
-      // silently passing a near-zero budget to truncatePromptToFit.
-      if (strictBudget <= 0) {
-        throw new Error(
-          `Internal error: strictBudget is ${strictBudget} — activeOverflowBudget (${activeOverflowBudget}) ` +
-          `is too small to accommodate strictSuffix (${strictSuffix.length} chars). ` +
-          'This indicates a budget accounting bug; please report at runbot-hq/afm-release-notes-action.'
-        )
-      }
-      const { prompt: strictBase } = truncatePromptToFit(
-        safeTag, safePrevTag, activeCommits, activeFiles, promptExtra,
-        strictBudget
-      )
-      const strictPrompt = strictBase + strictSuffix
-      core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars (budget: ${strictBudget} + ${strictSuffix.length} suffix)`)
+      const strictPrompt = prompt + strictSuffix
+      core.info(`[afm] Strict-retry prompt: ${strictPrompt.length} chars`)
       try {
         raw = afmCli(afmBin, strictPrompt, afmOptions)
       } catch (e2) {
         if (isFatalAfmError(e2)) throw e2
-        const detail = String(e2)
-        const isOverflow2 = isContextOverflowError(e2)
         throw new Error(
-          `[afm] Strict-prompt retry failed (binary: ${afmBin}): ${detail}. ` +
-          (isOverflow2
-            ? 'Context window overflow on strict-retry — token density is too high even at the reduced budget. ' +
-              `Strict-retry budget: ${strictBudget} + ${strictSuffix.length} suffix chars.`
-            : 'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
-              'consider increasing the timeout or pre-warming the runner.') +
-          (priorOverflowDetail ? ` Prior overflow (step 6): ${priorOverflowDetail}` : '')
+          `[afm] Strict-prompt retry failed (binary: ${afmBin}): ${String(e2)}. ` +
+          'If this is ETIMEDOUT, the model may need more than 60s to load on first run — ' +
+          'consider increasing the timeout or pre-warming the runner.'
         )
       }
-      // If strict-retry returned output but it still fails to parse, propagate
-      // with prior overflow context attached so the full chain is visible.
-      try {
-        result = parseAfmOutput(raw, tag)
-      } catch (e3) {
-        throw new Error(
-          `[afm] Strict-retry output still malformed: ${String(e3).slice(0, 300)}.` +
-          (priorOverflowDetail ? ` Prior overflow (step 6): ${priorOverflowDetail}` : '')
-        )
-      }
+      result = parseAfmOutput(raw, tag)
     }
 
     const { title, body } = result

@@ -125,52 +125,10 @@ export function parseAfmOutput(raw: string, currentTag: string): { title: string
   throw new Error(`AFM output did not match any known format. Raw: ${raw.slice(0, 200)}`)
 }
 
-// WHY MAX_PROMPT_CHARS is declared here (before buildPrompt/truncatePromptToFit):
-//
-// truncatePromptToFit references MAX_PROMPT_CHARS in its body. TypeScript const
-// declarations are subject to the Temporal Dead Zone — referencing a const before
-// its declaration in source order is a runtime ReferenceError if the reference is
-// evaluated at declaration time (e.g. a default parameter or class field). The
-// function body is only evaluated at call time (after module evaluation), so the
-// previous order was safe at runtime. However, declaring the constant after the
-// function that uses it is a readability hazard and a latent footgun if a call
-// site ever moves earlier. Constant declared first, then the functions that use it.
-//
-// WHY 12_000 and not 13_500 (the previous value)?
-// The failure in issue #2351 showed 4,091 tokens from 13,500 chars — a real density
-// of ~3.29 chars/token, not the assumed 3–3.5. The instructions string passed to
-// LanguageModelSession(instructions:) also consumes context tokens on top of the
-// prompt. Corrected formula:
-//   4096 - 300 (response headroom) - 60 (instructions) = 3,736 available prompt tokens
-//   3,736 × 3.29 chars/token ≈ 12,292 → rounded down to 12,000
-// At 12,000 chars the same worst-case density produces ~3,647 tokens — 449 tokens
-// of headroom instead of the previous 5. Do NOT raise this without re-measuring
-// real token counts on dense commit logs.
-// The overflow-retry in step 6 (isContextOverflowError → re-truncate to 75%)
-// is the live safety net if this constant drifts — e.g. if Apple updates the
-// FoundationModels tokenizer and real density drops below 3.29 chars/token.
-// A drifted constant produces a retry, not a silent failure.
-export const MAX_PROMPT_CHARS = 12_000
-
-// BOILERPLATE_FLOOR_CHARS is the maximum number of chars buildPrompt can return
-// when called with empty commits and files arrays. It equals fixed template text
-// (~1,100 chars) + safeTag (≤200 chars, embedded twice) + safePrevTag (≤200 chars,
-// embedded once) + promptExtra (≤300 chars). At maximum input lengths that totals
-// ~2,000 chars; the constant is set to 2_100 with a 5% margin.
-//
-// Used by truncatePromptToFit to assert the pathological-edge invariant: after
-// dropping all commits and files, prompt.length must be ≤ charBudget. If the
-// boilerplate alone exceeds charBudget, the function throws rather than returning
-// a prompt that silently violates the budget contract.
-//
-// Do NOT lower this constant without re-measuring buildPrompt with
-// safeTag=200 chars, safePrevTag=200 chars, promptExtra=300 chars.
-export const BOILERPLATE_FLOOR_CHARS = 2_100
-
 /**
  * Assembles the prompt string from its components.
  *
- * Called by truncatePromptToFit on every halving iteration — keep it cheap.
+ * Called by the preflight loop in run() on every halving iteration — keep it cheap.
  *
  * safeTag/safePrevTag must already have control chars stripped (\x00-\x1f\x7f)
  * before being passed here — they are embedded directly into the template.
@@ -201,97 +159,4 @@ export function buildPrompt(
     ...files.map(f => `- ${f}`),
     ...(promptExtra ? ['', `Extra instructions: ${promptExtra}`] : []),
   ].join('\n')
-}
-
-/**
- * Rebuilds the prompt string from its components, capping the total length
- * to charBudget (defaults to MAX_PROMPT_CHARS) to stay within AFM's 4096-token
- * context window.
- *
- * WHY charBudget is a parameter and not always MAX_PROMPT_CHARS:
- * ANSWER: The strict-retry path appends a ~130-char suffix to the prompt.
- * To guarantee the suffix is never truncated, the caller passes
- * MAX_PROMPT_CHARS - strictSuffix.length as the budget. The default
- * (MAX_PROMPT_CHARS) is used for the normal first-attempt call.
- * The overflow-retry path passes Math.floor(prompt.length * 0.75) so the
- * re-truncated prompt is guaranteed to be smaller than the overflowing one.
- *
- * WHY 12_000 and not 16_384 (4096 tokens × 4 chars/token)?
- * ANSWER: The 4 chars/token estimate is conservative — real token counts for
- * code/commit messages run 3–3.5 chars/token. 12_000 gives ~449 tokens of
- * headroom for the instructions string (~60 tokens) and the model response
- * (~389 tokens usable). Do NOT raise this without re-measuring real token counts.
- *
- * WHY progressively halve instead of binary-search?
- * ANSWER: The loop runs at most log2(80) ≈ 7 times. Binary search adds
- * complexity for negligible gain at these sizes.
- *
- * WHY we keep at least 0 items (empty lists) rather than throwing?
- * ANSWER: A prompt with just the tag names and rules is still valid input for AFM
- * — it will produce a minimal release note rather than failing the job.
- * Failing here would be worse than a thin release note.
- */
-export function truncatePromptToFit(
-  safeTag: string,
-  safePrevTag: string,
-  commits: string[],
-  files: string[],
-  promptExtra: string,
-  charBudget: number = MAX_PROMPT_CHARS
-): { prompt: string; commits: string[]; files: string[] } {
-  let c = [...commits]
-  let f = [...files]
-
-  let prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
-  if (prompt.length <= charBudget) return { prompt, commits: c, files: f }
-
-  // Halve both lists progressively until the assembled prompt fits charBudget.
-  //
-  // DOES THIS LOOP TERMINATE?
-  // ANSWER: Yes, always. Math.max(1, Math.floor(n/2)) pegs at 1 once n=1,
-  // so each side stops shrinking independently at 1. Once BOTH lists reach
-  // length 1, (c.length > 1 || f.length > 1) is false and the loop exits.
-  // The pathological-edge block below is unconditional (guarded only by
-  // prompt.length > charBudget, not by list lengths) so it always handles
-  // the residual case — whether lists arrived as [1,…] or as [].
-  //
-  // WHY > 1 and not > 0?
-  // With > 0: if c=1 and f=[] (or vice versa), the outer condition stays true
-  // (1 > 0 || 0 > 0) but neither inner guard fires (c.length > 1 is false,
-  // f.length > 1 is false), so the loop rebuilds an identical prompt on every
-  // iteration — an infinite no-op spin. Reverting to > 1 exits the loop as
-  // soon as neither list can shrink further, and the pathological-edge block
-  // below handles all residual cases (0+0, 1+0, 0+1, 1+1 > charBudget)
-  // unconditionally. Do NOT change this back to > 0.
-  while (prompt.length > charBudget && (c.length > 1 || f.length > 1)) {
-    if (c.length > 1) c = c.slice(0, Math.max(1, Math.floor(c.length / 2)))
-    if (f.length > 1) f = f.slice(0, Math.max(1, Math.floor(f.length / 2)))
-    prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
-  }
-
-  // Pathological edge: even 1 commit + 1 file exceeds charBudget (extremely
-  // long filenames or commit messages), or lists arrived as [] and the
-  // boilerplate alone exceeds charBudget. Drop both lists entirely.
-  // This block is unconditional — it runs for any residual case where
-  // prompt.length > charBudget after the loop (0+0, 1+0, 0+1, 1+1).
-  if (prompt.length > charBudget) {
-    c = []
-    f = []
-    prompt = buildPrompt(safeTag, safePrevTag, c, f, promptExtra)
-    // Assert the budget contract: boilerplate + promptExtra must fit within
-    // charBudget. In practice the minimum caller budget is
-    // activeOverflowBudget - strictSuffix.length ≈ 8,868 chars, far above
-    // BOILERPLATE_FLOOR_CHARS (2,100). If this throws it means charBudget was
-    // set dangerously low by a caller — surface it loudly rather than returning
-    // a prompt that silently exceeds the budget and causes another overflow.
-    if (prompt.length > charBudget) {
-      throw new Error(
-        `[afm] truncatePromptToFit: boilerplate + promptExtra (${prompt.length} chars) exceeds ` +
-        `charBudget (${charBudget}). Minimum supported budget is ~${BOILERPLATE_FLOOR_CHARS} chars. ` +
-        'Reduce promptExtra or raise charBudget. This is a caller contract violation.'
-      )
-    }
-  }
-
-  return { prompt, commits: c, files: f }
 }

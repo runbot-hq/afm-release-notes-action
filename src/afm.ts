@@ -23,11 +23,13 @@ import { spawnSync } from 'child_process'
  *   --instructions             → LanguageModelSession(instructions:) (Apple's term for system prompt)
  *   --temperature              → GenerationOptions.temperature
  *   --maximum-response-tokens  → GenerationOptions.maximumResponseTokens
+ *   --count-tokens             → SystemLanguageModel.tokenCount(for:) (macOS 26.4+, no inference)
  */
 export function afmCli(bin: string, prompt: string, options?: {
   instructions?: string
   temperature?: number
   maximumResponseTokens?: number
+  countTokens?: boolean
 }): string {
   const args: string[] = ['--prompt', prompt]
 
@@ -39,6 +41,9 @@ export function afmCli(bin: string, prompt: string, options?: {
   }
   if (options?.maximumResponseTokens !== undefined) {
     args.push('--maximum-response-tokens', String(options.maximumResponseTokens))
+  }
+  if (options?.countTokens) {
+    args.push('--count-tokens')
   }
 
   if (core.isDebug()) {
@@ -108,28 +113,20 @@ export function isFatalAfmError(e: unknown): boolean {
 /**
  * Returns true when the AFM error is a hard context-window overflow.
  *
+ * NOTE: This function is dead code now that the exact-token preflight loop
+ * (step 5 in run()) guarantees the prompt fits before inference is called.
+ * Retained here rather than deleted immediately so a single future PR can
+ * remove it in isolation without mixing clean-up into a logic change.
+ * Do NOT add new call sites — remove this function in the follow-on clean-up.
+ *
  * Two strings are matched as a defence-in-depth hedge:
  *
  * 1. 'exceededcontextwindowsize' — the Swift enum identifier
  *    (LanguageModelError.exceededContextWindowSize) observed in
- *    runbot-hq/run-bot#2351. This is an Apple-internal identifier, not a
- *    documented stable API string. If Apple renames the enum case in a future
- *    OS release this match silently stops firing.
+ *    runbot-hq/run-bot#2351.
  *
  * 2. 'exceeds the maximum allowed context size' — the human-readable
- *    FoundationModels framework error message observed in the same failure
- *    ("Content contains 4091 tokens, which exceeds the maximum allowed context
- *    size of 4096."). Framework-level prose is typically more stable across
- *    OS versions than internal enum identifiers, so this serves as a fallback
- *    if the enum name changes.
- *
- * Either match is sufficient. Both strings are lowercased before comparison.
- *
- * This is a deterministic limit — retrying with the same prompt will always
- * fail. The caller must reduce the prompt before retrying. Do NOT add either
- * string to isFatalAfmError: the overflow IS recoverable, just not via a
- * simple pause-and-retry. Structured exit codes are tracked at
- * runbot-hq/afm-cli#2.
+ *    FoundationModels framework error message observed in the same failure.
  */
 export function isContextOverflowError(e: unknown): boolean {
   const msg = String(e).toLowerCase()
